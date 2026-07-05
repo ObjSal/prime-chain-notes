@@ -618,11 +618,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 view.set_badge(if rec.private { "PRIVATE" } else { "PUBLIC" }.into());
                 view.set_meta(
                     format!(
-                        "pending — broadcast {}.hex via the companion\nfee {} sats · {} vB",
+                        "pending — scan the QR with the companion, or broadcast {}.hex\nfee {} sats · {} vB",
                         rec.txid, rec.fee, rec.vsize
                     )
                     .into(),
                 );
+                // Straight to the QR after signing — that's the broadcast path.
+                set_view_qr(&view, &rec);
+                view.set_show_qr(view.get_has_qr());
                 ui.global::<Compose>().set_text("".into());
                 ui.global::<Ui>().set_busy(false);
                 refresh_notes();
@@ -638,16 +641,18 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
             let Some(n) = st.notes.iter().find(|n| n.id == id.as_str()) else { return };
-            log::info!("cb: open-note id={} status={}", n.id, n.status);
             let view = ui.global::<View>();
             view.set_id(n.id.clone().into());
             view.set_text(n.text.clone().into());
             view.set_badge(if n.private { "PRIVATE" } else { "PUBLIC" }.into());
             let where_line = match n.height {
                 Some(h) => format!("confirmed at block {h}"),
-                None => "pending — export & broadcast via the companion".to_string(),
+                None => "pending — scan the tx QR with the companion to broadcast".to_string(),
             };
             view.set_meta(format!("{where_line}\ntxid: {}", n.txid).into());
+            set_view_qr(&view, n);
+            view.set_show_qr(false);
+            log::info!("cb: open-note id={} status={} qr={}", n.id, n.status, view.get_has_qr());
             ui.global::<Ui>().set_screen(2);
         });
     }
@@ -880,6 +885,20 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     refresh_notes();
 
     ui.run().expect("UI running");
+}
+
+/// A single QR (v40, alphanumeric via uppercase hex) holds ~4000 chars —
+/// plenty for any normal note tx. Larger txs fall back to file export
+/// (animated multi-part UR is future work, with the bundle-in leg).
+const MAX_QR_HEX_CHARS: usize = 4000;
+
+fn set_view_qr(view: &View<'_>, n: &NoteRec) {
+    let eligible =
+        n.status == "pending" && !n.raw_hex.is_empty() && n.raw_hex.len() <= MAX_QR_HEX_CHARS;
+    view.set_has_qr(eligible);
+    if eligible {
+        view.set_qr(qr_image(&n.raw_hex.to_uppercase()));
+    }
 }
 
 fn qr_image(payload: &str) -> Image {

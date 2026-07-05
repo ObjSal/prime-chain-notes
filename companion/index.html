@@ -88,7 +88,16 @@
     <input type="file" id="hexFiles" accept=".hex,.txt" multiple>
     <label>…or paste raw transaction hex</label>
     <textarea id="hexPaste" placeholder="02000000…" spellcheck="false"></textarea>
-    <button id="broadcastBtn">Broadcast</button>
+    <div class="row">
+      <div><button id="broadcastBtn" style="width:100%">Broadcast</button></div>
+      <div><button class="secondary" id="scanBtn" style="width:100%">Scan from device 📷</button></div>
+    </div>
+    <div id="scanBox" style="display:none; margin-top:12px">
+      <video id="scanVideo" playsinline muted
+             style="width:100%; border-radius:12px; border:1px solid var(--border)"></video>
+      <p class="sub" style="margin:6px 0 0">Point the camera at the tx QR on the
+      device's note screen ("Show tx QR"). Broadcasts automatically on scan.</p>
+    </div>
     <div class="log" id="bcastLog" style="display:none"></div>
   </section>
 
@@ -97,6 +106,7 @@
   broadcast are already signed and final.</p>
 </main>
 
+<script src="jsqr.js"></script>
 <script>
 "use strict";
 
@@ -309,6 +319,60 @@ $("broadcastBtn").addEventListener("click", async () => {
   } finally {
     $("broadcastBtn").disabled = false;
   }
+});
+
+/* ---------------------------------------------- camera QR scanner */
+// Leg 1 of the QR transport: the device shows the signed tx as a QR
+// (uppercase hex); we decode it with the vendored jsQR (Apache-2.0) and
+// broadcast immediately — no file transfer, no cable.
+let scanStream = null;
+
+function stopScan() {
+  if (scanStream) scanStream.getTracks().forEach((t) => t.stop());
+  scanStream = null;
+  $("scanBox").style.display = "none";
+  $("scanBtn").textContent = "Scan from device 📷";
+}
+
+$("scanBtn").addEventListener("click", async () => {
+  const logEl = $("bcastLog");
+  if (scanStream) return stopScan();
+  try {
+    scanStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+    });
+  } catch (e) {
+    logEl.textContent = "";
+    return log(logEl, `Camera unavailable: ${e.message}`, "err");
+  }
+  const video = $("scanVideo");
+  video.srcObject = scanStream;
+  await video.play();
+  $("scanBox").style.display = "block";
+  $("scanBtn").textContent = "Stop scanning";
+
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const tick = async () => {
+    if (!scanStream) return;
+    if (video.readyState >= 2 && video.videoWidth) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0);
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const hit = jsQR(img.data, img.width, img.height);
+      if (hit && /^[0-9A-Fa-f]{60,}$/.test(hit.data.trim())) {
+        const hex = hit.data.trim().toLowerCase();
+        stopScan();
+        logEl.textContent = "";
+        log(logEl, `scanned ✓ raw tx (${hex.length} hex chars) — broadcasting…`);
+        await broadcastOne("scanned QR", hex, logEl);
+        return;
+      }
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
 });
 
 /* ---------------------------------------------------------- faucet */

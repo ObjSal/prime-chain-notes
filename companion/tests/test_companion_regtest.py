@@ -104,6 +104,38 @@ def main():
         print(f"PASS note recovered from page-built bundle, confirmed at height {confirmed['height']}")
 
         browser.close()
+
+        # ---- Leg 1 of the QR transport: scan-from-device via fake camera.
+        # Compose another note, render its uppercase hex as a QR (exactly
+        # what the device's "Show tx QR" displays), feed it to Chromium as
+        # a fake webcam, and let the page decode + auto-broadcast it.
+        import qrcode
+
+        note2 = json.loads(cli("compose", str(bundle2), "private", "2", "100000",
+                               "broadcast me via the camera"))
+        img = qrcode.make(note2["raw_hex"].upper(), box_size=6, border=4)
+        png = tmp / "tx-qr.png"
+        img.save(png)
+        y4m = tmp / "tx-qr.y4m"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", str(png),
+             "-vf", "scale=640:640:flags=neighbor,format=yuv420p", "-t", "5", "-r", "10", str(y4m)],
+            check=True,
+        )
+        browser = p.chromium.launch(args=[
+            "--use-fake-ui-for-media-stream",
+            "--use-fake-device-for-media-stream",
+            f"--use-file-for-fake-video-capture={y4m}",
+        ])
+        page = browser.new_page()
+        page.goto(BASE)
+        page.wait_for_function("document.querySelector('#modePill').textContent.includes('regtest')")
+        page.click("#scanBtn")
+        wait_log("#bcastLog", "accepted", page)
+        assert note2["txid"] in page.locator("#bcastLog").text_content()
+        print(f"PASS QR scanned from fake camera and auto-broadcast, txid {note2['txid']}")
+        page.screenshot(path=str(SHOTS / "companion-scan.png"), full_page=True)
+        browser.close()
     print("COMPANION REGTEST E2E PASSED")
 
 

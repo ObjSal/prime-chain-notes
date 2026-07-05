@@ -349,12 +349,21 @@ export component AppWindow inherits Window {
             }
 
             HorizontalLayout {
+                spacing: 8px;
                 Text {
                     text: View.badge;
                     color: View.badge == "PRIVATE" ? Theme.palette-primary : Theme.palette-muted;
                     font-family: "Montserrat";
                     font-size: 14px;
                     font-weight: 700;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                if View.has-qr: PillOption {
+                    width: 130px;
+                    label: View.show-qr ? "Show text" : "Show tx QR";
+                    selected: View.show-qr;
+                    tapped => { View.show-qr = !View.show-qr; }
                 }
             }
 
@@ -363,7 +372,7 @@ export component AppWindow inherits Window {
                 background: Theme.palette-surface;
                 border-radius: 16px;
                 clip: true;
-                Flickable {
+                if !View.show-qr: Flickable {
                     x: 14px; y: 14px;
                     width: parent.width - 28px;
                     height: parent.height - 28px;
@@ -376,6 +385,25 @@ export component AppWindow inherits Window {
                         font-family: "SourceCodePro";
                         font-size: 18px;
                         wrap: word-wrap;
+                    }
+                }
+                if View.show-qr: VerticalLayout {
+                    padding: 14px;
+                    spacing: 8px;
+                    Image {
+                        source: View.qr;
+                        width: min(parent.width - 28px, 360px);
+                        height: self.width;
+                        image-rendering: pixelated;
+                        x: (parent.width - 28px - self.width) / 2;
+                    }
+                    Text {
+                        text: "Scan with the companion's “Scan from device” to broadcast.";
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 13px;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
                     }
                 }
             }
