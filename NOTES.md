@@ -218,6 +218,14 @@ localhost pattern and improving on it:
   scanAddress, note-card builder) out of viewer.html into `chain-scan.js`
   so the FROZEN-format parser exists in exactly one JS place. e2e covers
   permalink click (public) + direct URL (private placeholder).
+- note_id collision guard (2026-07-05): scanners bucket chunks purely by
+  note_id, so two of the user's own notes colliding would merge into one
+  bucket → `reassemble` fails → the device drops BOTH from chain recovery
+  (only visible after a wipe-restore). `keys::pick_unique_note_id` rerolls
+  the TRNG draw against known ids (64-attempt cap turns a stuck RNG into
+  an error); the app checks `state.notes`, notes_cli checks every id
+  decodable from the bundle's payloads. Can't guard against ids composed
+  before an unsynced wipe — those odds stay 1 in 2^32 per pair.
 - `tests/test_chain_scan.js` (node, no network/browser): runs the shipped
   chain-scan.js in a vm against synthetic esplora JSON — proves notes with
   chunks spread ACROSS TRANSACTIONS reassemble (both txids listed, height

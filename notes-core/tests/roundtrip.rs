@@ -51,6 +51,25 @@ fn envelope_rejects_bad_shapes() {
 }
 
 #[test]
+fn note_id_collision_guard_rerolls() {
+    // Scripted generator: two ids that are taken, then a fresh one.
+    let script = [[1u8; 4], [2u8; 4], [9u8; 4]];
+    let mut i = 0;
+    let gen = || {
+        let id = script[i];
+        i += 1;
+        Ok(id)
+    };
+    let taken = |id: &[u8; 4]| *id == [1u8; 4] || *id == [2u8; 4];
+    assert_eq!(notes_core::keys::pick_unique_note_id(gen, taken).unwrap(), [9u8; 4]);
+    assert_eq!(i, 3, "must have rerolled past both collisions");
+
+    // Everything taken (broken RNG stuck on one value) → error, not a spin.
+    let stuck = || Ok([1u8; 4]);
+    assert!(notes_core::keys::pick_unique_note_id(stuck, |_| true).is_err());
+}
+
+#[test]
 fn seal_open_roundtrip_and_auth() {
     let key = [3u8; 32];
     let note_id = [1, 2, 3, 4];

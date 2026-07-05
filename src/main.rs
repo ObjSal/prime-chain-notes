@@ -7,7 +7,7 @@ use std::time::Duration;
 use notes_core::bundle::{
     compose_note, decode_scanned, estimate_note_cost, extract_notes, Identity, SyncBundle,
 };
-use notes_core::keys::{generate_aux_rand, generate_note_id};
+use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::tx::{NoteTx, Utxo};
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
@@ -471,7 +471,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     .ok_or_else(|| "identity unavailable".to_string())
                     .and_then(|id| {
                         let rate = resolve_rate(tier, &rate_text, &st)?;
-                        let note_id = generate_note_id().map_err(|e| e.to_string())?;
+                        let note_id = pick_unique_note_id(generate_note_id, |id| {
+                            let id_hex = hex::encode(id);
+                            st.notes.iter().any(|n| n.id == id_hex)
+                        })
+                        .map_err(|e| e.to_string())?;
                         compose_note(
                             id,
                             &st.core_utxos(),
