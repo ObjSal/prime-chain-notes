@@ -120,8 +120,10 @@ when the local server is detected. Playwright tests drive the real
 rendered page: `tests/test_companion_regtest.py` (hermetic, incl. a
 fake-camera scan), `tests/test_companion_qr.py` (bundle-QR round-trips
 cross-checked against foundation-ur) and `tests/test_companion_testnet4.py`
-(live). Vendored: jsQR (Apache-2.0), qrcode-generator (MIT), plus the
-hand-rolled `ur.js` UR encoder.
+(live), plus a no-network node unit test for the shared scan core
+(`node tests/test_chain_scan.js`: cross-tx chunk reassembly, dedup,
+partial surfacing, spoof rejection). Vendored: jsQR (Apache-2.0),
+qrcode-generator (MIT), plus the hand-rolled `ur.js` UR encoder.
 
 `viewer.html` is a read-only sibling page that renders an address's
 on-chain notes directly in the browser (deep-linkable via
