@@ -1,0 +1,26 @@
+# Foundation application configuration
+app-name = "prime-chain-notes"
+friendly-app-name = "Chain Notes"
+launcher-app-name = "Chain Notes"
+description = "Personal notes on the bitcoin blockchain: compose on-device, sign offline, sync via bundles"
+icon = "resources/icon.svg"
+app-id = "0x80939851304fbf1880340f62cd9f9aac"
+version = "0.1.0"
+min-keyos-version = "1.0.0"
+
+[publisher]
+name = ""
+contact-email = ""
+support-url = ""
+
+[permissions]
+template = ["gui-app", "fs-generic", "fs-access"]
+# Import bundles / export signed txs may use Airlock; nothing mounts it in
+# the hosted simulator, so mount lazily and format only after a failed
+# mount (paper-wallet pattern, see its NOTES.md).
+"os/fs" = ["MountAirlock", "FormatAirlock"]
+# GetAppSeed (HMAC-derived per-app seed, PIN-gated on hardware) is the sole
+# root of the notes identity key AND the note encryption key — the wipe
+# recovery story depends on it. NOT GetSeed: this app must never see the
+# wallet's actual seed entropy.
+"os/security" = ["GetAppSeed"]

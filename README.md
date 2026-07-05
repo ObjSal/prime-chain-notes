@@ -1,0 +1,106 @@
+# Chain Notes — a Passport Prime app
+
+**Personal notes on the bitcoin blockchain**, from a device that has no
+network on purpose. Compose text on Foundation's **Passport Prime**
+(a Rust binary with a **Slint** UI on **KeyOS**), seal it with a key only
+your device seed can re-derive — or leave it deliberately public — and the
+app builds and signs a real bitcoin transaction carrying the note in
+`OP_RETURN` outputs. An online companion broadcasts it and scans the chain;
+the device and the companion exchange nothing but files/QRs: **sync
+bundles** in, **signed transactions** out.
+
+Your address history *is* the notebook: every note is a transaction from
+the app's taproot address back to itself, timestamped by its block. Wipe
+the device, restore the seed, rescan the chain — every note comes back,
+private ones decrypted, with nothing stored anywhere else.
+
+<p align="center">
+  <img src="screenshots/chain-notes-home.png" alt="Home — address QR, balance, sync status" width="270">
+  &nbsp;
+  <img src="screenshots/cn-typed.png" alt="Compose — live keystroke cost estimate" width="270">
+  &nbsp;
+  <img src="screenshots/cn-note.png" alt="A private note restored from chain data after a device wipe" width="270">
+</p>
+
+## How it works
+
+- **Identity**: one P2TR address, key HKDF-derived from `GetAppSeed`
+  (the PIN-gated per-app seed — never the wallet's own accounts). The
+  note-encryption key derives from the same root. Derivation strings are
+  frozen forever; the wipe-recovery story depends on them.
+- **A note** = tx spending the app's own coins: `OP_RETURN` payload(s) +
+  change back to the same address. Private notes are XChaCha20-Poly1305
+  sealed (nonce+tag once, then chunked); public notes are plaintext UTF-8.
+  Envelope: `PNTE ‖ v1 ‖ flags ‖ note_id ‖ seq/total ‖ data`.
+- **Sync bundle** (JSON via file or Airlock): UTXOs, fee tiers
+  (mempool.space format), BTC price, tip height, the endpoint's
+  `max_op_return_bytes` relay policy, and every OP_RETURN payload found in
+  the address history. Only txs that *spend from* the notes address count
+  — a third party paying the address with forged payloads is ignored, and
+  private notes are additionally AEAD-authenticated.
+- **Cost calculator**: the compose screen re-prices on every keystroke —
+  pure arithmetic, no crypto runs (sealed size = text + 40 bytes, always).
+  Fee tiers economy/normal/fast come from the bundle; a **Custom** tier
+  engages automatically when you edit the sat/vB field. The estimate is
+  byte-exact: tests assert it equals the signed transaction's real vsize.
+- **Chunk size** (Settings): Auto follows the bundle's relay policy
+  (Bitcoin Core v30 defaults allow ~100 kB, so typical notes are a single
+  OP_RETURN); "80 compat" targets pre-v30/strict relays; Custom is
+  validated to never exceed the endpoint policy.
+- **Unconfirmed chaining**: signing updates a local UTXO ledger, so
+  several notes can queue between syncs, each spending the last one's
+  change.
+
+## Layout
+
+```
+notes-core/     host-testable library: key derivation, envelope, AEAD,
+                BIP341 sighash + BIP340 signing, tx assembly, sync bundles
+src/ ui/        the KeyOS app (screens, persistence, log contract)
+scripts/        regtest-e2e.sh (host e2e), regtest-companion.sh
+vendor/         KeyOS getrandom TRNG override + security-api (GetAppSeed)
+```
+
+## Build & test
+
+```bash
+nix develop ~/.foundation/sdk/current --command cargo test -p notes-core
+nix develop ~/.foundation/sdk/current --command bash scripts/regtest-e2e.sh
+nix develop ~/.foundation/sdk/current --command foundation sim
+../ui-automation/tests/chain-notes.sh    # full UI e2e (manages sim + bitcoind)
+```
+
+Fresh clone: recreate the SDK links the repo intentionally doesn't track
+(`ln -s ~/.foundation/sdk/current/ui/ui ui/ui`, plus
+`resources/{fonts,images}` symlinks + copied `icons/` — see NOTES.md), and
+run `foundation sim` once to generate `manifest.toml`.
+
+## What's verified
+
+- `cargo test -p notes-core`: BIP340/BIP341 official vectors; addresses,
+  txids, sighashes and signatures cross-checked against
+  rust-bitcoin/libsecp256k1; envelope/AEAD round-trips; byte-exact fee
+  estimator; spoof/foreign-seed rejection; idempotent imports.
+- `scripts/regtest-e2e.sh` against Bitcoin Core v30: multi-chunk and
+  323-byte single OP_RETURN notes relayed and mined; unconfirmed-change
+  chaining; full-history wipe-restore; plaintext visible on-chain for
+  public notes, ciphertext-only for private.
+- `../ui-automation/tests/chain-notes.sh`: the same flow driven through
+  the simulator UI with real taps/keystrokes — the tx signed on the
+  "device" broadcasts on a real regtest node with the txid the device
+  predicted, and a wiped app restores the note from bare chain data.
+
+## Honest caveats
+
+- Every note costs a real fee, forever, in public. Private notes hide
+  content, not existence, size, or timing.
+- Companion web pages (mempool.space sync/broadcast) are not built yet —
+  the regtest scripts play that role today. QR transports (animated UR
+  out, camera in) are designed but not wired.
+- Experimental software that signs real spends: signet first, and
+  Foundation asks wallet-adjacent apps to pass their security review
+  (hello@foundation.xyz) before mainnet use.
+
+Design docs live in the workspace: `../PLAN-chain-notes.md` (this app) and
+`../FUTURE-chain-chat.md` (the address-to-address messaging sibling that
+reuses this core).
