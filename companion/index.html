@@ -85,12 +85,9 @@
     <h2>2 · Broadcast signed transactions</h2>
     <p class="sub">Drop the <code>.hex</code> file(s) the device exported to
     <code>/chain-notes/outbox</code>, or paste raw hex.</p>
-    <input type="file" id="hexFiles" accept=".hex,.txt" multiple>
-    <label>…or paste raw transaction hex</label>
-    <textarea id="hexPaste" placeholder="02000000…" spellcheck="false"></textarea>
-    <div class="row">
-      <div><button id="broadcastBtn" style="width:100%">Broadcast</button></div>
-      <div><button class="secondary" id="scanBtn" style="width:100%">Scan from device 📷</button></div>
+    <div class="row" style="align-items:center">
+      <div><input type="file" id="hexFiles" accept=".hex,.txt" multiple></div>
+      <div><button class="secondary" id="scanBtn" style="width:100%; margin-top:0">Scan from device 📷</button></div>
     </div>
     <div id="scanBox" style="display:none; margin-top:12px">
       <video id="scanVideo" playsinline muted
@@ -98,6 +95,9 @@
       <p class="sub" style="margin:6px 0 0">Point the camera at the tx QR on the
       device's note screen ("Show tx QR"). Broadcasts automatically on scan.</p>
     </div>
+    <label>…or paste raw transaction hex</label>
+    <textarea id="hexPaste" placeholder="02000000…" spellcheck="false"></textarea>
+    <button id="broadcastBtn">Broadcast</button>
     <div class="log" id="bcastLog" style="display:none"></div>
   </section>
 
