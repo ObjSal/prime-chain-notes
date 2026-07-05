@@ -105,12 +105,51 @@ not persisted, earlier valid 80000 retained) and in the automated e2e
 (80-compat via pill tap → 100-byte private note composes as exactly
 3 chunks, fee == 3 × vsize at the Fast tier, mined on regtest).
 
+## Companion pages + live testnet4 verification (2026-07-05)
+
+`companion/` — the phase-2 online half, borrowing the bitcoin-gift-wallet
+localhost pattern and improving on it:
+
+- `index.html` (single static page, no deps): sync-bundle builder
+  (full-history pagination via `after_txid`, `spends_from_self` from
+  esplora `vin[].prevout` — zero extra lookups, fee tiers + USD price,
+  per-network `max_op_return_bytes` with an Advanced override, bundle.json
+  download) + broadcaster (.hex files or pasted hex, reject-reason
+  surfaced verbatim) + regtest faucet button.
+- `server.py` (stdlib): serves the page and — the improvement — exposes a
+  local regtest node through a **mempool.space-shaped API** at
+  `/regtest/api/*` (esplora tx/utxo shapes from `getrawtransaction
+  verbosity=2`, `/v1/fees`, POST `/tx` with auto-mine). The page's only
+  regtest special-case is a base-URL entry; `/api/health` reveals the
+  regtest option only when the local server is present (gift-wallet
+  trick, kept). `--regtest` manages a throwaway node; `--datadir` attaches.
+- `tests/test_companion_regtest.py` (playwright, headless): faucet →
+  bundle → download → compose → upload .hex → broadcast → rescan → note
+  recovered; bad hex surfaces a reject reason. PASSED.
+- `tests/test_companion_testnet4.py` (LIVE): funded a throwaway tb1p
+  identity with 10k sats from the gift-wallet testnet4 credentials
+  (P2WPKH funding tx signed with their python reference), page built a
+  bundle from the unconfirmed utxo, composed a 212-char public note as a
+  **single 224-byte OP_RETURN — mempool.space/testnet4 ACCEPTED it**
+  (txid 9097778e…, Core v30 defaults confirmed; companion defaults now
+  100000 for all mempool.space networks), rescanned via a page bundle,
+  then **swept every remaining sat back** to
+  tb1q2ylq48ne37ng9clds23xjcrxp8hmn707j5vpyk (9554 returned + 1008
+  change; total cost 606 sats in fees across funding/note/sweep).
+  notes-core gained `address_to_script_pubkey` (any segwit dest, HRP
+  checked) + `build_sweep_tx` + a `notes_cli sweep` command for this,
+  both rust-bitcoin cross-checked.
+- Chrome-extension automation was unavailable; playwright (already in the
+  gift-wallet toolchain) drives the real rendered page instead.
+
 ## Not yet done / next
 
-- Companion web pages (`notes-sync.html`, `broadcast.html`) — phase 2 of
-  `../PLAN-chain-notes.md`; the regtest scripts stand in for them today.
 - QR sync path (animated UR out, `open_qr_scanner` in) — file/Airlock is
   the only transport wired so far.
-- Signet dry-run + Foundation security review before any mainnet use.
+- Companion hosting (GitHub Pages) — the page already behaves correctly
+  in static mode (regtest hidden); publishing is a repo/ops decision.
+- App-side network enum has no testnet4 variant (CLI used `signet` for
+  the tb HRP on testnet4); add one if the app itself should sync testnet4.
+- Foundation security review before any mainnet use.
 - Fee-bump (RBF) UI; the tx already signals RBF (sequence 0xfffffffd) and
   note_id survives re-signing by design.

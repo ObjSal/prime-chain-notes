@@ -76,6 +76,33 @@ fn main() {
                 })
             );
         }
+        Some("sweep") => {
+            // sweep <bundle.json|-> <network> <dest_address> <fee_rate>
+            let bundle = read_bundle(&args[2]);
+            let network = Network::from_str_opt(&args[3]).expect("network");
+            let dest_spk =
+                notes_core::address::address_to_script_pubkey(network, &args[4]).unwrap();
+            let fee_rate: f64 = args[5].parse().unwrap();
+            let sweep = notes_core::tx::build_sweep_tx(
+                &bundle.utxos(),
+                &identity.output_x,
+                dest_spk,
+                fee_rate,
+                &identity.tweaked_seckey,
+                || generate_aux_rand(),
+            )
+            .unwrap();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "txid": sweep.txid_hex,
+                    "raw_hex": sweep.raw_hex,
+                    "fee": sweep.fee,
+                    "vsize": sweep.vsize,
+                    "value_out": sweep.tx.outputs[0].value,
+                })
+            );
+        }
         Some("scan") => {
             let bundle = read_bundle(&args[2]);
             let notes = extract_notes(&bundle, &identity.enc_key);
@@ -95,7 +122,7 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
         }
         _ => {
-            eprintln!("usage: notes_cli address <network> | compose <bundle> <public|private> <fee_rate> <max_or> <text> | scan <bundle>");
+            eprintln!("usage: notes_cli address <network> | compose <bundle> <public|private> <fee_rate> <max_or> <text> | scan <bundle> | sweep <bundle> <network> <dest_address> <fee_rate>");
             std::process::exit(2);
         }
     }

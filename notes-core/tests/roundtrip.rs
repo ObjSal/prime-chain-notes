@@ -209,6 +209,94 @@ fn scan_import_is_idempotent() {
     assert_eq!(notes[0].text.as_deref(), Some("once only"));
 }
 
+#[test]
+fn address_decode_matches_rust_bitcoin() {
+    use std::str::FromStr;
+    // Any-network v0 + v1 decodes must equal rust-bitcoin's scriptPubKey.
+    for (net, btc_net, addr) in [
+        (
+            notes_core::Network::Signet,
+            bitcoin::Network::Signet,
+            "tb1q2ylq48ne37ng9clds23xjcrxp8hmn707j5vpyk", // P2WPKH (testnet HRP)
+        ),
+        (
+            notes_core::Network::Mainnet,
+            bitcoin::Network::Bitcoin,
+            "bc1p548gt356p9jrhr6p5hfvd83km5zus936hlcfyzl0xhmtg5av2arqtvrpme", // P2TR
+        ),
+    ] {
+        let ours = notes_core::address::address_to_script_pubkey(net, addr).unwrap();
+        let theirs = bitcoin::Address::from_str(addr)
+            .unwrap()
+            .require_network(btc_net)
+            .unwrap()
+            .script_pubkey();
+        assert_eq!(ours, theirs.into_bytes(), "{addr}");
+    }
+    // Wrong network HRP must be rejected.
+    assert!(notes_core::address::address_to_script_pubkey(
+        notes_core::Network::Regtest,
+        "bc1p548gt356p9jrhr6p5hfvd83km5zus936hlcfyzl0xhmtg5av2arqtvrpme"
+    )
+    .is_err());
+}
+
+/// Sweep: all inputs, one external output, rust-bitcoin cross-check.
+#[test]
+fn sweep_cross_check() {
+    use bitcoin::consensus::encode::deserialize;
+    use bitcoin::hashes::Hash;
+    use bitcoin::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
+    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+    use bitcoin::{Amount, ScriptBuf, TxOut};
+
+    let id = identity();
+    let dest = notes_core::address::address_to_script_pubkey(
+        notes_core::Network::Regtest,
+        &Identity::from_app_seed(&[9u8; 32]).unwrap().address(notes_core::Network::Regtest),
+    )
+    .unwrap();
+    let sweep = notes_core::tx::build_sweep_tx(
+        &utxos(),
+        &id.output_x,
+        dest.clone(),
+        2.0,
+        &id.tweaked_seckey,
+        || Ok(AUX),
+    )
+    .unwrap();
+    assert_eq!(sweep.tx.inputs.len(), 3, "sweeps every utxo");
+    assert_eq!(sweep.tx.outputs.len(), 1);
+    assert_eq!(sweep.tx.outputs[0].value, 86_000 - sweep.fee);
+
+    let raw = hex::decode(&sweep.raw_hex).unwrap();
+    let btx: bitcoin::Transaction = deserialize(&raw).unwrap();
+    assert_eq!(btx.compute_txid().to_string(), sweep.txid_hex);
+    assert_eq!(btx.vsize(), sweep.vsize);
+
+    let spk = ScriptBuf::from_bytes(notes_core::address::p2tr_script_pubkey(&id.output_x));
+    let prevouts: Vec<TxOut> = sweep
+        .tx
+        .inputs
+        .iter()
+        .map(|i| TxOut { value: Amount::from_sat(i.value), script_pubkey: spk.clone() })
+        .collect();
+    let secp = Secp256k1::verification_only();
+    let output_key = XOnlyPublicKey::from_slice(&id.output_x).unwrap();
+    let mut cache = SighashCache::new(&btx);
+    for (index, witness) in (0..btx.input.len()).zip(&sweep.tx.witnesses) {
+        let sighash = cache
+            .taproot_key_spend_signature_hash(index, &Prevouts::All(&prevouts), TapSighashType::Default)
+            .unwrap();
+        secp.verify_schnorr(
+            &Signature::from_slice(&witness[0]).unwrap(),
+            &Message::from_digest(sighash.to_byte_array()),
+            &output_key,
+        )
+        .expect("sweep signature must verify");
+    }
+}
+
 /// The heavyweight cross-check: rust-bitcoin must (a) parse our raw tx,
 /// (b) agree on txid and vsize, (c) recompute the identical BIP341 sighash
 /// via its own implementation, and (d) accept our schnorr signature with
