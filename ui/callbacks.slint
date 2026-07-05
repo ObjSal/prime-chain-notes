@@ -57,9 +57,10 @@ export global Sync {
 }
 
 export global Settings {
-    // OP_RETURN chunk-size policy: 0 auto (bundle) · 1 compat-80 · 2 custom.
-    // The bytes field mirrors the effective size; editing it flips to
-    // custom. Custom may never exceed the bundle's max_op_return_bytes.
+    // OP_RETURN chunk-size: 0 standard (100000, Core v30 relay default) ·
+    // 1 compat-80 · 2 custom. Purely device-side — bundles carry no relay
+    // policy. The bytes field mirrors the effective size; editing flips to
+    // custom (valid range 20–100000).
     in-out property <int> chunk-mode: 0;
     in-out property <string> chunk-text: "";
     // Inline validation error for the chunk field ("" = valid) — shown in

@@ -85,6 +85,8 @@ pub struct SyncBundle {
     pub since_height: Option<u64>,
     pub tip_height: u64,
     pub bundle_time: u64,
+    /// Legacy field, tolerated on parse but no longer emitted or consumed:
+    /// chunk size is a device-side setting (app Settings screen).
     pub max_op_return_bytes: usize,
     pub fee_rates: FeeRates,
     pub btc_usd: Option<f64>,

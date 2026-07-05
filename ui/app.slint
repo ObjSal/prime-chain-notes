@@ -651,7 +651,7 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 spacing: 6px;
                 PillOption {
-                    label: "Auto";
+                    label: "Standard";
                     selected: Settings.chunk-mode == 0;
                     horizontal-stretch: 1;
                     tapped => { Settings.chunk-mode = 0; Callbacks.chunk-changed(); }
@@ -704,7 +704,7 @@ export component AppWindow inherits Window {
             }
 
             Text {
-                text: "Chunk size caps each OP_RETURN output. Auto follows the sync bundle's relay policy; 80 is the pre-v30 compatibility floor.";
+                text: "Chunk size caps each OP_RETURN output. Standard (100000) matches Bitcoin Core v30 relay defaults, verified on mempool.space; pick 80 if your broadcast endpoint rejects a note, then recompose it.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
                 font-size: 13px;

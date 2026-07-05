@@ -105,6 +105,19 @@ not persisted, earlier valid 80000 retained) and in the automated e2e
 (80-compat via pill tap → 100-byte private note composes as exactly
 3 chunks, fee == 3 × vsize at the Fast tier, mined on regtest).
 
+## Chunk size became purely device-side (2026-07-05, user decision)
+
+The bundle's `max_op_return_bytes` field is gone from the flow: the
+companion no longer emits it, the app ignores it on import (SyncBundle
+still parses it for old files), and the Settings picker is now Standard
+(100000, Core v30 relay default — the verified mempool.space value) /
+80 compat / Custom (20–100000). Rationale: the "relay policy rides the
+bundle" design added a moving part and a stale-ceiling failure mode for
+little gain — if an endpoint rejects an oversized note, the broadcast
+page shows the reject-reason, the user flips Settings to 80 and
+recomposes (inputs unspent, only a round-trip lost). One less concept on
+the companion page, one prefilled field fewer.
+
 ## Companion pages + live testnet4 verification (2026-07-05)
 
 `companion/` — the phase-2 online half, borrowing the bitcoin-gift-wallet

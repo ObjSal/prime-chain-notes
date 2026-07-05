@@ -65,13 +65,15 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
 - Screens: 0 home · 1 notes · 2 note view · 3 compose · 4 confirm ·
   5 sync (ACTIONS only: import/export + status) · 6 settings (network +
   chunk picker) — actions and preferences deliberately split.
-- Chunk-size picker (Settings screen): Auto (bundle policy) / 80 compat /
-  Custom pills + bytes field (`Settings.chunk-*`). `State.chunk_override`
-  persists it; **custom may never exceed the bundle's
-  `max_op_return_bytes`** (rejected on entry with an inline label error,
-  and `effective_chunk()` clamps to `[MIN_CHUNK=20, max]` on use in case a
-  later import lowers the policy). Changing it invokes `compose-changed`
-  so a draft's cost line reprices immediately.
+- Chunk-size picker (Settings screen): Standard (DEFAULT_CHUNK=100000,
+  Core v30 relay default) / 80 compat / Custom pills + bytes field
+  (`Settings.chunk-*`). **Purely device-side** (user decision 2026-07-05):
+  bundles carry no relay policy and any legacy `max_op_return_bytes`
+  field is ignored on import. Custom validates to
+  `[MIN_CHUNK=20, DEFAULT_CHUNK]` (inline label error). If an endpoint
+  rejects an oversized note, the user picks 80 in Settings and
+  recomposes. Changing it invokes `compose-changed` so a draft's cost
+  line reprices immediately.
 - `Location::User` `/.chain-notes/state.json` — notes (plaintext cache),
   UTXO ledger (updated on sign: inputs out, change in — unconfirmed
   chaining), fee tiers/tip/btc_usd from the last bundle, network.

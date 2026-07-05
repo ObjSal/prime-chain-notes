@@ -48,10 +48,11 @@ private ones decrypted, with nothing stored anywhere else.
   Fee tiers economy/normal/fast come from the bundle; a **Custom** tier
   engages automatically when you edit the sat/vB field. The estimate is
   byte-exact: tests assert it equals the signed transaction's real vsize.
-- **Chunk size** (Settings): Auto follows the bundle's relay policy
-  (Bitcoin Core v30 defaults allow ~100 kB, so typical notes are a single
-  OP_RETURN); "80 compat" targets pre-v30/strict relays; Custom is
-  validated to never exceed the endpoint policy.
+- **Chunk size** (Settings, purely device-side): Standard is 100000 —
+  Bitcoin Core v30's relay default, verified live on mempool.space — so
+  typical notes are a single OP_RETURN; "80 compat" targets
+  pre-v30/strict relays. If an endpoint rejects a note, the reason shows
+  in the companion's broadcast log; pick 80 on the device and recompose.
 - **Unconfirmed chaining**: signing updates a local UTXO ledger, so
   several notes can queue between syncs, each spending the last one's
   change.
@@ -120,9 +121,9 @@ real rendered page: `tests/test_companion_regtest.py` (hermetic) and
 **Relay policy, verified live (2026-07-05):** mempool.space/testnet4
 accepted a 224-byte single OP_RETURN
 ([tx](https://mempool.space/testnet4/tx/9097778ec53b2b5b9f8270a7e404487643bdbdccaa81bf8af7aafb3b0404b8bc))
-— Bitcoin Core v30 defaults — so the companion advertises
-`max_op_return_bytes: 100000` everywhere, and the old 80-byte chunking
-remains available via the Advanced field / device Settings.
+— Bitcoin Core v30 defaults — which is why the device's Standard chunk
+size is 100000. Chunk size lives entirely in the device's Settings;
+bundles carry no relay policy.
 
 ## Honest caveats
 
