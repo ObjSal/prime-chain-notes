@@ -105,6 +105,34 @@ not persisted, earlier valid 80000 retained) and in the automated e2e
 (80-compat via pill tap → 100-byte private note composes as exactly
 3 chunks, fee == 3 × vsize at the Fast tier, mined on regtest).
 
+## QR transport leg 2: bundles into the device (2026-07-05)
+
+Companion → device with no file transfer. Payload format (one format,
+two carriers): `CNB1 || deflate-raw(bundle JSON)` — small bundles as a
+single binary QR, large ones as **animated `ur:bytes` parts**. Key
+discovery: the KeyOS system scanner (`open_qr_scanner`) reassembles UR
+sequences ITSELF (`ScanQrResult::Ur2(type, payload)`, foundation-ur) —
+the app consumes the whole message either way, zero fountain code
+on-device. `notes-core bundle::decode_scanned` (miniz_oxide inflate,
+plain-JSON tolerated) feeds the same `apply_bundle` path as file import.
+
+The companion's UR encoder is ~100 lines of hand-rolled JS
+(`companion/ur.js`: CRC32, part-CBOR, bytewords-minimal table lifted
+from foundation-ur's source) — **byte-identical** to foundation-ur's
+reference encoder on the first cross-check, and
+`tests/test_companion_qr.py` proves both carriers: the rendered static
+QR pixel-decodes (jsQR binaryData) to the exact payload, and the
+animated parts reassemble through notes-core's `ur_decode` example —
+the literal decoder crate the device runs. Sim: "Scan bundle 📷" opens
+the system scanner over the **Mac's webcam** (nokhwa hosted backend),
+cancel logs `cb: scan-bundle cancelled`; a live end-to-end scan works
+by pointing a phone showing the companion QR at the Mac camera (or on
+hardware, the device at the screen).
+
+Gotchas: qrcode-generator's `Byte` mode is latin-1 (fine for binary
+strings); cv2's QRCodeDetector transcodes byte payloads as text — use
+jsQR's `binaryData` for byte-exact QR reads in tests.
+
 ## QR transport leg 1: signed tx via camera (2026-07-05)
 
 Device → companion without any file/cable: the note view for a pending
@@ -176,11 +204,12 @@ localhost pattern and improving on it:
 
 ## Not yet done / next
 
-- QR transport leg 2 (bundle IN: companion animated multi-part QR →
-  device `open_qr_scanner`) — needs discovery: does the hosted sim's
-  camera emulation feed the system scanner, and does the scanner
-  reassemble UR sequences? Leg 1 (tx out via camera) is DONE. Oversized
-  txs (>4000 hex chars) still use file export until animated UR lands.
+- QR transports: BOTH legs done (tx out via companion camera; bundle in
+  via device scanner incl. animated UR). Remaining niche: oversized txs
+  (>4000 hex chars) still use file export — could reuse the same UR
+  animation on the device side via `encode_qr_parts` if ever needed.
+  Full-history restore bundles may exceed comfortable animated-QR
+  scanning time; file/Airlock remains the restore path of choice.
 - Companion hosting (GitHub Pages) — the page already behaves correctly
   in static mode (regtest hidden); publishing is a repo/ops decision.
 - App-side network enum has no testnet4 variant (CLI used `signet` for

@@ -195,6 +195,22 @@ fn scan_ignores_foreign_and_spoofed() {
     assert!(notes[0].text.is_none());
 }
 
+#[test]
+fn decode_scanned_roundtrip() {
+    use notes_core::bundle::{decode_scanned, SCAN_MAGIC};
+    let json = r#"{"network":"regtest","tip_height":7}"#;
+    // CNB1 + deflate-raw (what the companion's CompressionStream emits).
+    let mut blob = SCAN_MAGIC.to_vec();
+    blob.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(json.as_bytes(), 6));
+    assert_eq!(decode_scanned(&blob).unwrap(), json);
+    // Plain JSON QR tolerated.
+    assert_eq!(decode_scanned(json.as_bytes()).unwrap(), json);
+    // Garbage rejected.
+    assert!(decode_scanned(b"CNB1notdeflate").is_err());
+    assert!(decode_scanned(b"hello world").is_err());
+    assert!(decode_scanned(b"").is_err());
+}
+
 /// Idempotency: importing overlapping bundles converges (dedupe by chunk).
 #[test]
 fn scan_import_is_idempotent() {

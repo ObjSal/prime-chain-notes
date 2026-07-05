@@ -81,6 +81,7 @@ export global Callbacks {
     callback refresh-notes();
     callback open-note(string);     // note id (hex)
     callback import-bundle();
+    callback scan-bundle();         // system QR scanner → bundle import
     callback export-pending();
     callback cycle-network();       // mainnet → signet → regtest → mainnet
     callback chunk-changed();       // chunk-mode pill tapped / bytes field edited

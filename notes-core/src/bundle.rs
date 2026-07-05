@@ -129,6 +129,26 @@ impl SyncBundle {
     }
 }
 
+/// Magic prefix of a scanned-bundle payload: `CNB1 || deflate-raw(json)`.
+/// The same bytes travel as one binary QR (small bundles) or as the
+/// reassembled payload of an animated `ur:bytes` sequence (the system
+/// scanner hands back the whole message either way).
+pub const SCAN_MAGIC: &[u8; 4] = b"CNB1";
+
+/// Decode a payload returned by the system QR scanner into bundle JSON.
+/// Tolerates a plain uncompressed JSON QR too (starts with `{`).
+pub fn decode_scanned(data: &[u8]) -> Result<String, Error> {
+    if data.len() > 4 && data[..4] == *SCAN_MAGIC {
+        let inflated = miniz_oxide::inflate::decompress_to_vec(&data[4..])
+            .map_err(|_| Error::Envelope("bad deflate stream"))?;
+        String::from_utf8(inflated).map_err(|_| Error::Envelope("bundle not utf-8"))
+    } else if data.first() == Some(&b'{') {
+        String::from_utf8(data.to_vec()).map_err(|_| Error::Envelope("bundle not utf-8"))
+    } else {
+        Err(Error::Envelope("not a Chain Notes bundle QR"))
+    }
+}
+
 /// A note recovered from chain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredNote {

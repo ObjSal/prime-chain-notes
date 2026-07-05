@@ -71,6 +71,11 @@
     <input type="text" id="address" placeholder="bc1p… / tb1p… / bcrt1p…" spellcheck="false">
     <button id="buildBtn">Build sync bundle</button>
     <button class="secondary" id="downloadBtn" disabled>Download bundle.json</button>
+    <button class="secondary" id="showQrBtn" disabled>Show as QR</button>
+    <div id="qrBox" style="display:none; margin-top:14px; text-align:center">
+      <img id="qrImg" alt="bundle QR" style="background:#fff; padding:12px; border-radius:12px; max-width:min(420px,100%)">
+      <p class="sub" id="qrCaption" style="margin:8px 0 0"></p>
+    </div>
     <div class="summary" id="summary" style="display:none">
       <div class="stat"><b id="sBalance">—</b><span>balance (sats)</span></div>
       <div class="stat"><b id="sUtxos">—</b><span>utxos</span></div>
@@ -107,6 +112,8 @@
 </main>
 
 <script src="jsqr.js"></script>
+<script src="qrcode-gen.js"></script>
+<script src="ur.js"></script>
 <script>
 "use strict";
 
@@ -266,6 +273,10 @@ $("buildBtn").addEventListener("click", async () => {
     $("sFees").textContent = `${fees.fastestFee}/${fees.halfHourFee}/${fees.economyFee}`;
     $("summary").style.display = "grid";
     $("downloadBtn").disabled = false;
+    $("showQrBtn").disabled = false;
+    stopQrCycle();
+    $("qrBox").style.display = "none";
+    $("showQrBtn").textContent = "Show as QR";
     log(logEl, `Bundle ready: ${bundle.utxos.length} utxo(s), ` +
       `${notesOnchain.length} note tx(s), ${txs.length} total txs scanned.`, "ok");
     log(logEl, "Download it and copy to the device's /chain-notes/inbox/.");
@@ -284,6 +295,72 @@ $("downloadBtn").addEventListener("click", () => {
   a.download = `bundle-${bundle.network}-${bundle.tip_height}.json`;
   a.click();
   URL.revokeObjectURL(a.href);
+});
+
+/* -------------------------------------------- bundle → QR (leg 2 out) */
+// Payload = "CNB1" + deflate-raw(bundle JSON). Small → one binary QR;
+// large → animated ur:bytes parts (the device's system scanner
+// reassembles them itself). Encoder byte-verified against foundation-ur.
+let STATIC_QR_MAX = 2600;     // bytes; QR v40-L byte capacity is 2953 (let: tests tune it)
+let UR_FRAGMENT_LEN = 200;    // bytes per animated part (let: tests tune it)
+let qrTimer = null;
+
+async function deflateRaw(bytes) {
+  const cs = new CompressionStream("deflate-raw");
+  const stream = new Blob([bytes]).stream().pipeThrough(cs);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function qrDataUrl(data, mode) {
+  const qr = qrcode(0, "L");
+  qr.addData(data, mode);
+  qr.make();
+  return qr.createDataURL(6, 12);
+}
+
+function stopQrCycle() {
+  if (qrTimer) clearInterval(qrTimer);
+  qrTimer = null;
+}
+
+$("showQrBtn").addEventListener("click", async () => {
+  if (!bundle) return;
+  const box = $("qrBox");
+  if (box.style.display === "block") {  // toggle off
+    stopQrCycle();
+    box.style.display = "none";
+    $("showQrBtn").textContent = "Show as QR";
+    return;
+  }
+  const json = JSON.stringify(bundle);
+  const compressed = await deflateRaw(new TextEncoder().encode(json));
+  const payload = new Uint8Array(4 + compressed.length);
+  payload.set([0x43, 0x4e, 0x42, 0x31]); // "CNB1"
+  payload.set(compressed, 4);
+
+  stopQrCycle();
+  if (payload.length <= STATIC_QR_MAX) {
+    let bin = "";
+    payload.forEach((b) => (bin += String.fromCharCode(b)));
+    $("qrImg").src = qrDataUrl(bin, "Byte");
+    $("qrCaption").textContent =
+      `single QR · ${payload.length} bytes (from ${json.length} JSON) — device: Sync → Scan bundle`;
+    window.__cnQr = { kind: "static", payload: Array.from(payload) };
+  } else {
+    const parts = CNUR.encodeParts(payload, UR_FRAGMENT_LEN);
+    let i = 0;
+    const show = () => {
+      $("qrImg").src = qrDataUrl(parts[i].toUpperCase(), "Alphanumeric");
+      $("qrCaption").textContent =
+        `animated UR · part ${i + 1}/${parts.length} · ${payload.length} bytes — hold the device steady, it reassembles automatically`;
+      i = (i + 1) % parts.length;
+    };
+    show();
+    qrTimer = setInterval(show, 400);
+    window.__cnQr = { kind: "ur", parts, payload: Array.from(payload) };
+  }
+  box.style.display = "block";
+  $("showQrBtn").textContent = "Hide QR";
 });
 
 /* ------------------------------------------------------- broadcast */

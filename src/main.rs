@@ -4,13 +4,17 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use notes_core::bundle::{compose_note, estimate_note_cost, extract_notes, Identity, SyncBundle};
+use notes_core::bundle::{
+    compose_note, decode_scanned, estimate_note_cost, extract_notes, Identity, SyncBundle,
+};
 use notes_core::keys::{generate_aux_rand, generate_note_id};
 use notes_core::tx::{NoteTx, Utxo};
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
 use slint_keyos_platform::app_ui;
 use slint_keyos_platform::fs::{self, Location, OpenFlags};
+use slint_keyos_platform::gui_server_api::navigation::qrscanner::{ScanQrOptions, ScanQrResult};
+use slint_keyos_platform::navigation::open_qr_scanner;
 use slint_keyos_platform::qrcode;
 use slint_keyos_platform::slint::{Color, ComponentHandle, Image, Timer, VecModel};
 
@@ -657,24 +661,18 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
-    {
-        let ui_weak = ui_weak.clone();
+    // Shared by file import AND camera scan: parse + merge a bundle,
+    // logging `cb: import-bundle {src} … ok` (src keeps the file=/loc=
+    // shape the UI tests grep).
+    let apply_bundle: Rc<dyn Fn(&str, &str) -> Result<String, String>> = {
         let state = state.clone();
         let identity = identity.clone();
         let fs = fs.clone();
-        let refresh_home = refresh_home.clone();
-        ui.global::<Callbacks>().on_import_bundle(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let result = (|| -> Result<String, String> {
-                let id = identity.as_ref().as_ref().ok_or("identity unavailable")?;
-                let (name, loc, loc_label) =
-                    first_inbox_bundle(&fs).ok_or("no .json bundle in /chain-notes/inbox")?;
-                let json = read_text(&fs, &format!("{INBOX_DIR}/{name}"), loc)?;
-                if loc == Location::Airlock {
-                    unmount_airlock(&fs);
-                }
+        Rc::new(move |json: &str, src: &str| -> Result<String, String> {
+            let id = identity.as_ref().as_ref().ok_or("identity unavailable")?;
+            {
                 let bundle =
-                    SyncBundle::from_json(&json).map_err(|e| format!("bad bundle: {e}"))?;
+                    SyncBundle::from_json(json).map_err(|e| format!("bad bundle: {e}"))?;
                 let mut st = state.borrow_mut();
                 if !bundle.network.is_empty() && bundle.network != st.network {
                     return Err(format!(
@@ -743,17 +741,36 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 save_state(&fs, &st);
 
                 log::info!(
-                    "cb: import-bundle file={name} loc={loc_label} notes={} new={new_notes} utxos={} tip={} ok",
+                    "cb: import-bundle {src} notes={} new={new_notes} utxos={} tip={} ok",
                     recovered.len(),
                     st.utxos.len(),
                     bundle.tip_height
                 );
                 Ok(format!(
-                    "Imported {name}: {} note(s) ({new_notes} new), {} utxo(s), tip {}.",
+                    "Imported ({src}): {} note(s) ({new_notes} new), {} utxo(s), tip {}.",
                     recovered.len(),
                     st.utxos.len(),
                     bundle.tip_height
                 ))
+            }
+        })
+    };
+
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let refresh_home = refresh_home.clone();
+        let apply_bundle = apply_bundle.clone();
+        ui.global::<Callbacks>().on_import_bundle(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let result = (|| -> Result<String, String> {
+                let (name, loc, loc_label) =
+                    first_inbox_bundle(&fs).ok_or("no .json bundle in /chain-notes/inbox")?;
+                let json = read_text(&fs, &format!("{INBOX_DIR}/{name}"), loc)?;
+                if loc == Location::Airlock {
+                    unmount_airlock(&fs);
+                }
+                apply_bundle(&json, &format!("file={name} loc={loc_label}"))
             })();
             match result {
                 Ok(msg) => {
@@ -763,6 +780,54 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 Err(e) => {
                     log::warn!("cb: import-bundle err={e}");
                     ui.global::<Sync>().set_result(e.into());
+                }
+            }
+            refresh_home();
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        let refresh_home = refresh_home.clone();
+        let apply_bundle = apply_bundle.clone();
+        ui.global::<Callbacks>().on_scan_bundle(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let opts = ScanQrOptions {
+                header_title: "Scan sync bundle".into(),
+                message: "Point at the companion's bundle QR (static or animated)".into(),
+                ..ScanQrOptions::default()
+            };
+            // Blocks while the system scanner modal owns the screen; it
+            // reassembles animated UR sequences itself (foundation-ur).
+            let (kind, data) = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
+                Ok(Some(ScanQrResult::Qr(data))) => ("qr", data),
+                Ok(Some(ScanQrResult::Ur2(ur_type, data))) => {
+                    log::info!("cb: scan-bundle ur-type={ur_type}");
+                    ("ur", data)
+                }
+                Ok(_) => {
+                    log::info!("cb: scan-bundle cancelled");
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("cb: scan-bundle err=scanner {e:?}");
+                    ui.global::<Sync>()
+                        .set_result(format!("QR scanner unavailable: {e:?}").into());
+                    return;
+                }
+            };
+            log::info!("cb: scan-bundle kind={kind} bytes={}", data.len());
+            let result = decode_scanned(&data)
+                .map_err(|e| e.to_string())
+                .and_then(|json| apply_bundle(&json, &format!("src=scan-{kind}")));
+            match result {
+                Ok(msg) => {
+                    ui.global::<Sync>().set_result(msg.into());
+                    ui.global::<Ui>().set_error("".into());
+                }
+                Err(e) => {
+                    log::warn!("cb: scan-bundle err={e}");
+                    ui.global::<Sync>().set_result(format!("Scan failed: {e}").into());
                 }
             }
             refresh_home();

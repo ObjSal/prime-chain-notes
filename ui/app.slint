@@ -636,6 +636,11 @@ export component AppWindow inherits Window {
                 text: "Export pending txs";
                 clicked => { Callbacks.export-pending(); }
             }
+            SecondaryAction {
+                width: 100%;
+                text: "Scan bundle 📷";
+                clicked => { Callbacks.scan-bundle(); }
+            }
 
             Text {
                 text: Sync.result;

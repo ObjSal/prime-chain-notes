@@ -93,7 +93,9 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
 `cb: import-bundle file=<f> loc=<l> notes=<n> new=<k> utxos=<m> tip=<h> ok | err=<e>` ·
 `cb: export-pending n=<n> airlock=<ok|err>` ·
 `cb: set-network <net>` ·
-`cb: set-chunk-size <n|auto> ok | err=<msg>`
+`cb: set-chunk-size <n|auto> ok | err=<msg>` ·
+`cb: scan-bundle kind=<qr|ur> bytes=<n>` then `cb: import-bundle
+src=scan-<kind> … ok` · `cb: scan-bundle cancelled | err=<e>`
 
 ## Build / test
 

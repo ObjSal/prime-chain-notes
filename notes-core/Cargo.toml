@@ -17,6 +17,8 @@ hmac = { version = "0.12", default-features = false }
 chacha20poly1305 = "0.10"
 bech32 = "0.11"
 getrandom = "0.2"
+# Scanned-bundle payloads: CNB1 || deflate-raw(json). Pure Rust.
+miniz_oxide = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zeroize = { version = "1", features = ["derive"] }
@@ -27,3 +29,7 @@ hex = "0.4"
 # are verified against rust-bitcoin on the host. Never a device dependency —
 # secp256k1-sys is C and unproven under the SDK toolchain.
 bitcoin = { version = "0.32", features = ["rand-std"] }
+# The EXACT UR decoder the KeyOS system QR scanner runs (see
+# apps/gui-app-qr-scanner) — used to verify the companion's JS UR encoder
+# emits parts the device will actually reassemble.
+foundation-ur = "0.4"
