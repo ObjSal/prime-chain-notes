@@ -129,10 +129,11 @@ bundles carry no relay policy.
 
 - Every note costs a real fee, forever, in public. Private notes hide
   content, not existence, size, or timing.
-- QR broadcast is wired (pending note → "Show tx QR" → companion's
-  "Scan from device" camera → broadcast, no cable); bundles still come
-  IN via file/Airlock — the device-camera leg needs `open_qr_scanner`
-  discovery first.
+- QR sync is wired both ways, no cable needed: pending note → "Show tx
+  QR" → companion camera → broadcast; and companion "Show as QR"
+  (static or animated UR) → device "Scan bundle 📷" (the system scanner
+  reassembles animated sequences itself). File/Airlock remains for
+  restore-sized bundles and oversized txs.
 - Experimental software that signs real spends: Foundation asks
   wallet-adjacent apps to pass their security review
   (hello@foundation.xyz) before mainnet use.
