@@ -224,3 +224,11 @@ first try — log: `cb: scan-bundle kind=qr bytes=221` → `cb: import-bundle
 src=scan-qr … utxos=3 tip=424242 ok`. Screenshot
 `screenshots/live-scan-success.png`. The optical leg needs no further
 caveats: the whole loop is proven end to end.
+
+ANIMATED UR OPTICALLY VERIFIED TOO (2026-07-05): a 2605-byte bundle (50
+utxos + one sealed note) as 14 ur:bytes parts in a 500ms GIF on a phone,
+held to the Mac webcam — the system scanner reassembled the fountain and
+the app imported it (`cb: scan-bundle kind=ur bytes=2605` →
+`src=scan-ur notes=1 new=1 utxos=50 tip=555555 ok`), and the sealed note
+decrypted and displayed ("…rode a fountain of QR codes through a
+webcam", `screenshots/ur-scan-note.png`).
