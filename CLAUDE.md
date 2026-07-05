@@ -63,8 +63,20 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
   (rejects non-finite/≤0/>100k). Rust never overwrites the field while
   tier == 3.
 - Screens: 0 home · 1 notes · 2 note view · 3 compose · 4 confirm ·
-  5 sync (ACTIONS only: import/export + status) · 6 settings (network +
-  chunk picker) — actions and preferences deliberately split.
+  5 sync (ACTIONS only: import/export/scan + status) · 6 settings
+  (network + chunk picker) — actions and preferences deliberately split.
+- Networks: mainnet → testnet4 → signet → regtest (Settings cycle);
+  testnet4/signet share the tb HRP. User-facing copy says "chain height",
+  never "tip" (user decision — reads like a gratuity).
+- QR transports (both verified optically via the sim's webcam): pending
+  note renders its signed tx as a single QR (`set_view_qr`,
+  ≤ MAX_QR_HEX_CHARS=4000; larger → file export) for the companion's
+  camera; bundles come in via Sync "Scan bundle" → `open_qr_scanner` →
+  `decode_scanned` (`CNB1 || deflate-raw(json)`, plain JSON tolerated) —
+  the system scanner reassembles animated UR itself, and the companion's
+  `ur.js` encoder is byte-identical to foundation-ur (cross-checked by
+  `companion/tests/test_companion_qr.py` + the ur_encode/ur_decode
+  examples).
 - Chunk-size picker (Settings screen): Standard (DEFAULT_CHUNK=100000,
   Core v30 relay default) / 80 compat / Custom pills + bytes field
   (`Settings.chunk-*`). **Purely device-side** (user decision 2026-07-05):
