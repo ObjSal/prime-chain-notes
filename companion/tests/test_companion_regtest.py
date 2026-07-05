@@ -124,7 +124,9 @@ def main():
         assert "Encrypted (private)" in shown, shown       # note1 stays sealed
         assert NOTE_TEXT not in shown                      # plaintext never leaks
         assert note3["txid"] in shown, shown
-        assert viewer.locator("#notes a").count() == 0, "regtest has no explorer links"
+        assert viewer.locator("#notes .note-meta a").count() == 0, "regtest has no explorer links"
+        assert viewer.locator("#notes .permalink").count() == len(
+            viewer.evaluate("__cnViewer.notes")), "every note card has a permalink"
         newest = viewer.evaluate("window.__cnViewer.notes[0]")
         assert newest["text"] == VIEWER_NOTE_TEXT, newest  # newest-first ordering
         viewer.screenshot(path=str(SHOTS / "companion-viewer.png"), full_page=True)
@@ -136,8 +138,22 @@ def main():
         viewer.fill("#address", address)
         viewer.click("#loadBtn")
         wait_log("#notes", VIEWER_NOTE_TEXT, viewer)
-        viewer.close()
         print("PASS viewer standalone load")
+
+        # ---- note.html permalinks: public via click, private via direct URL.
+        ids = viewer.evaluate("__cnViewer.notes.map(n => [n.noteId, n.private])")
+        pub_id = next(i for i, priv in ids if not priv)
+        priv_id = next(i for i, priv in ids if priv)
+        viewer.click(f'#notes a[href*="note={pub_id}"]')
+        wait_log("#note", VIEWER_NOTE_TEXT, viewer)
+        assert "note.html" in viewer.url and f"note={pub_id}" in viewer.url, viewer.url
+        assert "Encrypted (private)" not in viewer.locator("#note").text_content()
+        viewer.goto(BASE + f"/note.html?address={address}&network=regtest&note={priv_id}")
+        wait_log("#note", "Encrypted (private)", viewer)
+        assert NOTE_TEXT not in viewer.locator("#note").text_content()
+        viewer.screenshot(path=str(SHOTS / "companion-note.png"), full_page=True)
+        viewer.close()
+        print("PASS single-note page: public via permalink click, private via direct link")
 
         # Fresh bundle so the camera-test note can't double-spend note3's coin.
         bundle3 = build_and_download(page, tmp)
