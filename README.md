@@ -90,15 +90,39 @@ run `foundation sim` once to generate `manifest.toml`.
   "device" broadcasts on a real regtest node with the txid the device
   predicted, and a wiped app restores the note from bare chain data.
 
+## The companion (`companion/`)
+
+The online half — one static page + an optional local server:
+
+```bash
+python3 companion/server.py 8091            # static (mainnet/testnet4/signet)
+python3 companion/server.py 8091 --regtest  # + managed local regtest node
+```
+
+`index.html` builds **sync bundles** (full address-history pagination,
+fee tiers, prices, endpoint relay policy) and **broadcasts** the device's
+`.hex` exports, against mempool.space — or against a local regtest node
+that `server.py` exposes through the *same mempool-shaped API*, so the
+page treats regtest as just another base URL. The regtest option only
+appears when the local server is detected. Playwright tests drive the
+real rendered page: `tests/test_companion_regtest.py` (hermetic) and
+`tests/test_companion_testnet4.py` (live).
+
+**Relay policy, verified live (2026-07-05):** mempool.space/testnet4
+accepted a 224-byte single OP_RETURN
+([tx](https://mempool.space/testnet4/tx/9097778ec53b2b5b9f8270a7e404487643bdbdccaa81bf8af7aafb3b0404b8bc))
+— Bitcoin Core v30 defaults — so the companion advertises
+`max_op_return_bytes: 100000` everywhere, and the old 80-byte chunking
+remains available via the Advanced field / device Settings.
+
 ## Honest caveats
 
 - Every note costs a real fee, forever, in public. Private notes hide
   content, not existence, size, or timing.
-- Companion web pages (mempool.space sync/broadcast) are not built yet —
-  the regtest scripts play that role today. QR transports (animated UR
-  out, camera in) are designed but not wired.
-- Experimental software that signs real spends: signet first, and
-  Foundation asks wallet-adjacent apps to pass their security review
+- QR transports (animated UR out, camera in) are designed but not wired;
+  sync is file/Airlock based today.
+- Experimental software that signs real spends: Foundation asks
+  wallet-adjacent apps to pass their security review
   (hello@foundation.xyz) before mainnet use.
 
 Design docs live in the workspace: `../PLAN-chain-notes.md` (this app) and

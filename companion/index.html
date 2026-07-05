@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chain Notes — Companion</title>
+<style>
+  :root { --bg:#101418; --card:#1a2027; --border:#2c3540; --fg:#e8edf2;
+          --muted:#8b98a5; --accent:#59a8bd; --danger:#e05d5d; --ok:#5dbd7a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 780px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 26px; margin: 8px 0 2px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+  section { background:var(--card); border:1px solid var(--border);
+            border-radius:14px; padding:18px; margin:16px 0; }
+  h2 { font-size:18px; margin:0 0 12px; }
+  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 4px; }
+  input[type=text], textarea, select {
+    width:100%; padding:10px 12px; border-radius:10px; border:1px solid var(--border);
+    background:#11161b; color:var(--fg); font:14px ui-monospace, Menlo, monospace; }
+  textarea { min-height:90px; resize:vertical; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:10px;
+           padding:10px 18px; font-size:15px; font-weight:600; cursor:pointer; margin-top:12px; }
+  button.secondary { background:transparent; border:1px solid var(--border); color:var(--fg); }
+  button:disabled { opacity:.45; cursor:default; }
+  .row { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
+  .row > div { flex:1; min-width:180px; }
+  .log { font:13px ui-monospace, Menlo, monospace; white-space:pre-wrap;
+         background:#0c1013; border-radius:10px; padding:12px; margin-top:12px;
+         max-height:260px; overflow:auto; color:var(--muted); }
+  .log .err { color:var(--danger); } .log .ok { color:var(--ok); }
+  .summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+             gap:10px; margin-top:12px; }
+  .stat { background:#11161b; border-radius:10px; padding:10px 12px; }
+  .stat b { display:block; font-size:17px; } .stat span { font-size:12px; color:var(--muted); }
+  details { margin-top:10px; } summary { color:var(--muted); font-size:13px; cursor:pointer; }
+  a { color: var(--accent); }
+  .pill { font-size:11px; padding:2px 8px; border-radius:10px; background:#11161b;
+          border:1px solid var(--border); color:var(--muted); vertical-align:middle; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Chain Notes — Companion <span class="pill" id="modePill">static</span></h1>
+  <p class="sub">The online half of the offline notes app: builds <b>sync bundles</b>
+  from the blockchain for the device to import, and <b>broadcasts</b> the
+  transactions the device signs. No keys ever touch this page.</p>
+
+  <section>
+    <h2>Network</h2>
+    <div class="row">
+      <div>
+        <select id="network">
+          <option value="mainnet">Mainnet</option>
+          <option value="testnet4">Testnet4</option>
+          <option value="signet">Signet</option>
+          <option value="regtest">Regtest (local server)</option>
+        </select>
+      </div>
+      <div id="faucetBox" style="display:none">
+        <button class="secondary" id="faucetBtn" style="margin-top:0">Faucet → address below</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>1 · Build a sync bundle</h2>
+    <label>Notes address (from the device's home screen)</label>
+    <input type="text" id="address" placeholder="bc1p… / tb1p… / bcrt1p…" spellcheck="false">
+    <details>
+      <summary>Advanced: OP_RETURN relay policy for this endpoint</summary>
+      <label>max_op_return_bytes advertised in the bundle</label>
+      <input type="text" id="maxOr" inputmode="numeric">
+      <p class="sub" style="margin-top:6px">Bitcoin Core v30 default is 100000.
+      The device chunks notes to fit whatever is set here.</p>
+    </details>
+    <button id="buildBtn">Build sync bundle</button>
+    <button class="secondary" id="downloadBtn" disabled>Download bundle.json</button>
+    <div class="summary" id="summary" style="display:none">
+      <div class="stat"><b id="sBalance">—</b><span>balance (sats)</span></div>
+      <div class="stat"><b id="sUtxos">—</b><span>utxos</span></div>
+      <div class="stat"><b id="sNotes">—</b><span>note-carrying txs</span></div>
+      <div class="stat"><b id="sTip">—</b><span>tip height</span></div>
+      <div class="stat"><b id="sFees">—</b><span>fees sat/vB (f/h/e)</span></div>
+    </div>
+    <div class="log" id="syncLog" style="display:none"></div>
+  </section>
+
+  <section>
+    <h2>2 · Broadcast signed transactions</h2>
+    <p class="sub">Drop the <code>.hex</code> file(s) the device exported to
+    <code>/chain-notes/outbox</code>, or paste raw hex.</p>
+    <input type="file" id="hexFiles" accept=".hex,.txt" multiple>
+    <label>…or paste raw transaction hex</label>
+    <textarea id="hexPaste" placeholder="02000000…" spellcheck="false"></textarea>
+    <button id="broadcastBtn">Broadcast</button>
+    <div class="log" id="bcastLog" style="display:none"></div>
+  </section>
+
+  <p class="sub">Endpoints: mempool.space (mainnet/testnet4/signet) or the local
+  regtest shim. Bundles contain only public chain data; transactions you
+  broadcast are already signed and final.</p>
+</main>
+
+<script>
+"use strict";
+
+const API = {
+  mainnet:  { base: "https://mempool.space/api",          explorer: "https://mempool.space" },
+  testnet4: { base: "https://mempool.space/testnet4/api", explorer: "https://mempool.space/testnet4" },
+  signet:   { base: "https://mempool.space/signet/api",   explorer: "https://mempool.space/signet" },
+  regtest:  { base: "/regtest/api",                       explorer: null },
+};
+// mempool.space runs Bitcoin Core v30 defaults — VERIFIED 2026-07-05 on
+// testnet4: a 224-byte single OP_RETURN was accepted and mined (txid
+// 9097778ec53b…). Signet/mainnet share the operator defaults; if an
+// endpoint ever rejects, the reason surfaces in the broadcast log and the
+// Advanced field lowers the policy for the next bundle.
+const DEFAULT_MAX_OP_RETURN = { mainnet: 100000, testnet4: 100000, signet: 100000, regtest: 100000 };
+
+let serverMode = false;
+let bundle = null;
+
+const $ = (id) => document.getElementById(id);
+const net = () => $("network").value;
+
+function log(el, msg, cls) {
+  el.style.display = "block";
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+async function api(path, opts) {
+  const resp = await fetch(API[net()].base + path, opts);
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(text || resp.statusText);
+  return text;
+}
+const apiJson = async (path) => JSON.parse(await api(path));
+
+/* ------------------------------------------------ init / network UI */
+(async function init() {
+  try {
+    const r = await fetch("/api/health", { signal: AbortSignal.timeout(1500) });
+    const d = await r.json();
+    serverMode = d.status === "ok" && d.regtest;
+  } catch { serverMode = false; }
+  if (!serverMode) {
+    document.querySelector('#network option[value="regtest"]').remove();
+  } else {
+    $("network").value = "regtest";
+    $("modePill").textContent = "local server · regtest available";
+  }
+  onNetworkChange();
+})();
+
+function onNetworkChange() {
+  $("maxOr").value = DEFAULT_MAX_OP_RETURN[net()];
+  $("faucetBox").style.display = net() === "regtest" ? "block" : "none";
+  bundle = null;
+  $("downloadBtn").disabled = true;
+  $("summary").style.display = "none";
+}
+$("network").addEventListener("change", onNetworkChange);
+
+/* -------------------------------------------------- OP_RETURN parse */
+// scriptPubKey hex → pushed payload hex (single canonical push), or null.
+function opReturnPayload(spkHex) {
+  const b = spkHex.toLowerCase();
+  if (!b.startsWith("6a")) return null;
+  let rest = b.slice(2);
+  const op = parseInt(rest.slice(0, 2), 16);
+  let len, data;
+  if (op >= 1 && op <= 75)      { len = op; data = rest.slice(2); }
+  else if (op === 0x4c)         { len = parseInt(rest.slice(2, 4), 16); data = rest.slice(4); }
+  else if (op === 0x4d)         { len = parseInt(rest.slice(4, 6) + rest.slice(2, 4), 16); data = rest.slice(6); }
+  else return null;
+  return data.length === len * 2 ? data : null;
+}
+
+/* --------------------------------------------------- bundle builder */
+async function fullHistory(address, logEl) {
+  // First page: /txs = up to 50 mempool + first 25 confirmed.
+  const txs = await apiJson(`/address/${address}/txs`);
+  let confirmed = txs.filter((t) => t.status.confirmed);
+  let last = confirmed.length ? confirmed[confirmed.length - 1].txid : null;
+  // Paginate the confirmed chain until a short page.
+  while (last) {
+    const page = await apiJson(`/address/${address}/txs/chain?after_txid=${last}`);
+    if (!page.length) break;
+    txs.push(...page);
+    log(logEl, `  …paged ${page.length} more confirmed txs`);
+    last = page.length >= 25 ? page[page.length - 1].txid : null;
+  }
+  const seen = new Set();
+  return txs.filter((t) => !seen.has(t.txid) && seen.add(t.txid));
+}
+
+$("buildBtn").addEventListener("click", async () => {
+  const address = $("address").value.trim();
+  const logEl = $("syncLog");
+  logEl.textContent = "";
+  if (!address) return log(logEl, "Enter the notes address first.", "err");
+  $("buildBtn").disabled = true;
+  try {
+    log(logEl, `Scanning ${address} on ${net()}…`);
+    const [tip, utxos, txs] = await Promise.all([
+      api("/blocks/tip/height").then(Number),
+      apiJson(`/address/${address}/utxo`),
+      fullHistory(address, logEl),
+    ]);
+    let fees = { fastestFee: 2, halfHourFee: 2, hourFee: 1, economyFee: 1, minimumFee: 1 };
+    try { fees = await apiJson("/v1/fees/recommended"); }
+    catch { log(logEl, "  fee endpoint unavailable — using 1-2 sat/vB placeholders"); }
+    let btcUsd = null;
+    if (net() === "mainnet" || net() === "regtest") {
+      try { btcUsd = (await apiJson("/v1/prices")).USD; } catch {}
+    }
+
+    const notesOnchain = txs
+      .map((t) => {
+        const payloads = t.vout
+          .filter((o) => o.scriptpubkey_type === "op_return")
+          .map((o) => opReturnPayload(o.scriptpubkey))
+          .filter(Boolean);
+        if (!payloads.length) return null;
+        const spendsFromSelf = t.vin.some(
+          (i) => i.prevout && i.prevout.scriptpubkey_address === address
+        );
+        return {
+          txid: t.txid,
+          height: t.status.confirmed ? t.status.block_height : null,
+          blocktime: t.status.confirmed ? t.status.block_time : null,
+          spends_from_self: spendsFromSelf,
+          payloads,
+        };
+      })
+      .filter(Boolean);
+
+    bundle = {
+      network: net(),
+      full: true,
+      since_height: null,
+      tip_height: tip,
+      bundle_time: Math.floor(Date.now() / 1000),
+      max_op_return_bytes: parseInt($("maxOr").value, 10) || DEFAULT_MAX_OP_RETURN[net()],
+      fee_rates: fees,
+      btc_usd: btcUsd,
+      utxos: utxos.map((u) => ({
+        txid: u.txid, vout: u.vout, value: u.value,
+        height: u.status.confirmed ? u.status.block_height : null,
+      })),
+      notes_onchain: notesOnchain,
+    };
+
+    const balance = bundle.utxos.reduce((a, u) => a + u.value, 0);
+    $("sBalance").textContent = balance.toLocaleString();
+    $("sUtxos").textContent = bundle.utxos.length;
+    $("sNotes").textContent = notesOnchain.length;
+    $("sTip").textContent = tip;
+    $("sFees").textContent = `${fees.fastestFee}/${fees.halfHourFee}/${fees.economyFee}`;
+    $("summary").style.display = "grid";
+    $("downloadBtn").disabled = false;
+    log(logEl, `Bundle ready: ${bundle.utxos.length} utxo(s), ` +
+      `${notesOnchain.length} note tx(s), ${txs.length} total txs scanned.`, "ok");
+    log(logEl, "Download it and copy to the device's /chain-notes/inbox/.");
+  } catch (e) {
+    log(logEl, `Failed: ${e.message}`, "err");
+  } finally {
+    $("buildBtn").disabled = false;
+  }
+});
+
+$("downloadBtn").addEventListener("click", () => {
+  if (!bundle) return;
+  const blob = new Blob([JSON.stringify(bundle, null, 1)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `bundle-${bundle.network}-${bundle.tip_height}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+/* ------------------------------------------------------- broadcast */
+async function broadcastOne(name, hex, logEl) {
+  hex = hex.trim();
+  if (!/^[0-9a-fA-F]{60,}$/.test(hex)) {
+    log(logEl, `${name}: not raw tx hex — skipped`, "err");
+    return;
+  }
+  try {
+    const txid = (await api("/tx", { method: "POST", body: hex })).trim();
+    const ex = API[net()].explorer;
+    log(logEl, `${name}: accepted ✓ ${txid}`, "ok");
+    if (ex) log(logEl, `  ${ex}/tx/${txid}`);
+    else log(logEl, "  (regtest: auto-mined 1 block)");
+  } catch (e) {
+    // Surface the endpoint's reject-reason verbatim — this is how relay
+    // policy (e.g. OP_RETURN size limits) shows itself.
+    log(logEl, `${name}: REJECTED — ${e.message}`, "err");
+  }
+}
+
+$("broadcastBtn").addEventListener("click", async () => {
+  const logEl = $("bcastLog");
+  logEl.textContent = "";
+  const files = $("hexFiles").files;
+  const pasted = $("hexPaste").value.trim();
+  if (!files.length && !pasted) return log(logEl, "Nothing to broadcast.", "err");
+  $("broadcastBtn").disabled = true;
+  try {
+    for (const f of files) await broadcastOne(f.name, await f.text(), logEl);
+    if (pasted) await broadcastOne("pasted hex", pasted, logEl);
+  } finally {
+    $("broadcastBtn").disabled = false;
+  }
+});
+
+/* ---------------------------------------------------------- faucet */
+$("faucetBtn").addEventListener("click", async () => {
+  const logEl = $("syncLog");
+  const address = $("address").value.trim();
+  if (!address) return log(logEl, "Enter the notes address first.", "err");
+  try {
+    const r = JSON.parse(await api("/faucet", {
+      method: "POST", body: JSON.stringify({ address, amount: 0.001 }),
+    }));
+    log(logEl, `Faucet sent 100000 sats: ${r.txid} (mined)`, "ok");
+  } catch (e) {
+    log(logEl, `Faucet failed: ${e.message}`, "err");
+  }
+});
+</script>
+</body>
+</html>

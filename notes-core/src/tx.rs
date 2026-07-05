@@ -215,6 +215,55 @@ pub struct NoteTx {
     pub spent_outpoints: Vec<([u8; 32], u32)>,
 }
 
+/// Build and sign a sweep: spend ALL `available` UTXOs (ours, key-path)
+/// into a single external output `dest_spk`, everything minus fee. Used to
+/// move funds off the notes address (e.g. returning testnet coins).
+pub fn build_sweep_tx(
+    available: &[Utxo],
+    our_output_x: &[u8; 32],
+    dest_spk: Vec<u8>,
+    fee_rate: f64,
+    tweaked_seckey: &[u8; 32],
+    mut aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    if available.is_empty() {
+        return Err(Error::InsufficientFunds);
+    }
+    let n = available.len();
+    let in_value: u64 = available.iter().map(|u| u.value).sum();
+    let base = 4 + varint_len(n) + n * 41 + 1 + (8 + varint_len(dest_spk.len()) + dest_spk.len()) + 4;
+    let witness = 2 + n * 66;
+    let vsize = (base * 4 + witness).div_ceil(4);
+    let fee = (vsize as f64 * fee_rate).ceil() as u64;
+    if in_value <= fee || in_value - fee < DUST_LIMIT {
+        return Err(Error::InsufficientFunds);
+    }
+
+    let mut tx = Transaction {
+        version: 2,
+        lock_time: 0,
+        inputs: available.to_vec(),
+        outputs: vec![TxOut { value: in_value - fee, script_pubkey: dest_spk }],
+        witnesses: Vec::new(),
+    };
+    let our_spk = p2tr_script_pubkey(our_output_x);
+    let prevout_spks: Vec<Vec<u8>> = tx.inputs.iter().map(|_| our_spk.clone()).collect();
+    for index in 0..tx.inputs.len() {
+        let sighash = taproot_key_spend_sighash(&tx, &prevout_spks, index);
+        let sig = schnorr_sign(tweaked_seckey, &sighash, &aux()?)?;
+        tx.witnesses.push(vec![sig.to_vec()]);
+    }
+    Ok(NoteTx {
+        fee,
+        change: 0,
+        vsize: tx.vsize(),
+        txid_hex: tx.txid_hex(),
+        raw_hex: hex::encode(tx.serialize_segwit()),
+        spent_outpoints: tx.inputs.iter().map(|i| (i.txid, i.vout)).collect(),
+        tx,
+    })
+}
+
 /// Build and sign a note tx: OP_RETURN outputs for `payloads`, change back
 /// to `output_x` (our own tweaked key), inputs selected largest-first from
 /// `available` until value covers payload fee at `fee_rate` sat/vB.
