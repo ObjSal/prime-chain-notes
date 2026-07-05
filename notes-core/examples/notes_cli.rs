@@ -9,7 +9,7 @@
 use std::io::Read;
 
 use notes_core::bundle::{compose_note, extract_notes, Identity, SyncBundle};
-use notes_core::keys::{generate_aux_rand, generate_note_id};
+use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::Network;
 
 fn app_seed() -> [u8; 32] {
@@ -50,7 +50,19 @@ fn main() {
             let fee_rate: f64 = args[4].parse().unwrap();
             let max_or: usize = args[5].parse().unwrap();
             let text = &args[6];
-            let note_id = generate_note_id().unwrap();
+            // Reroll against every note id already visible in the bundle
+            // (self-collision guard; foreign ids included — a wider taken
+            // set is harmless).
+            let taken: std::collections::BTreeSet<[u8; 4]> = bundle
+                .notes_onchain
+                .iter()
+                .flat_map(|t| t.payloads.iter())
+                .filter_map(|p| hex::decode(p).ok())
+                .filter_map(|p| notes_core::envelope::decode(&p))
+                .map(|c| c.note_id)
+                .collect();
+            let note_id =
+                pick_unique_note_id(generate_note_id, |id| taken.contains(id)).unwrap();
             let note = compose_note(
                 &identity,
                 &bundle.utxos(),
