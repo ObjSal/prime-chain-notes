@@ -212,8 +212,10 @@ localhost pattern and improving on it:
   scanning time; file/Airlock remains the restore path of choice.
 - Companion hosting (GitHub Pages) — the page already behaves correctly
   in static mode (regtest hidden); publishing is a repo/ops decision.
-- App-side network enum has no testnet4 variant (CLI used `signet` for
-  the tb HRP on testnet4); add one if the app itself should sync testnet4.
+- ~~App-side testnet4 variant~~ DONE (2026-07-05): `Network::Testnet4`
+  (tb HRP shared with signet), app cycle mainnet → testnet4 → signet →
+  regtest, `from_str_opt` accepts "testnet4"/"testnet" — companion
+  testnet4 bundles now import into the app directly.
 - Foundation security review before any mainnet use.
 - Fee-bump (RBF) UI; the tx already signals RBF (sequence 0xfffffffd) and
   note_id survives re-signing by design.

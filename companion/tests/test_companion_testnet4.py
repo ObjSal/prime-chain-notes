@@ -106,7 +106,7 @@ def build_and_download(page, tmp, tag):
 
 
 def main():
-    address = cli("address", "signet")  # tb1p — same HRP as testnet4
+    address = cli("address", "testnet4")
     print(f"notes identity (throwaway): {address}")
     tmp = Path(tempfile.mkdtemp(prefix="companion_t4_"))
     verdict = {}
@@ -169,7 +169,7 @@ def main():
         print("PASS note recovered from page-built testnet bundle")
 
         # Return every remaining sat to the funding address.
-        sweep = json.loads(cli("sweep", str(b2), "signet", FUND_ADDR, "1"))
+        sweep = json.loads(cli("sweep", str(b2), "testnet4", FUND_ADDR, "1"))
         out = broadcast_via_page(page, "sweep", sweep["raw_hex"])
         print(f"PASS sweep back to {FUND_ADDR}: {sweep['txid']} "
               f"({sweep['value_out']} sats returned, {sweep['fee']} fee)")

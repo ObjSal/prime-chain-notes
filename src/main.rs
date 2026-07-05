@@ -881,7 +881,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         ui.global::<Callbacks>().on_cycle_network(move || {
             let mut st = state.borrow_mut();
             st.network = match st.network.as_str() {
-                "mainnet" => "signet".into(),
+                "mainnet" => "testnet4".into(),
+                "testnet4" => "signet".into(),
                 "signet" => "regtest".into(),
                 _ => "mainnet".into(),
             };

@@ -78,6 +78,8 @@ fn address_matches_rust_bitcoin() {
 
     for (network, btc_network) in [
         (Network::Mainnet, bitcoin::Network::Bitcoin),
+        // rust-bitcoin's Testnet(3) shares the tb HRP with testnet4.
+        (Network::Testnet4, bitcoin::Network::Testnet),
         (Network::Signet, bitcoin::Network::Signet),
         (Network::Regtest, bitcoin::Network::Regtest),
     ] {

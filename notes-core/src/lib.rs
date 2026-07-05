@@ -54,6 +54,7 @@ impl std::error::Error for Error {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
     Mainnet,
+    Testnet4,
     Signet,
     Regtest,
 }
@@ -62,7 +63,8 @@ impl Network {
     pub fn hrp(self) -> bech32::Hrp {
         match self {
             Network::Mainnet => bech32::hrp::BC,
-            Network::Signet => bech32::hrp::TB,
+            // Testnet4 and signet share the tb HRP (BIP173/350).
+            Network::Testnet4 | Network::Signet => bech32::hrp::TB,
             Network::Regtest => bech32::hrp::BCRT,
         }
     }
@@ -70,6 +72,7 @@ impl Network {
     pub fn as_str(self) -> &'static str {
         match self {
             Network::Mainnet => "mainnet",
+            Network::Testnet4 => "testnet4",
             Network::Signet => "signet",
             Network::Regtest => "regtest",
         }
@@ -78,6 +81,7 @@ impl Network {
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
             "mainnet" => Some(Network::Mainnet),
+            "testnet4" | "testnet" => Some(Network::Testnet4),
             "signet" => Some(Network::Signet),
             "regtest" => Some(Network::Regtest),
             _ => None,
