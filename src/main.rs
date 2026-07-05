@@ -23,6 +23,11 @@ type Fs = fs::FileSystem<fs_permissions::FileSystemPermissions>;
 /// Below this the 12-byte envelope header dominates and a 255-chunk note
 /// holds almost nothing.
 const MIN_CHUNK: usize = 20;
+/// Default chunk ceiling: Bitcoin Core v30's relay default (verified live
+/// on mempool.space). Chunk size is a pure DEVICE setting — bundles carry
+/// no relay policy; if an endpoint rejects, pick "80 compat" in Settings
+/// and recompose.
+const DEFAULT_CHUNK: usize = 100_000;
 
 const STATE_DIR: &str = "/.chain-notes";
 const STATE_PATH: &str = "/.chain-notes/state.json";
@@ -61,10 +66,7 @@ struct State {
     utxos: Vec<UtxoRec>,
     tip_height: Option<u64>,
     bundle_time: Option<u64>,
-    max_op_return_bytes: usize,
-    /// User-picked chunk size; None = follow the bundle policy. Never
-    /// exceeds max_op_return_bytes (validated on entry, clamped on use in
-    /// case a later import lowers the policy below a saved override).
+    /// User-picked chunk size; None = DEFAULT_CHUNK. Purely device-side.
     chunk_override: Option<usize>,
     fee_economy: f64,
     fee_normal: f64,
@@ -80,7 +82,6 @@ impl Default for State {
             utxos: Vec::new(),
             tip_height: None,
             bundle_time: None,
-            max_op_return_bytes: 80,
             chunk_override: None,
             fee_economy: 1.0,
             fee_normal: 2.0,
@@ -112,11 +113,11 @@ impl State {
     }
 
     /// Chunk size actually used for composing: the override clamped into
-    /// [MIN_CHUNK, bundle policy], or the bundle policy itself.
+    /// [MIN_CHUNK, DEFAULT_CHUNK], or DEFAULT_CHUNK.
     fn effective_chunk(&self) -> usize {
         self.chunk_override
-            .map(|c| c.clamp(MIN_CHUNK, self.max_op_return_bytes))
-            .unwrap_or(self.max_op_return_bytes)
+            .map(|c| c.clamp(MIN_CHUNK, DEFAULT_CHUNK))
+            .unwrap_or(DEFAULT_CHUNK)
     }
 
     fn fee_rate(&self, tier: i32) -> f64 {
@@ -313,12 +314,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let sync = ui.global::<Sync>();
             sync.set_status(
                 format!(
-                    "network: {}\nbalance: {} sats · {} utxos\ntip: {} · max OP_RETURN: {} bytes\nfees (sat/vB): {}/{}/{} · chunk: {} bytes",
+                    "network: {}\nbalance: {} sats · {} utxos\ntip: {}\nfees (sat/vB): {}/{}/{} · chunk: {} bytes",
                     st.network,
                     st.balance(),
                     st.utxos.len(),
                     st.tip_height.map(|h| h.to_string()).unwrap_or("—".into()),
-                    st.max_op_return_bytes,
                     st.fee_economy,
                     st.fee_normal,
                     st.fee_fast,
@@ -723,7 +723,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     .collect();
                 st.tip_height = Some(bundle.tip_height);
                 st.bundle_time = Some(bundle.bundle_time);
-                st.max_op_return_bytes = bundle.max_op_return_bytes;
+                // Chunk size is a pure device setting — any relay-policy
+                // field in the bundle is deliberately ignored.
                 if bundle.fee_rates.economy > 0.0 {
                     st.fee_economy = bundle.fee_rates.economy;
                 }
@@ -834,16 +835,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 0 => st.chunk_override = None,
                 1 => st.chunk_override = Some(80),
                 _ => {
-                    // Custom: validate against the bundle policy — a chunk
-                    // may never exceed max_op_return_bytes.
                     match settings.get_chunk_text().trim().parse::<usize>() {
-                        Ok(n) if (MIN_CHUNK..=st.max_op_return_bytes).contains(&n) => {
+                        Ok(n) if (MIN_CHUNK..=DEFAULT_CHUNK).contains(&n) => {
                             st.chunk_override = Some(n);
                         }
                         _ => {
                             let msg = format!(
-                                "Chunk size must be {MIN_CHUNK}–{} bytes.",
-                                st.max_op_return_bytes
+                                "Chunk size must be {MIN_CHUNK}–{DEFAULT_CHUNK} bytes."
                             );
                             log::warn!("cb: set-chunk-size err={msg}");
                             settings.set_chunk_error(msg.into());

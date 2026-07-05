@@ -70,7 +70,7 @@ def main():
         bundle1 = build_and_download(page, tmp)
         b1 = json.loads(bundle1.read_text())
         assert b1["network"] == "regtest" and b1["utxos"], b1
-        assert b1["max_op_return_bytes"] == 100000
+        assert "max_op_return_bytes" not in b1, "chunk policy is device-side now"
         print(f"PASS bundle built+downloaded ({bundle1.name}: {len(b1['utxos'])} utxo, tip {b1['tip_height']})")
         page.screenshot(path=str(SHOTS / "companion-bundle.png"), full_page=True)
 

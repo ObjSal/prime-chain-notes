@@ -69,13 +69,6 @@
     <h2>1 · Build a sync bundle</h2>
     <label>Notes address (from the device's home screen)</label>
     <input type="text" id="address" placeholder="bc1p… / tb1p… / bcrt1p…" spellcheck="false">
-    <details>
-      <summary>Advanced: OP_RETURN relay policy for this endpoint</summary>
-      <label>max_op_return_bytes advertised in the bundle</label>
-      <input type="text" id="maxOr" inputmode="numeric">
-      <p class="sub" style="margin-top:6px">Bitcoin Core v30 default is 100000.
-      The device chunks notes to fit whatever is set here.</p>
-    </details>
     <button id="buildBtn">Build sync bundle</button>
     <button class="secondary" id="downloadBtn" disabled>Download bundle.json</button>
     <div class="summary" id="summary" style="display:none">
@@ -113,12 +106,11 @@ const API = {
   signet:   { base: "https://mempool.space/signet/api",   explorer: "https://mempool.space/signet" },
   regtest:  { base: "/regtest/api",                       explorer: null },
 };
-// mempool.space runs Bitcoin Core v30 defaults — VERIFIED 2026-07-05 on
-// testnet4: a 224-byte single OP_RETURN was accepted and mined (txid
-// 9097778ec53b…). Signet/mainnet share the operator defaults; if an
-// endpoint ever rejects, the reason surfaces in the broadcast log and the
-// Advanced field lowers the policy for the next bundle.
-const DEFAULT_MAX_OP_RETURN = { mainnet: 100000, testnet4: 100000, signet: 100000, regtest: 100000 };
+// NOTE: chunk size is a device-side setting (app Settings screen), not
+// bundle data — if an endpoint rejects an oversized OP_RETURN, the reason
+// surfaces in the broadcast log below and the user picks "80 compat" on
+// the device and recomposes. (mempool.space accepts Core v30 defaults —
+// verified 2026-07-05 on testnet4 with a 224-byte single OP_RETURN.)
 
 let serverMode = false;
 let bundle = null;
@@ -160,7 +152,6 @@ const apiJson = async (path) => JSON.parse(await api(path));
 })();
 
 function onNetworkChange() {
-  $("maxOr").value = DEFAULT_MAX_OP_RETURN[net()];
   $("faucetBox").style.display = net() === "regtest" ? "block" : "none";
   bundle = null;
   $("downloadBtn").disabled = true;
@@ -248,7 +239,6 @@ $("buildBtn").addEventListener("click", async () => {
       since_height: null,
       tip_height: tip,
       bundle_time: Math.floor(Date.now() / 1000),
-      max_op_return_bytes: parseInt($("maxOr").value, 10) || DEFAULT_MAX_OP_RETURN[net()],
       fee_rates: fees,
       btc_usd: btcUsd,
       utxos: utxos.map((u) => ({
