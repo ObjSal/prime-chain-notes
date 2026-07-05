@@ -218,6 +218,14 @@ localhost pattern and improving on it:
   scanAddress, note-card builder) out of viewer.html into `chain-scan.js`
   so the FROZEN-format parser exists in exactly one JS place. e2e covers
   permalink click (public) + direct URL (private placeholder).
+- `tests/test_chain_scan.js` (node, no network/browser): runs the shipped
+  chain-scan.js in a vm against synthetic esplora JSON — proves notes with
+  chunks spread ACROSS TRANSACTIONS reassemble (both txids listed, height
+  = first confirmation), duplicates dedup (dup-carrying tx deliberately
+  NOT listed, matching Rust extract_notes), missing chunks surface as
+  partial x/y, spoof txs (not spends-from-self) are ignored. Today's
+  composer packs all chunks in one tx; cross-tx tolerance is protocol
+  future-proofing shared with the device scanner.
 
 ## Not yet done / next
 
