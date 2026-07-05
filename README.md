@@ -15,11 +15,16 @@ the device, restore the seed, rescan the chain — every note comes back,
 private ones decrypted, with nothing stored anywhere else.
 
 <p align="center">
-  <img src="screenshots/chain-notes-home.png" alt="Home — address QR, balance, sync status" width="270">
+  <img src="screenshots/cn5-home.png" alt="Home — address QR, balance, sync status" width="270">
   &nbsp;
-  <img src="screenshots/cn-typed.png" alt="Compose — live keystroke cost estimate" width="270">
+  <img src="screenshots/cn4-auto.png" alt="Compose — live keystroke cost estimate with fee tiers and custom sat/vB" width="270">
   &nbsp;
   <img src="screenshots/cn-note.png" alt="A private note restored from chain data after a device wipe" width="270">
+</p>
+<p align="center">
+  <img src="screenshots/cn5-settings.png" alt="Settings — network and OP_RETURN chunk-size policy" width="270">
+  &nbsp;
+  <img src="screenshots/t4-probe.png" alt="Companion page broadcasting the 224-byte single-OP_RETURN probe on testnet4" width="270">
 </p>
 
 ## How it works
@@ -91,6 +96,10 @@ run `foundation sim` once to generate `manifest.toml`.
   predicted, and a wiped app restores the note from bare chain data.
 
 ## The companion (`companion/`)
+
+**Hosted: https://objsal.github.io/chain-notes-companion/** (deploy
+mirror in the public `chain-notes-companion` repo, published via
+`scripts/publish-companion.sh` — this directory is canonical).
 
 The online half — one static page + an optional local server:
 
