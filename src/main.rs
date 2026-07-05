@@ -4,8 +4,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use notes_core::address::Recipient;
 use notes_core::bundle::{
-    compose_note, decode_scanned, estimate_note_cost, extract_notes, Identity, SyncBundle,
+    compose_directed_note, compose_note, decode_scanned, estimate_note_cost, extract_notes,
+    Identity, SyncBundle,
 };
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::tx::{NoteTx, Utxo};
@@ -53,6 +55,15 @@ struct NoteRec {
     height: Option<u64>,
     blocktime: Option<u64>,
     status: String, // "pending" | "confirmed"
+    // Directed notes (all default so pre-existing state.json loads as-is).
+    #[serde(default)]
+    directed: bool,
+    /// Recipient address of a note we sent to someone else.
+    #[serde(default)]
+    to: Option<String>,
+    /// Sender address of a note someone sent to us.
+    #[serde(default)]
+    from: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -145,6 +156,7 @@ struct Plan {
     private: bool,
     note_id: [u8; 4],
     chunks: u64,
+    recipient: Option<String>,
 }
 
 // ------------------------------------------------------------- helpers
@@ -264,6 +276,15 @@ fn preview_of(text: &str) -> String {
     p
 }
 
+/// Compact address form for list rows: first 8 + last 6 chars.
+fn short_addr(addr: &str) -> String {
+    if addr.len() > 17 {
+        format!("{}…{}", &addr[..8], &addr[addr.len() - 6..])
+    } else {
+        addr.to_string()
+    }
+}
+
 // ---------------------------------------------------------------- main
 
 fn app_main(cx: AppContext, ui: AppWindow) {
@@ -363,9 +384,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 .map(|n| NoteRow {
                     id: n.id.clone().into(),
                     preview: preview_of(&n.text).into(),
-                    meta: match n.height {
-                        Some(h) => format!("block {h} · {} chunk(s)", n.chunks.max(1)),
-                        None => format!("pending · fee {} sats", n.fee),
+                    meta: {
+                        let base = match n.height {
+                            Some(h) => format!("block {h} · {} chunk(s)", n.chunks.max(1)),
+                            None => format!("pending · fee {} sats", n.fee),
+                        };
+                        match (&n.from, &n.to) {
+                            (Some(from), _) => format!("{base} · from {}", short_addr(from)),
+                            (None, Some(to)) => format!("{base} · to {}", short_addr(to)),
+                            _ => base,
+                        }
                     }
                     .into(),
                     badge: if n.private { "PRIVATE" } else { "PUBLIC" }.into(),
@@ -412,24 +440,56 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 compose.set_can_continue(false);
                 return;
             }
+            // Directed = non-empty To field. Validate the recipient like
+            // resolve_rate validates the rate — errors land in the cost
+            // line, never a panic.
+            let to_address = compose.get_to_address().trim().to_string();
+            let directed = !to_address.is_empty();
+            let recipient_spk_len = if directed {
+                match Recipient::parse(st.network(), &to_address) {
+                    Ok(r) => {
+                        if compose.get_private_note() && r.p2tr_x.is_none() {
+                            compose.set_cost_line(
+                                "Private directed notes need a taproot (…1p…) recipient — or switch to Public.".into(),
+                            );
+                            compose.set_can_continue(false);
+                            return;
+                        }
+                        Some(r.spk.len())
+                    }
+                    Err(_) => {
+                        compose.set_cost_line(
+                            format!("Enter a valid {} recipient address.", st.network).into(),
+                        );
+                        compose.set_can_continue(false);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let dust = if directed { notes_core::DUST_LIMIT } else { 0 };
             match estimate_note_cost(
                 text_len,
                 compose.get_private_note(),
                 st.effective_chunk(),
                 1,
+                recipient_spk_len,
             ) {
                 Ok((chunks, vsize)) => {
                     let fee = (vsize as f64 * rate).ceil() as u64;
-                    if fee > st.balance() {
+                    if fee + dust > st.balance() {
                         compose.set_cost_line(
-                            format!("Needs ~{fee} sats — balance is {}.", st.balance()).into(),
+                            format!("Needs ~{} sats — balance is {}.", fee + dust, st.balance())
+                                .into(),
                         );
                         compose.set_can_continue(false);
                     } else {
                         compose.set_cost_line(
                             format!(
-                                "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB",
-                                sats_line(fee, st.btc_usd)
+                                "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}",
+                                sats_line(fee, st.btc_usd),
+                                if directed { " + 330 sats to recipient" } else { "" }
                             )
                             .into(),
                         );
@@ -462,6 +522,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let compose = ui.global::<Compose>();
                 let text = compose.get_text().to_string();
                 let private = compose.get_private_note();
+                let to_address = compose.get_to_address().trim().to_string();
+                let directed = !to_address.is_empty();
                 let tier = compose.get_tier();
                 let rate_text = compose.get_rate_text().to_string();
                 let st = state.borrow();
@@ -476,18 +538,33 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             st.notes.iter().any(|n| n.id == id_hex)
                         })
                         .map_err(|e| e.to_string())?;
-                        compose_note(
-                            id,
-                            &st.core_utxos(),
-                            &text,
-                            private,
-                            note_id,
-                            st.effective_chunk(),
-                            rate,
-                            || generate_aux_rand(),
-                        )
-                        .map(|n| (note_id, n))
-                        .map_err(|e| e.to_string())
+                        let note = if directed {
+                            let recipient = Recipient::parse(st.network(), &to_address)
+                                .map_err(|e| e.to_string())?;
+                            compose_directed_note(
+                                id,
+                                &st.core_utxos(),
+                                &text,
+                                private,
+                                note_id,
+                                &recipient,
+                                st.effective_chunk(),
+                                rate,
+                                || generate_aux_rand(),
+                            )
+                        } else {
+                            compose_note(
+                                id,
+                                &st.core_utxos(),
+                                &text,
+                                private,
+                                note_id,
+                                st.effective_chunk(),
+                                rate,
+                                || generate_aux_rand(),
+                            )
+                        };
+                        note.map(|n| (note_id, n)).map_err(|e| e.to_string())
                     });
                 ui.global::<Ui>().set_busy(false);
                 match result {
@@ -499,35 +576,44 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             .filter(|o| o.script_pubkey.first() == Some(&0x6a))
                             .count() as u64;
                         log::info!(
-                            "cb: compose len={} private={} chunks={} fee={} vsize={} txid={} ok",
+                            "cb: compose len={} private={} to={} chunks={} fee={} vsize={} txid={} ok",
                             text.len(),
                             private,
+                            if directed { to_address.as_str() } else { "self" },
                             chunks,
                             note.fee,
                             note.vsize,
                             note.txid_hex
                         );
-                        let balance_after = st.balance() - note.fee;
+                        let balance_after = st.balance() - note.fee - note.sent;
                         ui.global::<Confirm>().set_summary(
                             format!(
-                                "{}\n\nsize: {} bytes in {} chunk(s)\ntx: {} vB · {} input(s)\nfee: {}\nchange back to you: {} sats\nbalance after: {} sats\n\ntxid:\n{}",
-                                if private {
-                                    "PRIVATE — encrypted with your device seed"
+                                "{}{}\n\nsize: {} bytes in {} chunk(s)\ntx: {} vB · {} input(s)\nfee: {}{}\nchange back to you: {} sats\nbalance after: {} sats\n\ntxid:\n{}",
+                                match (private, directed) {
+                                    (true, true) => "PRIVATE — sealed for the recipient (ECDH)",
+                                    (true, false) => "PRIVATE — encrypted with your device seed",
+                                    (false, _) => "PUBLIC — plaintext, world-readable forever",
+                                },
+                                if directed {
+                                    format!("\nto: {to_address}")
                                 } else {
-                                    "PUBLIC — plaintext, world-readable forever"
+                                    String::new()
                                 },
                                 text.len(),
                                 chunks,
                                 note.vsize,
                                 note.tx.inputs.len(),
                                 sats_line(note.fee, st.btc_usd),
+                                if directed { " + 330 sats to recipient" } else { "" },
                                 note.change,
                                 balance_after,
                                 note.txid_hex
                             )
                             .into(),
                         );
-                        *plan.borrow_mut() = Some(Plan { note, text, private, note_id, chunks });
+                        let recipient = if directed { Some(to_address) } else { None };
+                        *plan.borrow_mut() =
+                            Some(Plan { note, text, private, note_id, chunks, recipient });
                         ui.global::<Ui>().set_screen(4);
                     }
                     Err(e) => {
@@ -573,7 +659,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 if p.note.change > 0 {
                     st.utxos.push(UtxoRec {
                         txid: p.note.txid_hex.clone(),
-                        vout: p.chunks as u32, // change follows the OP_RETURNs
+                        // Change follows the OP_RETURNs — and, for directed
+                        // notes, the recipient dust output.
+                        vout: p.chunks as u32 + u32::from(p.recipient.is_some()),
                         value: p.note.change,
                     });
                 }
@@ -590,6 +678,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     height: None,
                     blocktime: None,
                     status: "pending".into(),
+                    directed: p.recipient.is_some(),
+                    to: p.recipient.clone(),
+                    from: None,
                 };
 
                 // Export the signed tx for the companion to broadcast:
@@ -635,6 +726,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 set_view_qr(&view, &rec);
                 view.set_show_qr(view.get_has_qr());
                 ui.global::<Compose>().set_text("".into());
+                // A stale recipient must never silently direct the next note.
+                ui.global::<Compose>().set_to_address("".into());
                 ui.global::<Ui>().set_busy(false);
                 refresh_notes();
                 ui.global::<Ui>().set_screen(2);
@@ -657,10 +750,21 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 Some(h) => format!("confirmed at block {h}"),
                 None => "pending — scan the tx QR with the companion to broadcast".to_string(),
             };
-            view.set_meta(format!("{where_line}\ntxid: {}", n.txid).into());
+            let who_line = match (&n.from, &n.to) {
+                (Some(from), _) => format!("\nfrom: {from}"),
+                (None, Some(to)) => format!("\nto: {to}"),
+                _ => String::new(),
+            };
+            view.set_meta(format!("{where_line}{who_line}\ntxid: {}", n.txid).into());
             set_view_qr(&view, n);
             view.set_show_qr(false);
-            log::info!("cb: open-note id={} status={} qr={}", n.id, n.status, view.get_has_qr());
+            log::info!(
+                "cb: open-note id={} status={}{} qr={}",
+                n.id,
+                n.status,
+                n.from.as_deref().map(|f| format!(" from={f}")).unwrap_or_default(),
+                view.get_has_qr()
+            );
             ui.global::<Ui>().set_screen(2);
         });
     }
@@ -685,11 +789,21 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     ));
                 }
 
-                let recovered = extract_notes(&bundle, &id.enc_key);
+                let recovered = extract_notes(&bundle, id, st.network());
                 let mut new_notes = 0usize;
+                let mut received_notes = 0usize;
                 for r in &recovered {
                     let id_hex = hex::encode(r.note_id);
-                    match st.notes.iter_mut().find(|n| n.id == id_hex) {
+                    if r.received {
+                        received_notes += 1;
+                    }
+                    // Merge keyed by (id, from): a received note can never
+                    // overwrite an own note sharing its note_id.
+                    match st
+                        .notes
+                        .iter_mut()
+                        .find(|n| n.id == id_hex && n.from.as_deref() == r.sender.as_deref())
+                    {
                         Some(existing) => {
                             existing.height = r.height.or(existing.height);
                             existing.blocktime = r.blocktime.or(existing.blocktime);
@@ -701,10 +815,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             new_notes += 1;
                             st.notes.push(NoteRec {
                                 id: id_hex,
-                                text: r
-                                    .text
-                                    .clone()
-                                    .unwrap_or("(sealed under another key)".into()),
+                                text: r.text.clone().unwrap_or_else(|| {
+                                    if r.received {
+                                        "(directed note — could not decrypt)".into()
+                                    } else {
+                                        "(sealed under another key)".into()
+                                    }
+                                }),
                                 private: r.private,
                                 txid: r.txids.first().cloned().unwrap_or_default(),
                                 raw_hex: String::new(),
@@ -718,6 +835,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 } else {
                                     "pending".into()
                                 },
+                                directed: r.directed,
+                                to: r.recipient.clone(),
+                                from: r.sender.clone(),
                             });
                         }
                     }
@@ -745,7 +865,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 save_state(&fs, &st);
 
                 log::info!(
-                    "cb: import-bundle {src} notes={} new={new_notes} utxos={} tip={} ok",
+                    "cb: import-bundle {src} notes={} new={new_notes} received={received_notes} utxos={} tip={} ok",
                     recovered.len(),
                     st.utxos.len(),
                     bundle.tip_height

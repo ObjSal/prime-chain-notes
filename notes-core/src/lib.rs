@@ -11,6 +11,7 @@
 pub mod address;
 pub mod bundle;
 pub mod crypt;
+pub mod dm;
 pub mod envelope;
 pub mod keys;
 pub mod sighash;
@@ -29,6 +30,7 @@ pub enum Error {
     Envelope(&'static str),
     InsufficientFunds,
     PayloadTooLarge,
+    RecipientNotTaproot,
 }
 
 impl core::fmt::Display for Error {
@@ -43,6 +45,9 @@ impl core::fmt::Display for Error {
             Error::Envelope(m) => write!(f, "envelope: {m}"),
             Error::InsufficientFunds => write!(f, "insufficient funds"),
             Error::PayloadTooLarge => write!(f, "payload too large"),
+            Error::RecipientNotTaproot => {
+                write!(f, "private directed notes need a taproot (bc1p…) recipient")
+            }
         }
     }
 }

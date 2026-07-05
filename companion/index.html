@@ -241,11 +241,33 @@ $("buildBtn").addEventListener("click", async () => {
         const spendsFromSelf = t.vin.some(
           (i) => i.prevout && i.prevout.scriptpubkey_address === address
         );
+        // Directed-note fields (additive; the device ignores unknown keys):
+        // pays_self gates received notes, sender attributes them (first
+        // taproot input — matched by address prefix since the regtest shim
+        // omits prevout.scriptpubkey_type), recipient lets the sender
+        // re-derive a sent note's DM key after a wipe.
+        const paysSelf = t.vout.some((o) => o.scriptpubkey_address === address);
+        const sender =
+          t.vin
+            .map((i) => i.prevout && i.prevout.scriptpubkey_address)
+            .find((a) => a && /^(bc|tb|bcrt)1p/.test(a)) || null;
+        const outs = t.vout.filter(
+          (o) =>
+            o.scriptpubkey_type !== "op_return" &&
+            o.scriptpubkey_address &&
+            o.scriptpubkey_address !== address
+        );
+        const recipient =
+          (outs.find((o) => /^(bc|tb|bcrt)1p/.test(o.scriptpubkey_address)) || outs[0])
+            ?.scriptpubkey_address || null;
         return {
           txid: t.txid,
           height: t.status.confirmed ? t.status.block_height : null,
           blocktime: t.status.confirmed ? t.status.block_time : null,
           spends_from_self: spendsFromSelf,
+          pays_self: paysSelf,
+          sender,
+          recipient,
           payloads,
         };
       })

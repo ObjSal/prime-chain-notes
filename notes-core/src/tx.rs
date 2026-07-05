@@ -162,14 +162,23 @@ impl Transaction {
 /// keystroke cost estimator. Key-path P2TR: 57.5 weight-units of input
 /// witness (66 witness bytes + marker/flag amortized), matched by tests
 /// against real signed transactions.
-pub fn estimate_vsize(n_inputs: usize, payload_lens: &[usize], change: bool) -> usize {
+pub fn estimate_vsize(
+    n_inputs: usize,
+    payload_lens: &[usize],
+    recipient_spk_len: Option<usize>,
+    change: bool,
+) -> usize {
     // Base (non-witness) bytes.
     let mut base = 4 + 4; // version + locktime
     base += varint_len(n_inputs) + n_inputs * (32 + 4 + 1 + 4);
-    let n_outputs = payload_lens.len() + usize::from(change);
+    let n_outputs =
+        payload_lens.len() + usize::from(recipient_spk_len.is_some()) + usize::from(change);
     base += varint_len(n_outputs);
     for &len in payload_lens {
         base += 8 + varint_len_script(len) + script_len(len);
+    }
+    if let Some(spk_len) = recipient_spk_len {
+        base += 8 + varint_len(spk_len) + spk_len;
     }
     if change {
         base += 8 + 1 + 34;
@@ -209,6 +218,9 @@ pub struct NoteTx {
     pub tx: Transaction,
     pub fee: u64,
     pub change: u64,
+    /// Sats delivered to a directed-note recipient (0 for self-notes and
+    /// sweeps; DUST_LIMIT for directed notes).
+    pub sent: u64,
     pub vsize: usize,
     pub txid_hex: String,
     pub raw_hex: String,
@@ -256,6 +268,7 @@ pub fn build_sweep_tx(
     Ok(NoteTx {
         fee,
         change: 0,
+        sent: 0,
         vsize: tx.vsize(),
         txid_hex: tx.txid_hex(),
         raw_hex: hex::encode(tx.serialize_segwit()),
@@ -264,15 +277,17 @@ pub fn build_sweep_tx(
     })
 }
 
-/// Build and sign a note tx: OP_RETURN outputs for `payloads`, change back
-/// to `output_x` (our own tweaked key), inputs selected largest-first from
-/// `available` until value covers payload fee at `fee_rate` sat/vB.
+/// Build and sign a note tx: OP_RETURN outputs for `payloads`, then — for
+/// directed notes — a DUST_LIMIT output to `recipient_spk`, then change
+/// back to `output_x` (our own tweaked key). Inputs selected largest-first
+/// from `available` until value covers fee (+ dust) at `fee_rate` sat/vB.
 /// `tweaked_seckey` is the taproot-tweaked signing key; `aux` supplies
 /// BIP340 aux randomness per input.
 pub fn build_note_tx(
     available: &[Utxo],
     output_x: &[u8; 32],
     payloads: &[Vec<u8>],
+    recipient_spk: Option<&[u8]>,
     fee_rate: f64,
     tweaked_seckey: &[u8; 32],
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
@@ -281,6 +296,7 @@ pub fn build_note_tx(
         return Err(Error::Envelope("no payloads"));
     }
     let payload_lens: Vec<usize> = payloads.iter().map(Vec::len).collect();
+    let sent: u64 = if recipient_spk.is_some() { DUST_LIMIT } else { 0 };
     let mut candidates = available.to_vec();
     candidates.sort_by(|a, b| b.value.cmp(&a.value));
 
@@ -294,12 +310,17 @@ pub fn build_note_tx(
 
         // Try with a change output first; fall back to no-change.
         for change in [true, false] {
-            let vsize = estimate_vsize(selected.len(), &payload_lens, change);
+            let vsize = estimate_vsize(
+                selected.len(),
+                &payload_lens,
+                recipient_spk.map(<[u8]>::len),
+                change,
+            );
             let fee = (vsize as f64 * fee_rate).ceil() as u64;
-            if in_value < fee {
+            if in_value < fee + sent {
                 continue;
             }
-            let change_value = in_value - fee;
+            let change_value = in_value - fee - sent;
             if change && change_value < DUST_LIMIT {
                 continue;
             }
@@ -313,6 +334,9 @@ pub fn build_note_tx(
                 .iter()
                 .map(|p| TxOut { value: 0, script_pubkey: op_return_script(p) })
                 .collect();
+            if let Some(spk) = recipient_spk {
+                outputs.push(TxOut { value: DUST_LIMIT, script_pubkey: spk.to_vec() });
+            }
             if change {
                 outputs.push(TxOut { value: change_value, script_pubkey: change_spk.clone() });
             }
@@ -333,10 +357,11 @@ pub fn build_note_tx(
                 tx.witnesses.push(vec![sig.to_vec()]);
             }
 
-            let actual_fee = in_value - if change { change_value } else { 0 };
+            let actual_fee = in_value - sent - if change { change_value } else { 0 };
             return Ok(NoteTx {
                 fee: actual_fee,
                 change: if change { change_value } else { 0 },
+                sent,
                 vsize: tx.vsize(),
                 txid_hex: tx.txid_hex(),
                 raw_hex: hex::encode(tx.serialize_segwit()),

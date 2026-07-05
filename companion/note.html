@@ -97,14 +97,18 @@ function log(el, msg, cls) {
     log(logEl, `Scanning ${address} on ${network}…`);
     const scan = await scanAddress(API[network].base, address,
       (n) => log(logEl, `  …paged ${n} more confirmed txs`));
-    const note = scan.notes.find((n) => n.noteId === noteId);
-    if (!note) {
+    // Own and received notes may share a note_id (separate buckets by
+    // design) — render every match.
+    const matches = scan.notes.filter((n) => n.noteId === noteId);
+    if (!matches.length) {
       return log(logEl, `No note ${noteId} found at this address ` +
         `(${scan.notes.length} note(s) exist — see "All notes").`, "err");
     }
-    $("note").appendChild(buildNoteCard(note, API[network].explorer, null));
+    for (const note of matches) {
+      $("note").appendChild(buildNoteCard(note, API[network].explorer, null));
+    }
     log(logEl, "Done.", "ok");
-    window.__cnNote = { note };
+    window.__cnNote = { notes: matches, note: matches[0] };
   } catch (e) {
     log(logEl, `Failed: ${e.message}`, "err");
   }

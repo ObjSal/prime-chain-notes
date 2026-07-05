@@ -56,41 +56,51 @@ MINER generatetoaddress 1 "$(MINER getnewaddress)" >/dev/null
 #   - history from listtransactions; per tx, OP_RETURN payloads and the
 #     spends-from-self flag (does any input's prevout pay our address?)
 # ---------------------------------------------------------------------------
-build_bundle() { # $1 = output path
+build_bundle() { # $1 = output path, $2 = address (default $ADDR), $3 = wallet (default watch)
+    local out="$1" addr="${2:-$ADDR}" wallet="${3:-watch}"
     local tip utxos txids notes_onchain
+    W() { CLI -rpcwallet="$wallet" "$@"; }
     tip="$(CLI getblockcount)"
-    utxos="$(WATCH listunspent 0 9999999 | jq '[.[] | {txid, vout, value: (.amount*1e8|round), height: (if .confirmations > 0 then '"$tip"' - .confirmations + 1 else null end)}]')"
-    txids="$(WATCH listtransactions '*' 1000 | jq -r '[.[].txid] | unique | .[]')"
+    utxos="$(W listunspent 0 9999999 | jq '[.[] | {txid, vout, value: (.amount*1e8|round), height: (if .confirmations > 0 then '"$tip"' - .confirmations + 1 else null end)}]')"
+    txids="$(W listtransactions '*' 1000 | jq -r '[.[].txid] | unique | .[]')"
     notes_onchain="[]"
     for txid in $txids; do
-        local raw payloads self height blocktime
-        raw="$(CLI getrawtransaction "$txid" 2 2>/dev/null || CLI -rpcwallet=watch gettransaction "$txid" true true | jq .decoded)"
+        local raw payloads self sender pays_self recipient height blocktime
+        raw="$(CLI getrawtransaction "$txid" 2 2>/dev/null || CLI -rpcwallet="$wallet" gettransaction "$txid" true true | jq .decoded)"
         # asm for nulldata is "OP_RETURN <payload-hex>"; take the data token.
         payloads="$(jq '[.vout[] | select(.scriptPubKey.type=="nulldata") | .scriptPubKey.asm | split(" ") | .[-1]]' <<<"$raw")"
         [[ "$payloads" == "[]" ]] && continue
-        self=false
+        self=false; sender=""
         for prev in $(jq -r '.vin[] | "\(.txid):\(.vout)"' <<<"$raw"); do
             local ptxid=${prev%%:*} pvout=${prev##*:}
             local pspk_addr
             pspk_addr="$(CLI getrawtransaction "$ptxid" 2 2>/dev/null | jq -r ".vout[$pvout].scriptPubKey.address // empty")"
-            [[ "$pspk_addr" == "$ADDR" ]] && self=true && break
+            [[ "$pspk_addr" == "$addr" ]] && self=true
+            [[ -z "$sender" && "$pspk_addr" == bcrt1p* ]] && sender="$pspk_addr"
         done
+        # Directed-note additive fields: pays_self gates received notes,
+        # sender attributes them, recipient records who an own note paid.
+        pays_self="$(jq --arg a "$addr" '[.vout[] | select(.scriptPubKey.address == $a)] | length > 0' <<<"$raw")"
+        recipient="$(jq --arg a "$addr" -r '[.vout[] | select(.scriptPubKey.type != "nulldata") | .scriptPubKey.address // empty | select(. != $a and . != "")] | (map(select(startswith("bcrt1p"))) + .) | .[0] // empty' <<<"$raw")"
         local conf
-        conf="$(WATCH gettransaction "$txid" true | jq .confirmations)"
+        conf="$(W gettransaction "$txid" true | jq .confirmations)"
         if (( conf > 0 )); then
             height=$(( tip - conf + 1 ))
-            blocktime="$(WATCH gettransaction "$txid" true | jq .blocktime)"
+            blocktime="$(W gettransaction "$txid" true | jq .blocktime)"
         else
             height=null; blocktime=null
         fi
-        notes_onchain="$(jq --argjson tx "{\"txid\":\"$txid\",\"height\":$height,\"blocktime\":$blocktime,\"spends_from_self\":$self,\"payloads\":$payloads}" '. + [$tx]' <<<"$notes_onchain")"
+        local sender_json recipient_json
+        sender_json="$([[ -n "$sender" ]] && echo "\"$sender\"" || echo null)"
+        recipient_json="$([[ -n "$recipient" ]] && echo "\"$recipient\"" || echo null)"
+        notes_onchain="$(jq --argjson tx "{\"txid\":\"$txid\",\"height\":$height,\"blocktime\":$blocktime,\"spends_from_self\":$self,\"pays_self\":$pays_self,\"sender\":$sender_json,\"recipient\":$recipient_json,\"payloads\":$payloads}" '. + [$tx]' <<<"$notes_onchain")"
     done
     jq -n --argjson utxos "$utxos" --argjson notes "$notes_onchain" --argjson tip "$tip" '{
         network: "regtest", full: true, tip_height: $tip,
         bundle_time: 1750000000, max_op_return_bytes: 80,
         fee_rates: {fastestFee: 2, halfHourFee: 2, hourFee: 1, economyFee: 1, minimumFee: 1},
         utxos: $utxos, notes_onchain: $notes
-    }' > "$1"
+    }' > "$out"
 }
 
 broadcast() { # $1 = compose json -> txid
@@ -158,6 +168,48 @@ echo "== public note is genuinely plaintext on-chain =="
 CLI getrawtransaction "$T2" 2 | jq -r '.vout[].scriptPubKey.asm' | grep -q "$(printf 'public note: hello, blockchain — proof I existed on regtest' | xxd -p -c 10000 | head -c 40)" \
     && pass "note2 plaintext visible in raw chain data" \
     || fail "could not find plaintext payload in note2's tx"
+
+echo "== directed notes: A sends public + private to identity B =="
+SEED_B="$(printf '09%.0s' {1..32})"
+ADDR_B="$(NOTES_APP_SEED=$SEED_B "$NOTES" address regtest)"
+CLI createwallet watch_b true true >/dev/null
+DESC_B="$(CLI getdescriptorinfo "addr($ADDR_B)" | jq -r .descriptor)"
+CLI -rpcwallet=watch_b importdescriptors "[{\"desc\":\"$DESC_B\",\"timestamp\":0}]" >/dev/null
+
+build_bundle "$WORK/dsend1.json"
+D1="$("$NOTES" send "$WORK/dsend1.json" "$ADDR_B" public 2 100000 'directed public: postcard from A to B')"
+jq -e '.sent == 330' <<<"$D1" >/dev/null || fail "directed note must carry 330 sats of dust"
+TD1="$(broadcast "$D1")"
+MINER generatetoaddress 1 "$(MINER getnewaddress)" >/dev/null
+build_bundle "$WORK/dsend2.json"
+D2="$("$NOTES" send "$WORK/dsend2.json" "$ADDR_B" private 2 100000 'directed private: sealed for B alone')"
+TD2="$(broadcast "$D2")"
+MINER generatetoaddress 1 "$(MINER getnewaddress)" >/dev/null
+pass "A sent public+private directed notes to B ($TD1, $TD2)"
+
+echo "== B recovers both from bare chain data (wipe-restore story) =="
+build_bundle "$WORK/bundleB.json" "$ADDR_B" watch_b
+SCANB="$(NOTES_APP_SEED=$SEED_B "$NOTES" scan "$WORK/bundleB.json")"
+(( $(jq length <<<"$SCANB") == 2 )) || fail "B expected 2 received notes, got $(jq length <<<"$SCANB")"
+jq -e --arg a "$ADDR" '[.[] | select(.received and .directed and .from == $a)] | length == 2' >/dev/null <<<"$SCANB" \
+    || fail "received notes must be attributed from=A"
+grep -q 'postcard from A to B' <<<"$SCANB" || fail "B cannot read the public directed note"
+grep -q 'sealed for B alone' <<<"$SCANB" || fail "B failed to ECDH-decrypt the private directed note"
+pass "B decrypted the private directed note via static-static ECDH, from=A"
+
+echo "== negative: a third seed cannot read B's private directed note =="
+WRONGB="$(NOTES_APP_SEED=$(printf '99%.0s' {1..32}) "$NOTES" scan "$WORK/bundleB.json")"
+grep -q 'sealed for B alone' <<<"$WRONGB" && fail "foreign seed decrypted a directed note!"
+grep -q 'postcard from A to B' <<<"$WRONGB" || fail "public directed note should be readable by anyone"
+pass "directed-private unreadable under a foreign seed; public readable"
+
+echo "== A re-reads its own sent notes (sender-side ECDH re-derivation) =="
+build_bundle "$WORK/restoreA.json"
+SCANA="$("$NOTES" scan "$WORK/restoreA.json")"
+jq -e --arg b "$ADDR_B" '[.[] | select(.directed and (.received | not) and .to == $b)] | length == 2' >/dev/null <<<"$SCANA" \
+    || fail "A's directed notes must carry to=B"
+grep -q 'sealed for B alone' <<<"$SCANA" || fail "A cannot re-read its own sent private directed note"
+pass "A re-derived the DM key from the dust output and read its sent note"
 
 echo
 echo "${GRN}ALL E2E CHECKS PASSED${NC}  (workdir: $WORK)"

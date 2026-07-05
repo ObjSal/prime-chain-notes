@@ -33,3 +33,38 @@ pub fn p2tr_script_pubkey(output_x: &[u8; 32]) -> Vec<u8> {
     spk.extend_from_slice(output_x);
     spk
 }
+
+/// The x-only output key of a P2TR scriptPubKey, or None for any other kind.
+pub fn p2tr_x_of_spk(spk: &[u8]) -> Option<[u8; 32]> {
+    if spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20 {
+        let mut x = [0u8; 32];
+        x.copy_from_slice(&spk[2..]);
+        Some(x)
+    } else {
+        None
+    }
+}
+
+/// The x-only output key of a P2TR address, or None (bad address, wrong
+/// network, or non-taproot). Used by the scanner to run ECDH against a
+/// sender/recipient address seen on-chain.
+pub fn p2tr_x_of_address(network: Network, address: &str) -> Option<[u8; 32]> {
+    address_to_script_pubkey(network, address).ok().and_then(|spk| p2tr_x_of_spk(&spk))
+}
+
+/// A validated directed-note recipient: any segwit address decodes; only
+/// P2TR recipients have an x-only key to encrypt to.
+pub struct Recipient {
+    pub address: String,
+    pub spk: Vec<u8>,
+    pub p2tr_x: Option<[u8; 32]>,
+}
+
+impl Recipient {
+    pub fn parse(network: Network, address: &str) -> Result<Self, Error> {
+        let address = address.trim();
+        let spk = address_to_script_pubkey(network, address)?;
+        let p2tr_x = p2tr_x_of_spk(&spk);
+        Ok(Recipient { address: address.to_string(), spk, p2tr_x })
+    }
+}
