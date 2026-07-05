@@ -110,13 +110,18 @@ python3 companion/server.py 8091 --regtest  # + managed local regtest node
 ```
 
 `index.html` builds **sync bundles** (full address-history pagination,
-fee tiers, prices, endpoint relay policy) and **broadcasts** the device's
-`.hex` exports, against mempool.space — or against a local regtest node
-that `server.py` exposes through the *same mempool-shaped API*, so the
-page treats regtest as just another base URL. The regtest option only
-appears when the local server is detected. Playwright tests drive the
-real rendered page: `tests/test_companion_regtest.py` (hermetic) and
-`tests/test_companion_testnet4.py` (live).
+fee tiers, prices) shown as a downloadable file or as a **QR — static or
+animated UR** — for the device's scanner, and **broadcasts** the
+device's `.hex` exports or **scans the device's tx QR with the camera**;
+all against mempool.space — or against a local regtest node that
+`server.py` exposes through the *same mempool-shaped API*, so the page
+treats regtest as just another base URL. The regtest option only appears
+when the local server is detected. Playwright tests drive the real
+rendered page: `tests/test_companion_regtest.py` (hermetic, incl. a
+fake-camera scan), `tests/test_companion_qr.py` (bundle-QR round-trips
+cross-checked against foundation-ur) and `tests/test_companion_testnet4.py`
+(live). Vendored: jsQR (Apache-2.0), qrcode-generator (MIT), plus the
+hand-rolled `ur.js` UR encoder.
 
 **Relay policy, verified live (2026-07-05):** mempool.space/testnet4
 accepted a 224-byte single OP_RETURN
