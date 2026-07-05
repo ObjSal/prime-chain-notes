@@ -73,12 +73,24 @@ struct UtxoRec {
     value: u64,
 }
 
+/// A send-to contact. Order in `State.contacts` IS the recency (front =
+/// most recently used — there is no clock on-device). Device-side
+/// convenience only: state.json, NOT recoverable from chain after a wipe.
+#[derive(Serialize, Deserialize, Clone)]
+struct ContactRec {
+    name: String, // "" = unnamed
+    address: String,
+}
+
+const MAX_CONTACTS: usize = 20;
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 struct State {
     network: String,
     notes: Vec<NoteRec>,
     utxos: Vec<UtxoRec>,
+    contacts: Vec<ContactRec>,
     tip_height: Option<u64>,
     bundle_time: Option<u64>,
     /// User-picked chunk size; None = DEFAULT_CHUNK. Purely device-side.
@@ -95,6 +107,7 @@ impl Default for State {
             network: "mainnet".into(),
             notes: Vec::new(),
             utxos: Vec::new(),
+            contacts: Vec::new(),
             tip_height: None,
             bundle_time: None,
             chunk_override: None,
@@ -285,6 +298,30 @@ fn short_addr(addr: &str) -> String {
     }
 }
 
+/// Move-to-front recency (no clock on-device): reinsert the address at
+/// index 0 preserving any existing name; cap the list at MAX_CONTACTS.
+fn upsert_contact(st: &mut State, address: &str) {
+    let name = st
+        .contacts
+        .iter()
+        .position(|c| c.address == address)
+        .map(|i| st.contacts.remove(i).name)
+        .unwrap_or_default();
+    st.contacts.insert(0, ContactRec { name, address: address.to_string() });
+    st.contacts.truncate(MAX_CONTACTS);
+}
+
+/// The compose header line for a picked recipient.
+fn to_label_for(st: &State, address: &str) -> String {
+    if address.is_empty() {
+        return "to: self — my notebook".into();
+    }
+    match st.contacts.iter().find(|c| c.address == address && !c.name.is_empty()) {
+        Some(c) => format!("to: {} ({})", c.name, short_addr(address)),
+        None => format!("to: {}", short_addr(address)),
+    }
+}
+
 // ---------------------------------------------------------------- main
 
 fn app_main(cx: AppContext, ui: AppWindow) {
@@ -403,6 +440,158 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             ui.global::<Notes>().set_rows(Rc::new(VecModel::from(rows)).into());
         }
     };
+
+    let refresh_contacts = {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let st = state.borrow();
+            // State order IS recency (front = latest use) — no re-sort.
+            let rows: Vec<ContactRow> = st
+                .contacts
+                .iter()
+                .map(|c| ContactRow {
+                    address: c.address.clone().into(),
+                    name: c.name.clone().into(),
+                    label: if c.name.is_empty() { short_addr(&c.address) } else { c.name.clone() }
+                        .into(),
+                    meta: short_addr(&c.address).into(),
+                })
+                .collect();
+            log::info!("cb: refresh-contacts n={}", rows.len());
+            ui.global::<Contacts>().set_rows(Rc::new(VecModel::from(rows)).into());
+        }
+    };
+
+    // The single pick funnel (self row / recent row / manual entry / scan):
+    // validates, bumps recency, sets the compose recipient + label, and
+    // navigates. Invalid manual input stays on the picker with an error.
+    let pick_contact = {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let fs = fs.clone();
+        move |addr_raw: &str| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let addr = addr_raw.trim().to_string();
+            let contacts_g = ui.global::<Contacts>();
+            let compose = ui.global::<Compose>();
+            if addr.is_empty() {
+                compose.set_to_address("".into());
+                compose.set_to_label("to: self — my notebook".into());
+                log::info!("cb: pick-contact to=self");
+            } else {
+                let mut st = state.borrow_mut();
+                if Recipient::parse(st.network(), &addr).is_err() {
+                    contacts_g
+                        .set_input_error(format!("Not a valid {} address.", st.network).into());
+                    log::warn!("cb: pick-contact err=invalid address");
+                    return;
+                }
+                upsert_contact(&mut st, &addr);
+                save_state(&fs, &st);
+                compose.set_to_address(addr.as_str().into());
+                compose.set_to_label(to_label_for(&st, &addr).into());
+                log::info!("cb: pick-contact to={addr}");
+            }
+            contacts_g.set_input_text("".into());
+            contacts_g.set_input_error("".into());
+            contacts_g.set_naming_address("".into());
+            ui.global::<Callbacks>().invoke_compose_changed();
+            ui.global::<Ui>().set_screen(3);
+        }
+    };
+
+    {
+        let pick_contact = pick_contact.clone();
+        ui.global::<Callbacks>().on_pick_contact(move |addr| pick_contact(addr.as_str()));
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let pick_contact = pick_contact.clone();
+        ui.global::<Callbacks>().on_scan_contact(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let opts = ScanQrOptions {
+                header_title: "Scan recipient address".into(),
+                message: "Point at an address QR (a companion page or another Prime's home screen)"
+                    .into(),
+                ..ScanQrOptions::default()
+            };
+            let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
+                Ok(Some(ScanQrResult::Qr(data))) | Ok(Some(ScanQrResult::Ur2(_, data))) => data,
+                Ok(_) => {
+                    log::info!("cb: scan-contact cancelled");
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("cb: scan-contact err=scanner {e:?}");
+                    ui.global::<Contacts>()
+                        .set_input_error(format!("QR scanner unavailable: {e:?}").into());
+                    return;
+                }
+            };
+            // Address QRs are plain text, possibly a BIP21 URI, and
+            // legitimately ALL-UPPERCASE (our own home QR is) — normalize.
+            let text = String::from_utf8(data).unwrap_or_default();
+            let mut addr = text.trim();
+            if addr.len() >= 8 && addr[..8].eq_ignore_ascii_case("bitcoin:") {
+                addr = &addr[8..];
+            }
+            let addr = addr.split('?').next().unwrap_or("").trim().to_string();
+            let st = state.borrow();
+            let network = st.network();
+            let network_name = st.network.clone();
+            drop(st);
+            let resolved = if Recipient::parse(network, &addr).is_ok() {
+                Some(addr.clone())
+            } else {
+                let lower = addr.to_lowercase();
+                Recipient::parse(network, &lower).is_ok().then_some(lower)
+            };
+            match resolved {
+                Some(a) => {
+                    log::info!("cb: scan-contact ok addr={a}");
+                    pick_contact(&a);
+                }
+                None => {
+                    log::warn!("cb: scan-contact err=not an address");
+                    ui.global::<Contacts>().set_input_error(
+                        format!("QR didn't contain a valid {network_name} address.").into(),
+                    );
+                }
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let fs = fs.clone();
+        let refresh_contacts = refresh_contacts.clone();
+        ui.global::<Callbacks>().on_save_contact_name(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let contacts_g = ui.global::<Contacts>();
+            let addr = contacts_g.get_naming_address().to_string();
+            if addr.is_empty() {
+                return;
+            }
+            let name = contacts_g.get_name_text().trim().to_string();
+            let mut st = state.borrow_mut();
+            // Naming does NOT bump recency — only use does, so the row
+            // being edited never jumps mid-interaction.
+            if let Some(c) = st.contacts.iter_mut().find(|c| c.address == addr) {
+                c.name = name.clone();
+            }
+            save_state(&fs, &st);
+            drop(st);
+            log::info!("cb: save-contact addr={addr} name-len={}", name.len());
+            contacts_g.set_naming_address("".into());
+            contacts_g.set_name_text("".into());
+            refresh_contacts();
+        });
+    }
 
     // Keystroke cost estimator — pure arithmetic, no crypto runs (see
     // notes-core crypt::SEAL_OVERHEAD), so per-keystroke recompute is free.
@@ -707,6 +896,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     if airlock.is_ok() { "ok" } else { "err" },
                 );
 
+                // Auto-save the recipient as a recent contact (usually a
+                // no-op re-front after the pick, but covers every path).
+                if let Some(to) = &p.recipient {
+                    upsert_contact(&mut st, to);
+                }
                 st.notes.push(rec.clone());
                 save_state(&fs, &st);
                 drop(st);
@@ -728,6 +922,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 ui.global::<Compose>().set_text("".into());
                 // A stale recipient must never silently direct the next note.
                 ui.global::<Compose>().set_to_address("".into());
+                ui.global::<Compose>().set_to_label("".into());
                 ui.global::<Ui>().set_busy(false);
                 refresh_notes();
                 ui.global::<Ui>().set_screen(2);
@@ -1070,9 +1265,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let refresh_notes = refresh_notes.clone();
         ui.global::<Callbacks>().on_refresh_notes(move || refresh_notes());
     }
+    {
+        let refresh_contacts = refresh_contacts.clone();
+        ui.global::<Callbacks>().on_refresh_contacts(move || refresh_contacts());
+    }
 
     refresh_home();
     refresh_notes();
+    refresh_contacts();
 
     ui.run().expect("UI running");
 }

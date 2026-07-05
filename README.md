@@ -14,11 +14,13 @@ the app's taproot address back to itself, timestamped by its block. Wipe
 the device, restore the seed, rescan the chain — every note comes back,
 private ones decrypted, with nothing stored anywhere else.
 
-Notes can also be **sent to another address** (the compose screen's "To"
-field): the tx pays 330 sats of dust to the recipient so their scanner
-finds it, and private directed notes are sealed via **static-static
-x-only ECDH** against the recipient's taproot key — only the two devices
-can read them, both re-derivable from bare chain data after a wipe.
+Notes can also be **sent to another address**: composing starts at a
+**contacts picker** — yourself first, then recently-used addresses (auto-
+saved, nameable), a QR scan, or manual entry. A directed note's tx pays
+330 sats of dust to the recipient so their scanner finds it, and private
+directed notes are sealed via **static-static x-only ECDH** against the
+recipient's taproot key — only the two devices can read them, both
+re-derivable from bare chain data after a wipe.
 Anyone can send notes to any address (like email); received notes are
 always attributed to their unforgeable input address and never mix with
 your own. Privacy caveat: a directed note publicly and permanently links
