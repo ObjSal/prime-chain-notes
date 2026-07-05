@@ -201,6 +201,16 @@ localhost pattern and improving on it:
   both rust-bitcoin cross-checked.
 - Chrome-extension automation was unavailable; playwright (already in the
   gift-wallet toolchain) drives the real rendered page instead.
+- `viewer.html` (2026-07-05): read-only on-chain notes viewer,
+  `?address=…&network=…` deep-linkable and launched from index.html's
+  "View on-chain notes" button. JS port of `envelope::decode`/`reassemble`
+  (FROZEN offsets), spends-from-self enforced client-side, notes rendered
+  newest-first via `textContent` only (note text is attacker-writable
+  chain data). Differences from the device scanner by design: partial /
+  inconsistent chunk sets surface as "partial x/y" instead of being
+  silently dropped, and private notes show an "Encrypted" placeholder —
+  **no browser-side decryption ever** (the key never leaves the device).
+  Covered by `test_companion_regtest.py` (button popup + standalone load).
 
 ## Not yet done / next
 

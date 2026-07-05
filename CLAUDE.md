@@ -34,6 +34,7 @@ ui/{app.slint, callbacks.slint}
 scripts/regtest-e2e.sh          # host-only e2e vs bitcoind -regtest
 scripts/regtest-companion.sh    # companion-role helper (setup/bundle/broadcast/mine)
 companion/index.html            # THE companion: sync-bundle builder + broadcaster
+companion/viewer.html           # read-only on-chain notes viewer (?address=&network=; public text, private = placeholder)
 companion/server.py             # static server + regtest via mempool-shaped /regtest/api/*
 companion/tests/                # playwright: regtest (hermetic) + testnet4 (live)
 vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API

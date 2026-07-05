@@ -72,6 +72,7 @@
     <button id="buildBtn">Build sync bundle</button>
     <button class="secondary" id="downloadBtn" disabled>Download bundle.json</button>
     <button class="secondary" id="showQrBtn" disabled>Show as QR</button>
+    <button class="secondary" id="viewBtn">View on-chain notes</button>
     <div id="qrBox" style="display:none; margin-top:14px; text-align:center">
       <img id="qrImg" alt="bundle QR" style="background:#fff; padding:12px; border-radius:12px; max-width:min(420px,100%)">
       <p class="sub" id="qrCaption" style="margin:8px 0 0"></p>
@@ -295,6 +296,12 @@ $("downloadBtn").addEventListener("click", () => {
   a.download = `bundle-${bundle.network}-${bundle.tip_height}.json`;
   a.click();
   URL.revokeObjectURL(a.href);
+});
+
+$("viewBtn").addEventListener("click", () => {
+  const address = $("address").value.trim();
+  if (!address) return log($("syncLog"), "Enter the notes address first.", "err");
+  window.open(`viewer.html?address=${encodeURIComponent(address)}&network=${net()}`, "_blank");
 });
 
 /* -------------------------------------------- bundle → QR (leg 2 out) */
