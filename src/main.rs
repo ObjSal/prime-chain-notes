@@ -318,7 +318,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let sync = ui.global::<Sync>();
             sync.set_status(
                 format!(
-                    "network: {}\nbalance: {} sats · {} utxos\ntip: {}\nfees (sat/vB): {}/{}/{} · chunk: {} bytes",
+                    "network: {}\nbalance: {} sats · {} utxos\nchain height: {}\nfees (sat/vB): {}/{}/{} · chunk: {} bytes",
                     st.network,
                     st.balance(),
                     st.utxos.len(),
@@ -747,7 +747,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     bundle.tip_height
                 );
                 Ok(format!(
-                    "Imported ({src}): {} note(s) ({new_notes} new), {} utxo(s), tip {}.",
+                    "Imported ({src}): {} note(s) ({new_notes} new), {} utxo(s), height {}.",
                     recovered.len(),
                     st.utxos.len(),
                     bundle.tip_height
