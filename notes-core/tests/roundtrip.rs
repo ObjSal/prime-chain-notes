@@ -2,18 +2,27 @@
 //! round-trips, and the rust-bitcoin cross-check of our transaction
 //! serialization, sighash and signatures.
 
+use notes_core::address::Recipient;
 use notes_core::bundle::{
-    compose_note, estimate_note_cost, extract_notes, Identity, OnchainTx, SyncBundle,
+    compose_directed_note, compose_note, estimate_note_cost, extract_notes, Identity, OnchainTx,
+    SyncBundle,
 };
 use notes_core::crypt::{self, SEAL_OVERHEAD};
 use notes_core::envelope;
 use notes_core::tx::{op_return_payload, Utxo};
+use notes_core::Network;
 
 const APP_SEED: [u8; 32] = [7u8; 32];
 const AUX: [u8; 32] = [0x42; 32];
+const NET: Network = Network::Regtest;
 
 fn identity() -> Identity {
     Identity::from_app_seed(&APP_SEED).unwrap()
+}
+
+/// Second party for directed-note tests.
+fn identity_b() -> Identity {
+    Identity::from_app_seed(&[9u8; 32]).unwrap()
 }
 
 fn utxos() -> Vec<Utxo> {
@@ -119,8 +128,45 @@ fn cost_estimator_is_exact() {
         .unwrap();
         assert!(note.change > 0, "fixture should produce change");
         let n_inputs = note.tx.inputs.len();
-        let (_chunks, est_vsize) = estimate_note_cost(text_len, private, max_or, n_inputs).unwrap();
+        let (_chunks, est_vsize) =
+            estimate_note_cost(text_len, private, max_or, n_inputs, None).unwrap();
         assert_eq!(est_vsize, note.vsize, "text_len={text_len} private={private} max={max_or}");
+    }
+
+    // Directed notes: the recipient dust output (34-byte P2TR / 22-byte
+    // P2WPKH spk) must be modeled byte-exactly too.
+    let b = identity_b();
+    let p2tr = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let p2wpkh = Recipient { address: String::new(), spk: vec![0x00, 0x14].into_iter().chain([0x11; 20]).collect(), p2tr_x: None };
+    for (text_len, private, recipient) in
+        [(5usize, true, &p2tr), (200, true, &p2tr), (40, false, &p2wpkh)]
+    {
+        let text: String = "y".repeat(text_len);
+        let note = compose_directed_note(
+            &id, &utxos(), &text, private, [2, 2, 2, 2], recipient, 80, 2.0, || Ok(AUX),
+        )
+        .unwrap();
+        assert!(note.change > 0, "fixture should produce change");
+        assert_eq!(note.sent, 330);
+        let chunks = note
+            .tx
+            .outputs
+            .iter()
+            .filter(|o| o.script_pubkey.first() == Some(&0x6a))
+            .count();
+        // Output order: OP_RETURNs, dust to recipient, change.
+        assert_eq!(note.tx.outputs[chunks].value, 330);
+        assert_eq!(note.tx.outputs[chunks].script_pubkey, recipient.spk);
+        assert_eq!(note.tx.outputs.len(), chunks + 2);
+        let (_c, est_vsize) = estimate_note_cost(
+            text_len,
+            private,
+            80,
+            note.tx.inputs.len(),
+            Some(recipient.spk.len()),
+        )
+        .unwrap();
+        assert_eq!(est_vsize, note.vsize, "directed text_len={text_len} private={private}");
     }
 }
 
@@ -157,6 +203,9 @@ fn bundle_from_txs(txs: &[(&notes_core::tx::NoteTx, bool, Option<u64>)]) -> Sync
                     .filter_map(|o| op_return_payload(&o.script_pubkey))
                     .map(hex::encode)
                     .collect(),
+                pays_self: false,
+                sender: None,
+                recipient: None,
             })
             .collect(),
         ..Default::default()
@@ -184,10 +233,11 @@ fn compose_scan_roundtrip_public_private_chunked() {
         (&priv_note, true, Some(101)),
         (&chunked, true, Some(102)),
     ]);
-    let notes = extract_notes(&bundle, &id.enc_key);
+    let notes = extract_notes(&bundle, &id, NET);
     assert_eq!(notes.len(), 3);
     assert_eq!(notes[0].text.as_deref(), Some("public hello ₿"));
     assert!(!notes[0].private);
+    assert!(!notes[0].received && !notes[0].directed);
     assert_eq!(notes[1].text.as_deref(), Some("secret plans"));
     assert!(notes[1].private);
     assert_eq!(notes[2].text.as_deref(), Some(long_text.as_str()));
@@ -198,20 +248,214 @@ fn scan_ignores_foreign_and_spoofed() {
     let id = identity();
     let note =
         compose_note(&id, &utxos(), "mine", true, [1, 2, 3, 4], 80, 1.0, || Ok(AUX)).unwrap();
-    // Same payloads but spends_from_self=false → spoof attempt, ignored.
+    // Same payloads, neither spending from nor paying us → pure spoof,
+    // ignored entirely (the acceptance rule stays additive).
     let spoofed = bundle_from_txs(&[(&note, false, Some(50))]);
-    assert!(extract_notes(&spoofed, &id.enc_key).is_empty());
+    assert!(extract_notes(&spoofed, &id, NET).is_empty());
 
     // A private note sealed under a DIFFERENT seed: envelope parses but
     // text must be None (foreign ciphertext).
-    let other = Identity::from_app_seed(&[9u8; 32]).unwrap();
+    let other = identity_b();
     let foreign =
         compose_note(&other, &utxos(), "not yours", true, [5, 5, 5, 5], 80, 1.0, || Ok(AUX))
             .unwrap();
     let bundle = bundle_from_txs(&[(&foreign, true, Some(60))]);
-    let notes = extract_notes(&bundle, &id.enc_key);
+    let notes = extract_notes(&bundle, &id, NET);
     assert_eq!(notes.len(), 1);
     assert!(notes[0].text.is_none());
+}
+
+#[test]
+fn dm_shared_key_is_symmetric() {
+    use notes_core::dm;
+    let a = identity();
+    let b = identity_b();
+    let ab = dm::ecdh_shared_x(&a.tweaked_seckey, &b.output_x).unwrap();
+    let ba = dm::ecdh_shared_x(&b.tweaked_seckey, &a.output_x).unwrap();
+    // The tweaked scalars may be negated relative to their lifted points —
+    // x-only must erase all four parity combinations.
+    assert_eq!(ab, ba, "static-static ECDH must be symmetric over real tweaked keys");
+    assert_eq!(dm::dm_key(&ab), dm::dm_key(&ba));
+
+    // A third party derives something else entirely.
+    let c = Identity::from_app_seed(&[8u8; 32]).unwrap();
+    assert_ne!(dm::ecdh_shared_x(&c.tweaked_seckey, &b.output_x).unwrap(), ab);
+
+    // AAD binds the note_id at the dm layer.
+    let blob =
+        dm::seal_directed(&a.tweaked_seckey, &a.output_x, &b.output_x, &[1, 2, 3, 4], b"psst")
+            .unwrap();
+    assert_eq!(
+        dm::open_received(&b.tweaked_seckey, &b.output_x, &a.output_x, &[1, 2, 3, 4], &blob)
+            .unwrap(),
+        b"psst"
+    );
+    assert!(dm::open_received(&b.tweaked_seckey, &b.output_x, &a.output_x, &[9, 9, 9, 9], &blob)
+        .is_err());
+}
+
+/// A → B, public: B sees a received note with text and sender; A's own
+/// scan shows the same note as sent-to-B.
+#[test]
+fn compose_directed_public_roundtrip() {
+    let a = identity();
+    let b = identity_b();
+    let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let note = compose_directed_note(
+        &a, &utxos(), "hello bob, love alice", false, [1, 0, 0, 1], &to_b, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+
+    // B's bundle view: tx pays B but does not spend from B.
+    let mut bundle = bundle_from_txs(&[(&note, false, Some(100))]);
+    bundle.notes_onchain[0].pays_self = true;
+    bundle.notes_onchain[0].sender = Some(a.address(NET));
+    let notes = extract_notes(&bundle, &b, NET);
+    assert_eq!(notes.len(), 1);
+    let n = &notes[0];
+    assert!(n.received && n.directed && !n.private);
+    assert_eq!(n.text.as_deref(), Some("hello bob, love alice"));
+    assert_eq!(n.sender.as_deref(), Some(a.address(NET).as_str()));
+
+    // A's own view: spends from self, recipient recorded from the vout.
+    let mut own = bundle_from_txs(&[(&note, true, Some(100))]);
+    own.notes_onchain[0].recipient = Some(b.address(NET));
+    let notes = extract_notes(&own, &a, NET);
+    assert_eq!(notes.len(), 1);
+    assert!(!notes[0].received && notes[0].directed);
+    assert_eq!(notes[0].recipient.as_deref(), Some(b.address(NET).as_str()));
+    assert_eq!(notes[0].text.as_deref(), Some("hello bob, love alice"));
+}
+
+/// A → B, private: B decrypts via reciprocal ECDH; A re-derives the key
+/// from the dust-output address (post-wipe recovery); a third identity
+/// cannot read it.
+#[test]
+fn compose_directed_private_roundtrip() {
+    let a = identity();
+    let b = identity_b();
+    let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let note = compose_directed_note(
+        &a, &utxos(), "for bob's eyes only", true, [2, 0, 0, 2], &to_b, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+
+    let mut bundle = bundle_from_txs(&[(&note, false, Some(100))]);
+    bundle.notes_onchain[0].pays_self = true;
+    bundle.notes_onchain[0].sender = Some(a.address(NET));
+    let notes = extract_notes(&bundle, &b, NET);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].received && notes[0].directed && notes[0].private);
+    assert_eq!(notes[0].text.as_deref(), Some("for bob's eyes only"));
+
+    // Sender wipe-recovery: A reads its own sent note from bare chain data.
+    let mut own = bundle_from_txs(&[(&note, true, Some(100))]);
+    own.notes_onchain[0].recipient = Some(b.address(NET));
+    let notes = extract_notes(&own, &a, NET);
+    assert_eq!(notes[0].text.as_deref(), Some("for bob's eyes only"));
+
+    // A third identity presented with the same tx gets ciphertext only.
+    let c = Identity::from_app_seed(&[8u8; 32]).unwrap();
+    let mut leaked = bundle_from_txs(&[(&note, false, Some(100))]);
+    leaked.notes_onchain[0].pays_self = true;
+    leaked.notes_onchain[0].sender = Some(a.address(NET));
+    let notes = extract_notes(&leaked, &c, NET);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].text.is_none(), "not addressed to C — must stay sealed");
+}
+
+/// The 68-byte AAD binds the sender: attributing the same sealed body to a
+/// different sender address must fail decryption, not yield wrong text.
+#[test]
+fn directed_aad_binds_direction_and_sender() {
+    let a = identity();
+    let b = identity_b();
+    let c = Identity::from_app_seed(&[8u8; 32]).unwrap();
+    let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let note = compose_directed_note(
+        &a, &utxos(), "authentic", true, [3, 0, 0, 3], &to_b, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+
+    let mut spoofed = bundle_from_txs(&[(&note, false, Some(100))]);
+    spoofed.notes_onchain[0].pays_self = true;
+    spoofed.notes_onchain[0].sender = Some(c.address(NET)); // lie about the author
+    let notes = extract_notes(&spoofed, &b, NET);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].text.is_none(), "spoofed sender must fail the AAD, not decrypt");
+}
+
+/// Received acceptance is additive: pays-me PNTE surfaces as received
+/// (never own); neither-from-nor-paying stays ignored (covered again here
+/// with a directed note for completeness).
+#[test]
+fn received_acceptance_is_additive() {
+    let a = identity();
+    let b = identity_b();
+    let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let note = compose_directed_note(
+        &a, &utxos(), "delivered", false, [4, 0, 0, 4], &to_b, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+
+    // pays_self missing (old bundle) → tx contributes nothing at B.
+    let old_style = bundle_from_txs(&[(&note, false, Some(100))]);
+    assert!(extract_notes(&old_style, &b, NET).is_empty());
+
+    // pays_self set → received, and never classified as own.
+    let mut bundle = bundle_from_txs(&[(&note, false, Some(100))]);
+    bundle.notes_onchain[0].pays_self = true;
+    bundle.notes_onchain[0].sender = Some(a.address(NET));
+    let notes = extract_notes(&bundle, &b, NET);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].received);
+}
+
+/// An attacker reusing one of MY note_ids in a pays-me tx must not
+/// contaminate my own note's chunk bucket.
+#[test]
+fn received_note_id_collision_does_not_contaminate() {
+    let a = identity();
+    let b = identity_b();
+    let shared_id = [5, 0, 0, 5];
+    let mine =
+        compose_note(&a, &utxos(), "my own words", false, shared_id, 80, 1.0, || Ok(AUX)).unwrap();
+    let to_a = Recipient::parse(NET, &a.address(NET)).unwrap();
+    let attack = compose_directed_note(
+        &b, &utxos(), "gotcha?", false, shared_id, &to_a, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+
+    let mut bundle = bundle_from_txs(&[(&mine, true, Some(100)), (&attack, false, Some(101))]);
+    bundle.notes_onchain[1].pays_self = true;
+    bundle.notes_onchain[1].sender = Some(b.address(NET));
+    let notes = extract_notes(&bundle, &a, NET);
+    assert_eq!(notes.len(), 2, "own and received buckets must stay separate");
+    let own = notes.iter().find(|n| !n.received).unwrap();
+    assert_eq!(own.text.as_deref(), Some("my own words"), "own note must survive intact");
+    let recv = notes.iter().find(|n| n.received).unwrap();
+    assert_eq!(recv.text.as_deref(), Some("gotcha?"));
+}
+
+#[test]
+fn private_directed_requires_p2tr_recipient() {
+    let a = identity();
+    let v0 = Recipient {
+        address: "fake".into(),
+        spk: {
+            let mut s = vec![0x00, 0x14];
+            s.extend_from_slice(&[0x11; 20]);
+            s
+        },
+        p2tr_x: None,
+    };
+    let err = compose_directed_note(
+        &a, &utxos(), "secret", true, [6, 0, 0, 6], &v0, 80, 1.0, || Ok(AUX),
+    );
+    assert!(matches!(err, Err(notes_core::Error::RecipientNotTaproot)));
+    // Public to a v0 address is fine.
+    compose_directed_note(&a, &utxos(), "postcard", false, [6, 0, 0, 7], &v0, 80, 1.0, || Ok(AUX))
+        .unwrap();
 }
 
 #[test]
@@ -239,9 +483,25 @@ fn scan_import_is_idempotent() {
     let mut bundle = bundle_from_txs(&[(&note, true, Some(10))]);
     let dup = bundle.notes_onchain[0].clone();
     bundle.notes_onchain.push(dup); // overlapping incremental import
-    let notes = extract_notes(&bundle, &id.enc_key);
+    let notes = extract_notes(&bundle, &id, NET);
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0].text.as_deref(), Some("once only"));
+
+    // Same for a RECEIVED directed note duplicated across bundles.
+    let b = identity_b();
+    let to_me = Recipient::parse(NET, &id.address(NET)).unwrap();
+    let sent = compose_directed_note(
+        &b, &utxos(), "dm once", true, [8, 8, 8, 8], &to_me, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+    let mut rb = bundle_from_txs(&[(&sent, false, Some(11))]);
+    rb.notes_onchain[0].pays_self = true;
+    rb.notes_onchain[0].sender = Some(b.address(NET));
+    let dup = rb.notes_onchain[0].clone();
+    rb.notes_onchain.push(dup);
+    let received = extract_notes(&rb, &id, NET);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].text.as_deref(), Some("dm once"));
 }
 
 #[test]
@@ -382,5 +642,63 @@ fn rust_bitcoin_cross_check() {
         let sig = Signature::from_slice(&witness[0]).unwrap();
         secp.verify_schnorr(&sig, &msg, &output_key)
             .expect("libsecp256k1 must accept our BIP340 signature over rust-bitcoin's sighash");
+    }
+}
+
+/// Same cross-check for a DIRECTED tx (self inputs + dust to recipient +
+/// OP_RETURNs + change): rust-bitcoin must parse it, agree on txid/vsize,
+/// recompute the sighash and accept our signature.
+#[test]
+fn directed_rust_bitcoin_cross_check() {
+    use bitcoin::consensus::encode::deserialize;
+    use bitcoin::hashes::Hash;
+    use bitcoin::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
+    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+    use bitcoin::{Amount, ScriptBuf, TxOut};
+
+    let id = identity();
+    let b = identity_b();
+    let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let note = compose_directed_note(
+        &id,
+        &utxos(),
+        "directed, cross-checked against rust-bitcoin",
+        true,
+        [0xDD, 0x11, 0x22, 0x33],
+        &to_b,
+        80,
+        3.0,
+        || Ok(AUX),
+    )
+    .unwrap();
+
+    let raw = hex::decode(&note.raw_hex).unwrap();
+    let btx: bitcoin::Transaction = deserialize(&raw).unwrap();
+    assert_eq!(btx.compute_txid().to_string(), note.txid_hex);
+    assert_eq!(btx.vsize(), note.vsize);
+    // The dust output must land at B's address per rust-bitcoin's decoder.
+    let dust = btx.output.iter().find(|o| o.value.to_sat() == 330).unwrap();
+    assert_eq!(dust.script_pubkey.as_bytes(), to_b.spk.as_slice());
+
+    let spk = ScriptBuf::from_bytes(notes_core::address::p2tr_script_pubkey(&id.output_x));
+    let prevouts: Vec<TxOut> = note
+        .tx
+        .inputs
+        .iter()
+        .map(|i| TxOut { value: Amount::from_sat(i.value), script_pubkey: spk.clone() })
+        .collect();
+    let secp = Secp256k1::verification_only();
+    let output_key = XOnlyPublicKey::from_slice(&id.output_x).unwrap();
+    let mut cache = SighashCache::new(&btx);
+    for (index, witness) in (0..btx.input.len()).zip(&note.tx.witnesses) {
+        let sighash = cache
+            .taproot_key_spend_signature_hash(index, &Prevouts::All(&prevouts), TapSighashType::Default)
+            .unwrap();
+        secp.verify_schnorr(
+            &Signature::from_slice(&witness[0]).unwrap(),
+            &Message::from_digest(sighash.to_byte_array()),
+            &output_key,
+        )
+        .expect("directed tx signature must verify");
     }
 }

@@ -458,6 +458,41 @@ export component AppWindow inherits Window {
                 }
             }
 
+            // Directed notes: leave the To field empty for a classic
+            // self-note; enter an address to add a dust output to that
+            // recipient and (for private) seal via the ECDH DM key.
+            Rectangle {
+                vertical-stretch: 0;
+                height: 44px;
+                background: Theme.palette-surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: to-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                clip: true;
+                to-input := TextInput {
+                    x: 14px;
+                    width: parent.width - 28px;
+                    height: 24px;
+                    y: (parent.height - self.height) / 2;
+                    text <=> Compose.to-address;
+                    color: Theme.palette-foreground;
+                    font-family: "SourceCodePro";
+                    font-size: 15px;
+                    single-line: true;
+                    edited => { Callbacks.compose-changed(); }
+                }
+                Text {
+                    x: 14px;
+                    height: parent.height;
+                    text: Compose.to-address == "" && to-input.preedit-text == ""
+                        ? "To: self — or a recipient address" : "";
+                    color: Theme.palette-muted;
+                    font-family: "SourceCodePro";
+                    font-size: 15px;
+                    vertical-alignment: center;
+                }
+            }
+
             HorizontalLayout {
                 vertical-stretch: 0;
                 spacing: 6px;
@@ -527,7 +562,9 @@ export component AppWindow inherits Window {
 
             editor := EditorField {
                 vertical-stretch: 0;
-                height: 118px;
+                // The To row above costs 54px — a 76px editor keeps every
+                // control (Continue included) above the on-screen keyboard.
+                height: 76px;
                 text <=> Compose.text;
                 placeholder: "Type your note…";
                 changed => { Callbacks.compose-changed(); }

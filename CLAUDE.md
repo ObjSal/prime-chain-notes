@@ -27,6 +27,7 @@ notes-core/            # UI-free, host-testable: cargo test -p notes-core
   src/tx.rs            # tx model/serialization, fee estimator, coin selection
   src/envelope.rs      # PNTE || v1 || flags || note_id || seq/total (FROZEN)
   src/crypt.rs         # seal/open, SEAL_OVERHEAD=40 (cost estimator depends on it)
+  src/dm.rs            # directed notes: static-static x-only ECDH + HKDF (FROZEN)
   src/bundle.rs        # SyncBundle JSON, extract_notes, compose_note, Identity
   examples/notes_cli.rs  # host CLI (device role) for the e2e scripts
 src/main.rs            # app: screens, callbacks, state.json persistence
@@ -45,21 +46,38 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
 ## Invariants (do not break)
 
 - **FROZEN strings**: HKDF salts `prime-chain-notes/key/v1`,
-  `prime-chain-notes/enc/v1`, infos `identity/<attempt>`, `note-enc/v1`,
-  and the PNTE envelope layout. Every confirmed note depends on them.
+  `prime-chain-notes/enc/v1`, `prime-chain-notes/dm/v1`, infos
+  `identity/<attempt>`, `note-enc/v1`, `dm-enc/v1`, the PNTE envelope
+  layout (flags bit0 private, bit1 directed), and the directed-note AAD
+  `sender_x(32) || recipient_x(32) || note_id(4)`. Every confirmed note
+  depends on them. Directed-private key = HKDF(dm/v1,
+  x(my_tweaked_seckey · lift_x(peer_output_x))) — symmetric both ways,
+  frozen vector in `tests/vectors.rs`.
 - **Pure-Rust only on device** (no C under armv7a-unknown-xous-elf).
   `rust-bitcoin` is a **dev-dependency only** — host tests cross-check our
   serialization/sighash/signatures against libsecp256k1.
 - The estimator (`estimate_note_cost`/`estimate_vsize`) must stay
   byte-exact vs real signed txs — `cost_estimator_is_exact` enforces it.
-- A payload counts as a note only if its tx **spends from the notes
-  address** (spoof resistance) — companion sets `spends_from_self`.
+- A payload counts as an **OWN** note only if its tx **spends from the
+  notes address** (spoof resistance — companion sets `spends_from_self`).
+  A PNTE tx that instead **pays** the address is a **RECEIVED** note,
+  always shown `from <sender>` (first taproot input prevout — unforgeable),
+  never as an own note; own and received chunk buckets never merge (keyed
+  by note_id × origin/sender), so a pays-me tx reusing an own note_id
+  cannot contaminate it. Directed-note txs: OP_RETURNs, then a
+  DUST_LIMIT=330 output to the recipient, then change — the app's UTXO
+  ledger takes change at vout `chunks + 1` for directed notes.
 - getrandom patch: after bumping deps re-run
   `cargo update getrandom@<ver> --precise 0.2.10` or the TRNG override
   silently drops out (check for "Patch … was not used" warnings).
 
 ## State & sync contract
 
+- Compose "To" field (below the Private/Public pills): empty = classic
+  self-note; a valid address = **directed note** (dust output + `to=` in
+  the log; private requires a taproot recipient, sealed via dm.rs ECDH).
+  The field clears after signing so a stale recipient can't leak into the
+  next note. Cost line appends "+ 330 sats to recipient".
 - Compose fee tiers: 0 economy / 1 normal / 2 fast / **3 custom**. The
   rate field (`Compose.rate-text`) mirrors the selected tier's sat/vB;
   a manual edit flips the tier to 3 and `resolve_rate` parses the field
@@ -102,10 +120,10 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
 
 `cb: home balance=<sats> utxos=<n> tip=<h|none>` ·
 `cb: refresh-notes n=<n>` ·
-`cb: compose len=<n> private=<b> chunks=<c> fee=<f> vsize=<v> txid=<t> ok | err=<e>` (the UI test derives the applied sat/vB as fee/vsize) ·
+`cb: compose len=<n> private=<b> to=<addr|self> chunks=<c> fee=<f> vsize=<v> txid=<t> ok | err=<e>` (the UI test derives the applied sat/vB as fee/vsize) ·
 `cb: sign-note id=<hex8> txid=<t> fee=<f> vsize=<v> internal=<ok|err> airlock=<ok|err>` ·
-`cb: open-note id=<hex8> status=<s>` ·
-`cb: import-bundle file=<f> loc=<l> notes=<n> new=<k> utxos=<m> tip=<h> ok | err=<e>` ·
+`cb: open-note id=<hex8> status=<s>[ from=<addr>]` ·
+`cb: import-bundle file=<f> loc=<l> notes=<n> new=<k> received=<r> utxos=<m> tip=<h> ok | err=<e>` ·
 `cb: export-pending n=<n> airlock=<ok|err>` ·
 `cb: set-network <net>` ·
 `cb: set-chunk-size <n|auto> ok | err=<msg>` ·

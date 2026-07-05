@@ -21,6 +21,43 @@ fn aad(note_id: &[u8; 4]) -> [u8; 4] {
     *note_id
 }
 
+/// Seal with an explicit nonce and arbitrary AAD (directed notes bind
+/// sender/recipient keys — see dm.rs; own notes bind only the note_id).
+pub(crate) fn seal_with_nonce_aad(
+    key: &[u8; 32],
+    aad: &[u8],
+    nonce: &[u8; NONCE_LEN],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let ct = cipher
+        .encrypt(XNonce::from_slice(nonce), Payload { msg: plaintext, aad })
+        .map_err(|_| Error::DecryptFailed)?;
+    let mut blob = Vec::with_capacity(NONCE_LEN + ct.len());
+    blob.extend_from_slice(nonce);
+    blob.extend_from_slice(&ct);
+    Ok(blob)
+}
+
+/// Seal with a fresh TRNG/OS nonce and arbitrary AAD.
+pub(crate) fn seal_aad(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut nonce = [0u8; NONCE_LEN];
+    getrandom::getrandom(&mut nonce).map_err(|_| Error::Entropy)?;
+    seal_with_nonce_aad(key, aad, &nonce, plaintext)
+}
+
+/// Open a sealed blob under arbitrary AAD. Failure = "not ours / corrupted".
+pub(crate) fn open_aad(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<Vec<u8>, Error> {
+    if blob.len() < SEAL_OVERHEAD {
+        return Err(Error::DecryptFailed);
+    }
+    let (nonce, ct) = blob.split_at(NONCE_LEN);
+    let cipher = XChaCha20Poly1305::new(key.into());
+    cipher
+        .decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad })
+        .map_err(|_| Error::DecryptFailed)
+}
+
 /// Seal with an explicit nonce (tests). Production callers use `seal`.
 pub fn seal_with_nonce(
     key: &[u8; 32],
@@ -28,17 +65,7 @@ pub fn seal_with_nonce(
     nonce: &[u8; NONCE_LEN],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    let cipher = XChaCha20Poly1305::new(key.into());
-    let ct = cipher
-        .encrypt(
-            XNonce::from_slice(nonce),
-            Payload { msg: plaintext, aad: &aad(note_id) },
-        )
-        .map_err(|_| Error::DecryptFailed)?;
-    let mut blob = Vec::with_capacity(NONCE_LEN + ct.len());
-    blob.extend_from_slice(nonce);
-    blob.extend_from_slice(&ct);
-    Ok(blob)
+    seal_with_nonce_aad(key, &aad(note_id), nonce, plaintext)
 }
 
 /// Seal a note body with a fresh TRNG/OS nonce.
@@ -51,15 +78,5 @@ pub fn seal(key: &[u8; 32], note_id: &[u8; 4], plaintext: &[u8]) -> Result<Vec<u
 /// Open a sealed blob. A failure means "not ours / corrupted" — callers
 /// treat it as a foreign payload, not a fatal error.
 pub fn open(key: &[u8; 32], note_id: &[u8; 4], blob: &[u8]) -> Result<Vec<u8>, Error> {
-    if blob.len() < SEAL_OVERHEAD {
-        return Err(Error::DecryptFailed);
-    }
-    let (nonce, ct) = blob.split_at(NONCE_LEN);
-    let cipher = XChaCha20Poly1305::new(key.into());
-    cipher
-        .decrypt(
-            XNonce::from_slice(nonce),
-            Payload { msg: ct, aad: &aad(note_id) },
-        )
-        .map_err(|_| Error::DecryptFailed)
+    open_aad(key, &aad(note_id), blob)
 }

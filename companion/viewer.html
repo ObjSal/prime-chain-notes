@@ -141,9 +141,10 @@ async function loadNotes() {
       (n) => log(logEl, `  …paged ${n} more confirmed txs`));
 
     render(scan.notes, address);
-    const bits = [`${scan.notes.length} note(s)`, `${scan.noteTxs} note tx(s)`,
-                  `${scan.txsScanned} txs scanned`];
-    if (scan.foreign) bits.push(`${scan.foreign} foreign OP_RETURN tx(s) ignored`);
+    const bits = [`${scan.notes.length} note(s)`, `${scan.noteTxs} note tx(s)`];
+    if (scan.receivedTxs) bits.push(`${scan.receivedTxs} received tx(s)`);
+    bits.push(`${scan.txsScanned} txs scanned`);
+    if (scan.foreign) bits.push(`${scan.foreign} unrelated OP_RETURN tx(s) ignored`);
     if (scan.nonPnte) bits.push(`${scan.nonPnte} non-PNTE payload(s) ignored`);
     $("notesHeader").textContent = bits.join(" · ");
     log(logEl, "Done.", "ok");

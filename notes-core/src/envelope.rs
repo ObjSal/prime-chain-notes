@@ -14,6 +14,10 @@ pub const HEADER_LEN: usize = 12;
 
 /// flags bit 0: 1 = private (AEAD blob), 0 = public (plaintext UTF-8).
 pub const FLAG_PRIVATE: u8 = 0x01;
+/// flags bit 1: 1 = directed (note addressed to another taproot address via
+/// a dust output; private bodies sealed under the dm.rs ECDH key, not the
+/// self enc_key). Additive to the FROZEN v1 layout.
+pub const FLAG_DIRECTED: u8 = 0x02;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
@@ -27,6 +31,10 @@ pub struct Chunk {
 impl Chunk {
     pub fn is_private(&self) -> bool {
         self.flags & FLAG_PRIVATE != 0
+    }
+
+    pub fn is_directed(&self) -> bool {
+        self.flags & FLAG_DIRECTED != 0
     }
 }
 

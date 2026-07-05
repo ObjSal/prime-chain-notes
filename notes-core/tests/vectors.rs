@@ -93,3 +93,35 @@ fn address_matches_rust_bitcoin() {
         assert_eq!(ours, theirs.to_string(), "{network:?}");
     }
 }
+
+/// FROZEN directed-note derivation vector (dm.rs): pins the static-static
+/// x-only ECDH shared secret and the HKDF'd dm key between the two fixed
+/// test identities, in BOTH directions. Computed once at implementation
+/// time (2026-07-05) and frozen forever — any change to DM_SALT/DM_INFO,
+/// lift_x, or the tweak pipeline breaks every directed note on-chain.
+#[test]
+fn dm_derivation_vector() {
+    use notes_core::bundle::Identity;
+    use notes_core::dm;
+    let a = Identity::from_app_seed(&[7u8; 32]).unwrap();
+    let b = Identity::from_app_seed(&[9u8; 32]).unwrap();
+    assert_eq!(
+        hex::encode(a.output_x),
+        "340b5676cb3a2601bafc33618758d4ceb9c2e31f0a94e74525e7c0b3265a9806"
+    );
+    assert_eq!(
+        hex::encode(b.output_x),
+        "d92e82f3e71764d5114ced67d96f03f941d45de46e8ee5b770d588ba2207ae20"
+    );
+    let shared_ab = dm::ecdh_shared_x(&a.tweaked_seckey, &b.output_x).unwrap();
+    let shared_ba = dm::ecdh_shared_x(&b.tweaked_seckey, &a.output_x).unwrap();
+    assert_eq!(
+        hex::encode(shared_ab),
+        "a1ab7a2394be6aeb788f7700509d006d3ed71f2a085316185ccd6e72ad01d8c6"
+    );
+    assert_eq!(shared_ab, shared_ba);
+    assert_eq!(
+        hex::encode(dm::dm_key(&shared_ab)),
+        "fc5ed80cb6f3b317797d5a11cbedda484d631291da3f2d15c377e9e6e06b2121"
+    );
+}

@@ -218,7 +218,26 @@ localhost pattern and improving on it:
   scanAddress, note-card builder) out of viewer.html into `chain-scan.js`
   so the FROZEN-format parser exists in exactly one JS place. e2e covers
   permalink click (public) + direct URL (private placeholder).
-- note_id collision guard (2026-07-05): scanners bucket chunks purely by
+- Directed notes (2026-07-05, user request; plan-reviewed): send public +
+  private notes TO another taproot address. Protocol frozen: FLAG_DIRECTED
+  0x02, dust output 330 sats to the recipient (OP_RETURNs → dust → change,
+  so the app ledger's change vout is `chunks+1` for directed), private
+  bodies sealed under HKDF(dm/v1, x-only static-static ECDH of the two
+  tweaked output keys) with AAD `sender_x||recipient_x||note_id` —
+  **static-static chosen over the FUTURE doc's ephemeral ECIES** (user
+  decision) so both sides re-derive from bare chain data post-wipe (sender
+  peer key = the tx's dust-output address; recipient peer key = the tx's
+  taproot input). Scanner acceptance is additive: spends-from-self gates
+  OWN notes exactly as before; pays-me PNTE = RECEIVED note keyed
+  (note_id, origin/sender) so buckets never merge. Compose UI: a single
+  "To" field (empty = self) instead of pills — the pill row + conditional
+  field pushed Continue under the keyboard (caught via sim screenshot);
+  the field clears after signing. Two ledger landmines fixed alongside:
+  balance_after forgot the dust (−330) and the change vout was hardcoded
+  to `chunks`. Verified: 27 cargo tests incl. frozen dm vector + directed
+  exactness/cross-check, node chain-scan tests, companion e2e A→B via the
+  real page, regtest-e2e.sh A/B section, full sim-UI e2e (tap coords
+  shifted +54px for the To row — chain-notes.sh updated).
   note_id, so two of the user's own notes colliding would merge into one
   bucket → `reassemble` fails → the device drops BOTH from chain recovery
   (only visible after a wipe-restore). `keys::pick_unique_note_id` rerolls

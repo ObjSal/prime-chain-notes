@@ -3,9 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::address::taproot_address;
+use crate::address::{p2tr_x_of_address, taproot_address, Recipient};
 use crate::crypt;
-use crate::envelope::{self, Chunk, FLAG_PRIVATE};
+use crate::dm;
+use crate::envelope::{self, Chunk, FLAG_DIRECTED, FLAG_PRIVATE};
 use crate::keys::{derive_encryption_key, derive_identity_key, xonly_pubkey};
 use crate::taproot::{taproot_tweak_pubkey, taproot_tweak_seckey};
 use crate::tx::{build_note_tx, NoteTx, Utxo};
@@ -70,11 +71,22 @@ pub struct OnchainTx {
     #[serde(default)]
     pub blocktime: Option<u64>,
     /// True when the tx spends an input belonging to the notes address —
-    /// the sender-authentication rule; payloads in txs merely PAYING the
-    /// address are ignored.
+    /// the sender-authentication rule for OWN notes; PNTE payloads in txs
+    /// merely PAYING the address surface as RECEIVED notes instead.
     pub spends_from_self: bool,
     /// OP_RETURN payloads (hex), in output order.
     pub payloads: Vec<String>,
+    /// True when any output pays the notes address (directed-note delivery).
+    #[serde(default)]
+    pub pays_self: bool,
+    /// First taproot input prevout address — the (unforgeable) author of a
+    /// received note.
+    #[serde(default)]
+    pub sender: Option<String>,
+    /// First non-self, non-OP_RETURN output address — the recipient of an
+    /// own directed note (lets the sender re-derive the DM key after a wipe).
+    #[serde(default)]
+    pub recipient: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,40 +169,72 @@ pub struct RecoveredNote {
     pub height: Option<u64>,
     pub blocktime: Option<u64>,
     pub private: bool,
+    /// Directed note (dust output to a recipient; FLAG_DIRECTED set).
+    pub directed: bool,
+    /// True = someone else sent this note TO our address; false = our own.
+    pub received: bool,
+    /// Author address of a received note (first taproot input prevout).
+    pub sender: Option<String>,
+    /// Recipient address of our own directed note.
+    pub recipient: Option<String>,
     /// None = private note that did not decrypt under our key (foreign).
     pub text: Option<String>,
 }
 
-/// Scan a bundle's on-chain txs into notes: filter to self-spends, decode
-/// PNTE envelopes, group chunks by note_id across txs, reassemble, decrypt
-/// private bodies. Import is idempotent by construction — output depends
-/// only on chain content, keyed by note_id.
-pub fn extract_notes(bundle: &SyncBundle, enc_key: &[u8; 32]) -> Vec<RecoveredNote> {
+/// Scan a bundle's on-chain txs into notes.
+///
+/// Acceptance: a tx that SPENDS FROM the notes address carries OWN notes
+/// (the frozen spoof-resistance rule); a tx that only PAYS the address and
+/// carries PNTE is a RECEIVED note, attributed to its (unforgeable) input
+/// address; anything else is ignored. Chunks bucket by (note_id, origin) so
+/// a pays-me tx reusing one of our note_ids can never contaminate our own
+/// note. Import stays idempotent — output depends only on chain content.
+pub fn extract_notes(
+    bundle: &SyncBundle,
+    identity: &Identity,
+    network: Network,
+) -> Vec<RecoveredNote> {
+    #[derive(PartialEq, Eq, Clone)]
+    enum Origin {
+        Own,
+        Received(Option<String>), // sender address
+    }
     struct Pending {
+        origin: Origin,
         chunks: Vec<Chunk>,
         txids: Vec<String>,
         height: Option<u64>,
         blocktime: Option<u64>,
+        recipient: Option<String>,
     }
     let mut by_id: Vec<([u8; 4], Pending)> = Vec::new();
 
     for tx in &bundle.notes_onchain {
-        if !tx.spends_from_self {
-            continue;
-        }
+        let origin = if tx.spends_from_self {
+            Origin::Own
+        } else if tx.pays_self {
+            Origin::Received(tx.sender.clone())
+        } else {
+            continue; // neither from nor to us — pure spoof, ignored
+        };
         for payload_hex in &tx.payloads {
             let Ok(payload) = hex::decode(payload_hex) else { continue };
             let Some(chunk) = envelope::decode(&payload) else { continue };
-            let entry = match by_id.iter_mut().find(|(id, _)| *id == chunk.note_id) {
+            let entry = match by_id
+                .iter_mut()
+                .find(|(id, p)| *id == chunk.note_id && p.origin == origin)
+            {
                 Some((_, p)) => p,
                 None => {
                     by_id.push((
                         chunk.note_id,
                         Pending {
+                            origin: origin.clone(),
                             chunks: Vec::new(),
                             txids: Vec::new(),
                             height: None,
                             blocktime: None,
+                            recipient: None,
                         },
                     ));
                     &mut by_id.last_mut().expect("just pushed").1
@@ -203,6 +247,9 @@ pub fn extract_notes(bundle: &SyncBundle, enc_key: &[u8; 32]) -> Vec<RecoveredNo
             entry.chunks.push(chunk);
             if !entry.txids.contains(&tx.txid) {
                 entry.txids.push(tx.txid.clone());
+            }
+            if entry.recipient.is_none() {
+                entry.recipient = tx.recipient.clone();
             }
             // A note's height is its FIRST confirmation.
             if entry.height.is_none() || tx.height < entry.height {
@@ -217,26 +264,95 @@ pub fn extract_notes(bundle: &SyncBundle, enc_key: &[u8; 32]) -> Vec<RecoveredNo
     let mut notes = Vec::new();
     for (note_id, pending) in by_id {
         let Ok(body) = envelope::reassemble(&pending.chunks) else { continue };
-        let private = pending.chunks[0].flags & FLAG_PRIVATE != 0;
-        let text = if private {
-            crypt::open(enc_key, &note_id, &body)
-                .ok()
-                .and_then(|pt| String::from_utf8(pt).ok())
-        } else {
-            String::from_utf8(body).ok()
+        let flags = pending.chunks[0].flags;
+        let private = flags & FLAG_PRIVATE != 0;
+        let directed = flags & FLAG_DIRECTED != 0;
+        let received = matches!(pending.origin, Origin::Received(_));
+        let sender = match &pending.origin {
+            Origin::Received(s) => s.clone(),
+            Origin::Own => None,
         };
+        let recipient = if received { None } else { pending.recipient.clone() };
+
+        let plaintext = if !private {
+            Some(body)
+        } else if !directed {
+            // Own self-note: the frozen enc_key path, byte-for-byte as v1.
+            crypt::open(&identity.enc_key, &note_id, &body).ok()
+        } else if received {
+            // Received directed-private: reciprocal ECDH with the sender key.
+            sender
+                .as_deref()
+                .and_then(|s| p2tr_x_of_address(network, s))
+                .and_then(|sender_x| {
+                    dm::open_received(
+                        &identity.tweaked_seckey,
+                        &identity.output_x,
+                        &sender_x,
+                        &note_id,
+                        &body,
+                    )
+                    .ok()
+                })
+        } else {
+            // Own sent directed-private: re-derive via the dust-output key.
+            recipient
+                .as_deref()
+                .and_then(|r| p2tr_x_of_address(network, r))
+                .and_then(|recipient_x| {
+                    dm::open_sent(
+                        &identity.tweaked_seckey,
+                        &identity.output_x,
+                        &recipient_x,
+                        &note_id,
+                        &body,
+                    )
+                    .ok()
+                })
+        };
+        let text = plaintext.and_then(|pt| String::from_utf8(pt).ok());
+
         notes.push(RecoveredNote {
             note_id,
             txids: pending.txids,
             height: pending.height,
             blocktime: pending.blocktime,
             private,
+            directed,
+            received,
+            sender,
+            recipient,
             text,
         });
     }
     // Confirmed first, oldest first; unconfirmed last.
     notes.sort_by_key(|n| n.height.unwrap_or(u64::MAX));
     notes
+}
+
+/// Shared tail of both compose paths: body → enveloped payloads → signed tx.
+#[allow(clippy::too_many_arguments)]
+fn compose_inner(
+    identity: &Identity,
+    utxos: &[Utxo],
+    note_id: [u8; 4],
+    flags: u8,
+    body: &[u8],
+    recipient_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let payloads = envelope::encode_chunks(note_id, flags, body, max_op_return_bytes)?;
+    build_note_tx(
+        utxos,
+        &identity.output_x,
+        &payloads,
+        recipient_spk,
+        fee_rate,
+        &identity.tweaked_seckey,
+        aux,
+    )
 }
 
 /// Compose path: text → (sealed) body → enveloped payloads → signed tx.
@@ -257,13 +373,49 @@ pub fn compose_note(
         text.as_bytes().to_vec()
     };
     let flags = if private { FLAG_PRIVATE } else { 0 };
-    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
-    build_note_tx(
+    compose_inner(identity, utxos, note_id, flags, &body, None, max_op_return_bytes, fee_rate, aux)
+}
+
+/// Directed compose: like `compose_note` but the note is addressed TO
+/// `recipient` — a DUST_LIMIT output delivers/indexes it at their address.
+/// Private bodies are sealed under the static-static ECDH key (dm.rs), so
+/// only the recipient (and the sender, reciprocally) can read them; private
+/// therefore requires a taproot recipient. Public directed notes go to any
+/// segwit address.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_directed_note(
+    identity: &Identity,
+    utxos: &[Utxo],
+    text: &str,
+    private: bool,
+    note_id: [u8; 4],
+    recipient: &Recipient,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let body = if private {
+        let recipient_x = recipient.p2tr_x.ok_or(Error::RecipientNotTaproot)?;
+        dm::seal_directed(
+            &identity.tweaked_seckey,
+            &identity.output_x,
+            &recipient_x,
+            &note_id,
+            text.as_bytes(),
+        )?
+    } else {
+        text.as_bytes().to_vec()
+    };
+    let flags = FLAG_DIRECTED | if private { FLAG_PRIVATE } else { 0 };
+    compose_inner(
+        identity,
         utxos,
-        &identity.output_x,
-        &payloads,
+        note_id,
+        flags,
+        &body,
+        Some(&recipient.spk),
+        max_op_return_bytes,
         fee_rate,
-        &identity.tweaked_seckey,
         aux,
     )
 }
@@ -275,6 +427,7 @@ pub fn estimate_note_cost(
     private: bool,
     max_op_return_bytes: usize,
     n_inputs: usize,
+    recipient_spk_len: Option<usize>,
 ) -> Result<(usize, usize), Error> {
     let body_len = if private { text_len + crypt::SEAL_OVERHEAD } else { text_len };
     if body_len == 0 {
@@ -291,6 +444,6 @@ pub fn estimate_note_cost(
     let mut payload_lens = vec![max_op_return_bytes; total - 1];
     let tail = body_len - (total - 1) * chunk_size;
     payload_lens.push(envelope::HEADER_LEN + tail);
-    let vsize = crate::tx::estimate_vsize(n_inputs.max(1), &payload_lens, true);
+    let vsize = crate::tx::estimate_vsize(n_inputs.max(1), &payload_lens, recipient_spk_len, true);
     Ok((total, vsize))
 }

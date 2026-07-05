@@ -14,6 +14,10 @@ const API = {
 };
 
 const FLAG_PRIVATE = 0x01;
+const FLAG_DIRECTED = 0x02;
+const P2TR_RE = /^(bc|tb|bcrt)1p/;
+
+const shortAddr = (a) => (a && a.length > 17 ? `${a.slice(0, 8)}…${a.slice(-6)}` : a || "unknown");
 
 const hexToBytes = (h) => Uint8Array.from(h.match(/../g) || [], (b) => parseInt(b, 16));
 
@@ -89,15 +93,19 @@ function reassemble(chunks) {
   return { body };
 }
 
-// Port of notes-core extract_notes (bundle.rs): filter to txs that spend
-// from the address (spoof resistance — anyone can send OP_RETURNs *to* an
-// address), decode PNTE envelopes, group chunks by note_id across txs.
-// Returns { notes (newest-first), noteTxs, txsScanned, foreign, nonPnte }.
+// Port of notes-core extract_notes (bundle.rs). Acceptance: a tx that
+// SPENDS FROM the address carries OWN notes (spoof resistance — anyone can
+// send OP_RETURNs *to* an address, so those never count as yours); a tx
+// that only PAYS the address and carries PNTE is a RECEIVED note,
+// attributed to its (unforgeable) taproot input address. Chunks bucket by
+// (note_id, origin) so a pays-me tx reusing one of your note_ids can never
+// contaminate your own note.
+// Returns { notes (newest-first), noteTxs, receivedTxs, txsScanned, foreign, nonPnte }.
 async function scanAddress(base, address, onPage) {
   const txs = await fullHistory(base, address, onPage);
 
   const byId = new Map();
-  let foreign = 0, nonPnte = 0, noteTxs = 0;
+  let foreign = 0, nonPnte = 0, noteTxs = 0, receivedTxs = 0;
   for (const t of txs) {
     const payloads = t.vout
       .filter((o) => o.scriptpubkey_type === "op_return")
@@ -107,23 +115,48 @@ async function scanAddress(base, address, onPage) {
     const spendsFromSelf = t.vin.some(
       (i) => i.prevout && i.prevout.scriptpubkey_address === address
     );
-    if (!spendsFromSelf) { foreign++; continue; }
-    noteTxs++;
+    const paysSelf = t.vout.some((o) => o.scriptpubkey_address === address);
+    let originKey, from = null, to = null;
+    if (spendsFromSelf) {
+      originKey = "own";
+      const outs = t.vout.filter(
+        (o) =>
+          o.scriptpubkey_type !== "op_return" &&
+          o.scriptpubkey_address &&
+          o.scriptpubkey_address !== address
+      );
+      to = (outs.find((o) => P2TR_RE.test(o.scriptpubkey_address)) || outs[0])
+        ?.scriptpubkey_address || null;
+      noteTxs++;
+    } else if (paysSelf) {
+      from =
+        t.vin
+          .map((i) => i.prevout && i.prevout.scriptpubkey_address)
+          .find((a) => a && P2TR_RE.test(a)) || null;
+      originKey = `recv:${from || "unknown"}`;
+      receivedTxs++;
+    } else {
+      foreign++; // neither from nor to this address — pure spoof
+      continue;
+    }
     const txHeight = t.status.confirmed ? t.status.block_height : null;
     const txTime = t.status.confirmed ? t.status.block_time : null;
     for (const payloadHex of payloads) {
       const chunk = decodeEnvelope(hexToBytes(payloadHex));
       if (!chunk) { nonPnte++; continue; }
       chunk.dataHex = payloadHex.slice(24);   // for dedup below
-      let entry = byId.get(chunk.noteId);
+      const key = `${chunk.noteId}|${originKey}`;
+      let entry = byId.get(key);
       if (!entry) {
-        entry = { chunks: [], txids: [], height: null, blocktime: null };
-        byId.set(chunk.noteId, entry);
+        entry = { noteId: chunk.noteId, chunks: [], txids: [], height: null,
+                  blocktime: null, received: originKey !== "own", from, to: null };
+        byId.set(key, entry);
       }
       // Drop exact duplicates (same chunk seen in overlapping txs).
       if (entry.chunks.some((c) => c.seq === chunk.seq && c.dataHex === chunk.dataHex)) continue;
       entry.chunks.push(chunk);
       if (!entry.txids.includes(t.txid)) entry.txids.push(t.txid);
+      if (!entry.to) entry.to = to;
       // A note's height is its FIRST confirmation.
       if (txHeight != null && (entry.height == null || txHeight < entry.height)) {
         entry.height = txHeight;
@@ -133,17 +166,23 @@ async function scanAddress(base, address, onPage) {
   }
 
   const notes = [];
-  for (const [noteId, entry] of byId) {
+  for (const entry of byId.values()) {
     const asm = reassemble(entry.chunks);
-    const priv = (entry.chunks[0].flags & FLAG_PRIVATE) !== 0;
+    const flags = entry.chunks[0].flags;
+    const priv = (flags & FLAG_PRIVATE) !== 0;
+    const directed = (flags & FLAG_DIRECTED) !== 0;
     let text = null;
     if (asm.body && !priv) {
       try { text = new TextDecoder("utf-8", { fatal: true }).decode(asm.body); }
       catch { text = null; }
     }
     notes.push({
-      noteId,
+      noteId: entry.noteId,
       private: priv,
+      directed,
+      received: entry.received,
+      from: entry.received ? entry.from : null,
+      to: entry.received ? null : (directed ? entry.to : null),
       partial: asm.partial || null,
       bodyLen: asm.body ? asm.body.length : null,
       text,
@@ -156,7 +195,7 @@ async function scanAddress(base, address, onPage) {
   const sortKey = (n) => (n.height == null ? Number.MAX_SAFE_INTEGER : n.height);
   notes.sort((a, b) => sortKey(b) - sortKey(a));
 
-  return { notes, noteTxs, txsScanned: txs.length, foreign, nonPnte };
+  return { notes, noteTxs, receivedTxs, txsScanned: txs.length, foreign, nonPnte };
 }
 
 // One note → a .note card element. permalinkHref (optional) adds a
@@ -177,6 +216,8 @@ function buildNoteCard(n, explorer, permalinkHref) {
     head.appendChild(s);
   };
   pill(n.private ? "private" : "public");
+  if (n.received) pill(`from ${shortAddr(n.from)}`);
+  else if (n.directed && n.to) pill(`to ${shortAddr(n.to)}`);
   if (n.height == null) pill("unconfirmed");
   if (n.partial) pill(`partial ${n.partial.have}/${n.partial.total}`);
   if (permalinkHref) {
@@ -195,7 +236,9 @@ function buildNoteCard(n, explorer, permalinkHref) {
     body.textContent = `Partial note — ${n.partial.have} of ${n.partial.total} chunks found on-chain.`;
   } else if (n.private) {
     body.classList.add("enc");
-    body.textContent = "Encrypted (private) — readable only on the device.";
+    body.textContent = n.directed
+      ? "Encrypted (directed) — readable only on the sender's and recipient's devices."
+      : "Encrypted (private) — readable only on the device.";
   } else if (n.text != null) {
     body.textContent = n.text;
   } else {

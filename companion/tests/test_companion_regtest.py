@@ -11,6 +11,7 @@ Prereqs: companion/server.py running with regtest on :8091, and
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,8 @@ SHOTS.mkdir(exist_ok=True)
 
 NOTE_TEXT = "companion-page note: built, broadcast and rescanned through the real UI"
 VIEWER_NOTE_TEXT = "public note rendered by the viewer page"
+DIRECTED_PUB_TEXT = "directed public note: postcard from A to B"
+DIRECTED_PRIV_TEXT = "directed private note: sealed for B via static-static ECDH"
 
 
 def cli(*args, env=None):
@@ -190,6 +193,78 @@ def main():
         assert note2["txid"] in page.locator("#bcastLog").text_content()
         print(f"PASS QR scanned from fake camera and auto-broadcast, txid {note2['txid']}")
         page.screenshot(path=str(SHOTS / "companion-scan.png"), full_page=True)
+        browser.close()
+
+        # ---- directed notes: A sends public + private to identity B ----
+        b_env = {**os.environ, "NOTES_APP_SEED": "09" * 32}
+        b_address = cli("address", "regtest", env=b_env)
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.goto(BASE)
+        page.wait_for_function("document.querySelector('#modePill').textContent.includes('regtest')")
+        page.fill("#address", address)
+
+        bundle4 = build_and_download(page, tmp)
+        send_pub = json.loads(cli("send", str(bundle4), b_address, "public", "2", "100000",
+                                  DIRECTED_PUB_TEXT))
+        assert send_pub["sent"] == 330 and send_pub["recipient"] == b_address, send_pub
+        page.fill("#hexPaste", send_pub["raw_hex"])
+        page.click("#broadcastBtn")
+        wait_log("#bcastLog", "accepted", page)
+        bundle5 = build_and_download(page, tmp)     # fresh change for the second send
+        send_priv = json.loads(cli("send", str(bundle5), b_address, "private", "2", "100000",
+                                   DIRECTED_PRIV_TEXT))
+        page.fill("#hexPaste", send_priv["raw_hex"])
+        page.click("#broadcastBtn")
+        wait_log("#bcastLog", "accepted", page)
+        print(f"PASS A sent public+private directed notes to B ({send_pub['txid'][:8]}…, "
+              f"{send_priv['txid'][:8]}…)")
+
+        # B's bundle via the page carries the additive directed fields.
+        page.fill("#address", b_address)
+        bundle_b = build_and_download(page, tmp)
+        bb = json.loads(bundle_b.read_text())
+        entry = next(t for t in bb["notes_onchain"] if t["txid"] == send_pub["txid"])
+        assert entry["pays_self"] and not entry["spends_from_self"], entry
+        assert entry["sender"] == address, entry
+        scan_b = json.loads(cli("scan", str(bundle_b), env=b_env))
+        by_text = {n["text"]: n for n in scan_b}
+        assert DIRECTED_PUB_TEXT in by_text and by_text[DIRECTED_PUB_TEXT]["received"] \
+            and by_text[DIRECTED_PUB_TEXT]["from"] == address, scan_b
+        assert DIRECTED_PRIV_TEXT in by_text and by_text[DIRECTED_PRIV_TEXT]["private"] \
+            and by_text[DIRECTED_PRIV_TEXT]["directed"], scan_b
+        print("PASS B recovered both directed notes (private decrypted via ECDH), from=A")
+
+        # A third seed cannot read B's private note.
+        scan_c = json.loads(cli("scan", str(bundle_b),
+                                env={**os.environ, "NOTES_APP_SEED": "08" * 32}))
+        assert DIRECTED_PRIV_TEXT not in [n["text"] for n in scan_c], scan_c
+        print("PASS wrong-seed scan leaves the directed-private note sealed")
+
+        # A-side: sent notes appear with to=B; the private one decrypts via
+        # the dust-output key (the post-wipe sender recovery story).
+        page.fill("#address", address)
+        bundle_a = build_and_download(page, tmp)
+        scan_a = json.loads(cli("scan", str(bundle_a)))
+        sent_priv = next(n for n in scan_a if n["text"] == DIRECTED_PRIV_TEXT)
+        assert sent_priv["directed"] and not sent_priv["received"] \
+            and sent_priv["to"] == b_address, sent_priv
+        print("PASS A re-reads its own sent private-directed note, to=B")
+
+        # Viewer at B's address: public text + from pill, private placeholder.
+        viewer = browser.new_page()
+        viewer.goto(BASE + f"/viewer.html?address={b_address}&network=regtest")
+        wait_log("#notes", DIRECTED_PUB_TEXT, viewer)
+        shown = viewer.locator("#notes").text_content()
+        assert "Encrypted (directed)" in shown, shown
+        assert DIRECTED_PRIV_TEXT not in shown, "directed-private plaintext leaked!"
+        assert "from " in shown, shown
+        viewer.screenshot(path=str(SHOTS / "companion-directed.png"), full_page=True)
+        # note.html permalink on the received public note still works.
+        viewer.click(f'#notes a[href*="note={send_pub["note_id"]}"]')
+        wait_log("#note", DIRECTED_PUB_TEXT, viewer)
+        viewer.close()
+        print("PASS viewer at B shows received notes (from pill, sealed private, permalink)")
         browser.close()
     print("COMPANION REGTEST E2E PASSED")
 

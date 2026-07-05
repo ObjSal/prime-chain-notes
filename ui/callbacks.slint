@@ -20,6 +20,9 @@ export global Home {
 export global Compose {
     in-out property <string> text: "";
     in-out property <bool> private-note: true;   // DECIDED: private by default
+    // Directed note: non-empty = addressed to another address (dust
+    // output); empty = classic self-note.
+    in-out property <string> to-address: "";
     in-out property <int> tier: 1;               // 0 economy · 1 normal · 2 fast · 3 custom
     // sat/vB shown in the rate field. Rust refreshes it from the bundle's
     // tiers while tier < 3; a manual edit flips tier to 3 (custom) and the
