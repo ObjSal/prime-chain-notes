@@ -105,6 +105,25 @@ not persisted, earlier valid 80000 retained) and in the automated e2e
 (80-compat via pill tap → 100-byte private note composes as exactly
 3 chunks, fee == 3 × vsize at the Fast tier, mined on regtest).
 
+## QR transport leg 1: signed tx via camera (2026-07-05)
+
+Device → companion without any file/cable: the note view for a pending
+note shows the raw tx as a single QR (uppercase hex for alphanumeric-mode
+density; `MAX_QR_HEX_CHARS`=4000 ≈ any normal note tx; bigger falls back
+to file export — animated multi-part UR stays future work with the
+bundle-in leg). After Sign & export the view opens ON the QR; the "Show
+tx QR"/"Show text" pill toggles. The companion's broadcast section
+gained "Scan from device 📷": getUserMedia + vendored jsQR (Apache-2.0,
+`companion/jsqr.js`) decodes and auto-broadcasts on scan.
+
+Verified both ends: (a) playwright feeds a QR-video as Chromium's fake
+camera (`--use-file-for-fake-video-capture`, y4m via ffmpeg) — page
+decoded and auto-broadcast, txid matched, mined on regtest; (b) the
+actual sim screenshot's QR decoded (cv2) and `bitcoin-tx -json` computed
+exactly the txid the app logged at signing. Bundle-in via QR (leg 2)
+still open: needs `open_qr_scanner` behavior + sim camera-emulation
+discovery, tracked in Not yet done.
+
 ## Chunk size became purely device-side (2026-07-05, user decision)
 
 The bundle's `max_op_return_bytes` field is gone from the flow: the
@@ -157,8 +176,11 @@ localhost pattern and improving on it:
 
 ## Not yet done / next
 
-- QR sync path (animated UR out, `open_qr_scanner` in) — file/Airlock is
-  the only transport wired so far.
+- QR transport leg 2 (bundle IN: companion animated multi-part QR →
+  device `open_qr_scanner`) — needs discovery: does the hosted sim's
+  camera emulation feed the system scanner, and does the scanner
+  reassemble UR sequences? Leg 1 (tx out via camera) is DONE. Oversized
+  txs (>4000 hex chars) still use file export until animated UR lands.
 - Companion hosting (GitHub Pages) — the page already behaves correctly
   in static mode (regtest hidden); publishing is a repo/ops decision.
 - App-side network enum has no testnet4 variant (CLI used `signet` for

@@ -49,6 +49,11 @@ export global View {
     in-out property <string> text: "";
     in-out property <string> meta: "";
     in-out property <string> badge: "";
+    // Signed-tx QR (pending notes only): scan it with the companion page's
+    // "Scan from device" camera to broadcast without any file transfer.
+    in-out property <image> qr;
+    in-out property <bool> has-qr: false;
+    in-out property <bool> show-qr: false;
 }
 
 export global Sync {
