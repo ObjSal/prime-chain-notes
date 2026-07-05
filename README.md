@@ -123,6 +123,14 @@ cross-checked against foundation-ur) and `tests/test_companion_testnet4.py`
 (live). Vendored: jsQR (Apache-2.0), qrcode-generator (MIT), plus the
 hand-rolled `ur.js` UR encoder.
 
+`viewer.html` is a read-only sibling page that renders an address's
+on-chain notes directly in the browser (deep-linkable via
+`viewer.html?address=…&network=…`; the bundle section's "View on-chain
+notes" button opens it prefilled): it ports the PNTE envelope
+decode/reassemble to JS, enforces the same spends-from-self rule, shows
+public notes as text and private ones as an encrypted placeholder —
+decryption stays on the device by design.
+
 **Relay policy, verified live (2026-07-05):** mempool.space/testnet4
 accepted a 224-byte single OP_RETURN
 ([tx](https://mempool.space/testnet4/tx/9097778ec53b2b5b9f8270a7e404487643bdbdccaa81bf8af7aafb3b0404b8bc))

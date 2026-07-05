@@ -25,6 +25,7 @@ SHOTS = Path(__file__).resolve().parent / "screenshots"
 SHOTS.mkdir(exist_ok=True)
 
 NOTE_TEXT = "companion-page note: built, broadcast and rescanned through the real UI"
+VIEWER_NOTE_TEXT = "public note rendered by the viewer page"
 
 
 def cli(*args, env=None):
@@ -103,6 +104,44 @@ def main():
         assert confirmed["height"] is not None, "auto-mine should have confirmed it"
         print(f"PASS note recovered from page-built bundle, confirmed at height {confirmed['height']}")
 
+        # ---- viewer.html: seed a PUBLIC note, then check both entry paths
+        # (launcher button with URL params, and standalone manual load).
+        note3 = json.loads(cli("compose", str(bundle2), "public", "2", "100000",
+                               VIEWER_NOTE_TEXT))
+        page.fill("#hexPaste", note3["raw_hex"])
+        page.set_input_files("#hexFiles", [])
+        page.click("#broadcastBtn")
+        wait_log("#bcastLog", "accepted", page)
+        assert note3["txid"] in page.locator("#bcastLog").text_content()
+
+        with page.expect_popup() as pop:
+            page.click("#viewBtn")
+        viewer = pop.value
+        assert "viewer.html" in viewer.url and address in viewer.url \
+            and "network=regtest" in viewer.url, viewer.url
+        wait_log("#notes", VIEWER_NOTE_TEXT, viewer)  # params auto-load the notes
+        shown = viewer.locator("#notes").text_content()
+        assert "Encrypted (private)" in shown, shown       # note1 stays sealed
+        assert NOTE_TEXT not in shown                      # plaintext never leaks
+        assert note3["txid"] in shown, shown
+        assert viewer.locator("#notes a").count() == 0, "regtest has no explorer links"
+        newest = viewer.evaluate("window.__cnViewer.notes[0]")
+        assert newest["text"] == VIEWER_NOTE_TEXT, newest  # newest-first ordering
+        viewer.screenshot(path=str(SHOTS / "companion-viewer.png"), full_page=True)
+        print("PASS viewer opened via button: public text, private placeholder, order")
+
+        viewer.goto(BASE + "/viewer.html")                 # standalone path
+        viewer.wait_for_function(
+            "document.querySelector('#modePill').textContent.includes('regtest')")
+        viewer.fill("#address", address)
+        viewer.click("#loadBtn")
+        wait_log("#notes", VIEWER_NOTE_TEXT, viewer)
+        viewer.close()
+        print("PASS viewer standalone load")
+
+        # Fresh bundle so the camera-test note can't double-spend note3's coin.
+        bundle3 = build_and_download(page, tmp)
+
         browser.close()
 
         # ---- Leg 1 of the QR transport: scan-from-device via fake camera.
@@ -111,7 +150,7 @@ def main():
         # a fake webcam, and let the page decode + auto-broadcast it.
         import qrcode
 
-        note2 = json.loads(cli("compose", str(bundle2), "private", "2", "100000",
+        note2 = json.loads(cli("compose", str(bundle3), "private", "2", "100000",
                                "broadcast me via the camera"))
         img = qrcode.make(note2["raw_hex"].upper(), box_size=6, border=4)
         png = tmp / "tx-qr.png"
