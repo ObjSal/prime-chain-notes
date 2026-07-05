@@ -1,0 +1,743 @@
+import { Theme, UISize, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize } from "@ui/theme.slint";
+import { Callbacks, Ui, Home, Compose, Confirm, Notes, NoteRow, View, Sync, Settings } from "callbacks.slint";
+import { Button } from "@ui/button.slint";
+
+export { Callbacks, Ui, Home, Compose, Confirm, Notes, View, Sync, Settings, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
+
+component PrimaryAction inherits Button {
+    background: Theme.palette-primary;
+    foreground: #ffffff;
+    border-color: transparent;
+    border-width: 0px;
+    font-weight: 600;
+    font-family: "Montserrat";
+    button-opacity: self.disabled ? 0.5 : 1.0;
+    touch-expansion: 4px;
+    font-size: 20px;
+    padding-horizontal: 20px;
+    padding-vertical: 12px;
+    border-radius: 24px;
+}
+
+component SecondaryAction inherits Button {
+    background: Theme.palette-surface;
+    foreground: Theme.palette-foreground;
+    border-color: Theme.palette-border;
+    border-width: 1px;
+    font-weight: 600;
+    font-family: "Montserrat";
+    touch-expansion: 4px;
+    font-size: 20px;
+    padding-horizontal: 20px;
+    padding-vertical: 12px;
+    border-radius: 24px;
+}
+
+// Plain-TouchArea back control — the SDK IconButton drops taps (sibling
+// apps' NOTES), so headers use text buttons.
+component BackBtn inherits TouchArea {
+    width: 90px;
+    height: 40px;
+    callback back();
+    clicked => { root.back(); }
+    Text {
+        text: "‹ Back";
+        color: Theme.palette-primary;
+        font-family: "Montserrat";
+        font-size: 20px;
+        font-weight: 600;
+        vertical-alignment: center;
+    }
+}
+
+component ScreenHeader inherits Rectangle {
+    in property <string> title;
+    in property <bool> show-back: true;
+    callback back();
+    height: 48px;
+    if root.show-back: BackBtn {
+        x: 0;
+        y: 4px;
+        back => { root.back(); }
+    }
+    Text {
+        text: root.title;
+        color: Theme.palette-foreground;
+        font-family: "Montserrat";
+        font-size: 22px;
+        font-weight: 700;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+}
+
+// Two-state pill toggle (Private / Public, fee tiers).
+component PillOption inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback tapped();
+    height: 44px;
+    border-radius: 22px;
+    background: selected ? Theme.palette-primary : Theme.palette-surface;
+    border-width: 1px;
+    border-color: selected ? Theme.palette-primary : Theme.palette-border;
+    TouchArea { clicked => { root.tapped(); } }
+    Text {
+        text: root.label;
+        color: root.selected ? #ffffff : Theme.palette-foreground;
+        font-family: "Montserrat";
+        font-size: 17px;
+        font-weight: 600;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+}
+
+// Scrollable multiline editor: Flickable around a builtin TextInput with
+// cursor-follow (text-editor pattern — the SDK TextArea can't scroll).
+component EditorField inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder;
+    out property <bool> has-focus: input.has-focus;
+    callback changed();
+    forward-focus: input;
+
+    property <length> pad: 14px;
+
+    background: Theme.palette-surface;
+    border-radius: 16px;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.palette-primary : Theme.palette-border;
+    clip: true;
+
+    fly := Flickable {
+        x: root.pad;
+        y: root.pad;
+        width: parent.width - 2 * root.pad;
+        height: parent.height - 2 * root.pad;
+        viewport-width: self.width;
+        viewport-height: max(self.height, input.preferred-height);
+
+        input := TextInput {
+            width: parent.width;
+            text <=> root.text;
+            color: Theme.palette-foreground;
+            font-family: "SourceCodePro";
+            font-size: 18px;
+            single-line: false;
+            wrap: word-wrap;
+            vertical-alignment: top;
+            page-height: fly.height;
+            edited => { root.changed(); }
+            cursor-position-changed(cpos) => {
+                if (cpos.y + fly.viewport-y < 12px) {
+                    fly.viewport-y = min(0px, max(fly.height - self.height, -cpos.y + 12px));
+                } else if (cpos.y + fly.viewport-y > fly.height - 36px) {
+                    fly.viewport-y = min(0px, max(fly.height - self.height, fly.height - cpos.y - 36px));
+                }
+            }
+        }
+    }
+
+    Text {
+        x: root.pad;
+        y: root.pad;
+        width: parent.width - 2 * root.pad;
+        text: root.text == "" && input.preedit-text == "" ? root.placeholder : "";
+        color: Theme.palette-muted;
+        font-family: "SourceCodePro";
+        font-size: 18px;
+        wrap: word-wrap;
+    }
+}
+
+component NoteEntry inherits Rectangle {
+    in property <NoteRow> entry;
+    callback tapped();
+    height: 76px;
+    border-radius: 12px;
+    background: touch.has-hover ? Theme.palette-surface : transparent;
+    border-width: 1px;
+    border-color: Theme.palette-border;
+    touch := TouchArea { clicked => { root.tapped(); } }
+    VerticalLayout {
+        padding: 10px;
+        spacing: 4px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.entry.preview;
+                color: Theme.palette-foreground;
+                font-family: "Montserrat";
+                font-size: 18px;
+                font-weight: 600;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: root.entry.badge;
+                color: root.entry.badge == "PRIVATE" ? Theme.palette-primary : Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: root.entry.meta;
+            color: Theme.palette-muted;
+            font-family: "SourceCodePro";
+            font-size: 14px;
+            overflow: elide;
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Chain Notes";
+    preferred-width: 480px;
+    preferred-height: 800px;
+    background: Theme.palette-background;
+
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: Theme.palette-background;
+
+        // ------------------------------------------------ screen 0: home
+        if Ui.screen == 0: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 24px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 14px;
+
+            Text {
+                text: "Chain Notes";
+                color: Theme.palette-foreground;
+                font-family: "Montserrat";
+                font-size: 26px;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+
+            if Home.address == "": Text {
+                text: Ui.error == "" ? "Deriving identity…" : Ui.error;
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 17px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+            }
+
+            if Home.address != "": VerticalLayout {
+                spacing: 10px;
+                Image {
+                    source: Home.qr;
+                    width: 190px;
+                    height: 190px;
+                    image-rendering: pixelated;
+                    x: (parent.width - self.width) / 2;
+                }
+                Text {
+                    text: Home.address;
+                    color: Theme.palette-muted;
+                    font-family: "SourceCodePro";
+                    font-size: 13px;
+                    wrap: char-wrap;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: Home.balance-line;
+                    color: Theme.palette-foreground;
+                    font-family: "Montserrat";
+                    font-size: 20px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: Home.sync-line + " · " + Home.network;
+                    color: Theme.palette-muted;
+                    font-family: "SourceCodePro";
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+
+            PrimaryAction {
+                width: 100%;
+                text: "Compose note";
+                disabled: Home.address == "";
+                clicked => {
+                    Callbacks.compose-changed();
+                    Ui.screen = 3;
+                }
+            }
+            SecondaryAction {
+                width: 100%;
+                text: "Notes";
+                clicked => {
+                    Callbacks.refresh-notes();
+                    Ui.screen = 1;
+                }
+            }
+            SecondaryAction {
+                width: 100%;
+                text: "Sync";
+                clicked => { Ui.screen = 5; }
+            }
+            SecondaryAction {
+                width: 100%;
+                text: "Settings";
+                clicked => { Ui.screen = 6; }
+            }
+        }
+
+        // ------------------------------------------- screen 1: notes list
+        if Ui.screen == 1: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 12px;
+
+            ScreenHeader {
+                title: "Notes";
+                back => { Callbacks.refresh-home(); Ui.screen = 0; }
+            }
+
+            if Notes.rows.length == 0: Text {
+                text: "No notes yet.\nCompose one, or import a sync bundle.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 17px;
+                horizontal-alignment: center;
+            }
+
+            Flickable {
+                vertical-stretch: 1;
+                viewport-height: Notes.rows.length * 84px;
+                VerticalLayout {
+                    spacing: 8px;
+                    for entry in Notes.rows: NoteEntry {
+                        entry: entry;
+                        tapped => { Callbacks.open-note(entry.id); }
+                    }
+                }
+            }
+        }
+
+        // -------------------------------------------- screen 2: note view
+        if Ui.screen == 2: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 12px;
+
+            ScreenHeader {
+                title: "Note";
+                back => { Callbacks.refresh-notes(); Ui.screen = 1; }
+            }
+
+            HorizontalLayout {
+                Text {
+                    text: View.badge;
+                    color: View.badge == "PRIVATE" ? Theme.palette-primary : Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 14px;
+                    font-weight: 700;
+                }
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+                background: Theme.palette-surface;
+                border-radius: 16px;
+                clip: true;
+                Flickable {
+                    x: 14px; y: 14px;
+                    width: parent.width - 28px;
+                    height: parent.height - 28px;
+                    viewport-width: self.width;
+                    viewport-height: max(self.height, body.preferred-height);
+                    body := Text {
+                        width: parent.width;
+                        text: View.text;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 18px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            Text {
+                text: View.meta;
+                color: Theme.palette-muted;
+                font-family: "SourceCodePro";
+                font-size: 13px;
+                wrap: char-wrap;
+            }
+        }
+
+        // ---------------------------------------------- screen 3: compose
+        // Everything interactive stays in the top ~400px so the on-screen
+        // keyboard never covers a control (sibling-app gotcha).
+        if Ui.screen == 3: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 8px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 10px;
+
+            ScreenHeader {
+                vertical-stretch: 0;
+                title: "Compose";
+                back => { Callbacks.refresh-home(); Ui.screen = 0; }
+            }
+
+            HorizontalLayout {
+                vertical-stretch: 0;
+                spacing: 8px;
+                PillOption {
+                    label: "Private";
+                    selected: Compose.private-note;
+                    horizontal-stretch: 1;
+                    tapped => { Compose.private-note = true; Callbacks.compose-changed(); }
+                }
+                PillOption {
+                    label: "Public";
+                    selected: !Compose.private-note;
+                    horizontal-stretch: 1;
+                    tapped => { Compose.private-note = false; Callbacks.compose-changed(); }
+                }
+            }
+
+            HorizontalLayout {
+                vertical-stretch: 0;
+                spacing: 6px;
+                PillOption {
+                    label: "Economy";
+                    selected: Compose.tier == 0;
+                    horizontal-stretch: 1;
+                    tapped => { Compose.tier = 0; Callbacks.compose-changed(); }
+                }
+                PillOption {
+                    label: "Normal";
+                    selected: Compose.tier == 1;
+                    horizontal-stretch: 1;
+                    tapped => { Compose.tier = 1; Callbacks.compose-changed(); }
+                }
+                PillOption {
+                    label: "Fast";
+                    selected: Compose.tier == 2;
+                    horizontal-stretch: 1;
+                    tapped => { Compose.tier = 2; Callbacks.compose-changed(); }
+                }
+                PillOption {
+                    label: "Custom";
+                    selected: Compose.tier == 3;
+                    horizontal-stretch: 1;
+                    tapped => { Compose.tier = 3; Callbacks.compose-changed(); }
+                }
+            }
+
+            // Fee-rate field: tracks the selected tier; typing here flips
+            // the tier to Custom and the entered sat/vB takes over.
+            HorizontalLayout {
+                vertical-stretch: 0;
+                spacing: 8px;
+                Rectangle {
+                    height: 44px;
+                    horizontal-stretch: 1;
+                    background: Theme.palette-surface;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: rate-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                    clip: true;
+                    rate-input := TextInput {
+                        x: 14px;
+                        width: parent.width - 28px;
+                        y: (parent.height - self.height) / 2;
+                        text <=> Compose.rate-text;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 18px;
+                        single-line: true;
+                        edited => {
+                            Compose.tier = 3;
+                            Callbacks.compose-changed();
+                        }
+                    }
+                }
+                Text {
+                    text: "sat/vB";
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 16px;
+                    vertical-alignment: center;
+                }
+            }
+
+            editor := EditorField {
+                vertical-stretch: 0;
+                height: 118px;
+                text <=> Compose.text;
+                placeholder: "Type your note…";
+                changed => { Callbacks.compose-changed(); }
+            }
+
+            // Live cost readout — updates every keystroke.
+            Text {
+                vertical-stretch: 0;
+                text: Compose.cost-line;
+                color: Theme.palette-muted;
+                font-family: "SourceCodePro";
+                font-size: 14px;
+                wrap: word-wrap;
+            }
+
+            PrimaryAction {
+                vertical-stretch: 0;
+                width: 100%;
+                text: "Continue";
+                disabled: !Compose.can-continue;
+                clicked => {
+                    editor.clear-focus();
+                    Callbacks.compose-continue();
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        // ----------------------------------------- screen 4: confirm-sign
+        if Ui.screen == 4: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 14px;
+
+            ScreenHeader {
+                title: "Confirm";
+                back => { Ui.screen = 3; }
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+                background: Theme.palette-surface;
+                border-radius: 16px;
+                Text {
+                    x: 16px; y: 16px;
+                    width: parent.width - 32px;
+                    text: Confirm.summary;
+                    color: Theme.palette-foreground;
+                    font-family: "SourceCodePro";
+                    font-size: 16px;
+                    wrap: word-wrap;
+                }
+            }
+
+            Text {
+                text: "Signing spends real sats and writes this note to the blockchain forever.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 14px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+            }
+
+            PrimaryAction {
+                width: 100%;
+                text: "Sign & export";
+                clicked => { Callbacks.confirm-sign(); }
+            }
+        }
+
+        // ------------------------------------------------- screen 5: sync
+        if Ui.screen == 5: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 14px;
+
+            ScreenHeader {
+                title: "Sync";
+                back => { Callbacks.refresh-home(); Ui.screen = 0; }
+            }
+
+            Text {
+                text: Sync.status;
+                color: Theme.palette-foreground;
+                font-family: "SourceCodePro";
+                font-size: 15px;
+                wrap: word-wrap;
+            }
+
+            PrimaryAction {
+                width: 100%;
+                text: "Import sync bundle";
+                clicked => { Callbacks.import-bundle(); }
+            }
+            SecondaryAction {
+                width: 100%;
+                text: "Export pending txs";
+                clicked => { Callbacks.export-pending(); }
+            }
+
+            Text {
+                text: Sync.result;
+                color: Ui.error == "" ? Theme.palette-muted : Theme.palette-danger;
+                font-family: "SourceCodePro";
+                font-size: 14px;
+                wrap: word-wrap;
+            }
+
+            Rectangle { vertical-stretch: 1; }
+
+            Text {
+                text: "Bundles: /chain-notes/inbox on Internal or Airlock.\nSigned txs land in /chain-notes/outbox.";
+                color: Theme.palette-muted;
+                font-family: "SourceCodePro";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+        }
+
+        // -------------------------------------------- screen 6: settings
+        if Ui.screen == 6: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 14px;
+
+            ScreenHeader {
+                title: "Settings";
+                back => { Callbacks.refresh-home(); Ui.screen = 0; }
+            }
+
+            SecondaryAction {
+                width: 100%;
+                text: "Network: " + Home.network;
+                clicked => { Callbacks.cycle-network(); }
+            }
+
+            Text {
+                text: Settings.chunk-error == "" ? "OP_RETURN chunk size" : Settings.chunk-error;
+                color: Settings.chunk-error == "" ? Theme.palette-muted : Theme.palette-danger;
+                font-family: "Montserrat";
+                font-size: 14px;
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                PillOption {
+                    label: "Auto";
+                    selected: Settings.chunk-mode == 0;
+                    horizontal-stretch: 1;
+                    tapped => { Settings.chunk-mode = 0; Callbacks.chunk-changed(); }
+                }
+                PillOption {
+                    label: "80 compat";
+                    selected: Settings.chunk-mode == 1;
+                    horizontal-stretch: 1;
+                    tapped => { Settings.chunk-mode = 1; Callbacks.chunk-changed(); }
+                }
+                PillOption {
+                    label: "Custom";
+                    selected: Settings.chunk-mode == 2;
+                    horizontal-stretch: 1;
+                    tapped => { Settings.chunk-mode = 2; Callbacks.chunk-changed(); }
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle {
+                    height: 44px;
+                    horizontal-stretch: 1;
+                    background: Theme.palette-surface;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: chunk-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                    clip: true;
+                    chunk-input := TextInput {
+                        x: 14px;
+                        width: parent.width - 28px;
+                        y: (parent.height - self.height) / 2;
+                        text <=> Settings.chunk-text;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 18px;
+                        single-line: true;
+                        edited => {
+                            Settings.chunk-mode = 2;
+                            Callbacks.chunk-changed();
+                        }
+                    }
+                }
+                Text {
+                    text: "bytes";
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 16px;
+                    vertical-alignment: center;
+                }
+            }
+
+            Text {
+                text: "Chunk size caps each OP_RETURN output. Auto follows the sync bundle's relay policy; 80 is the pre-v30 compatibility floor.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        // Busy overlay — nested inside the root container (never a direct
+        // Window child; sibling-app gotcha).
+        if Ui.busy: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #00000088;
+            TouchArea { }
+            Rectangle {
+                width: 220px;
+                height: 80px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: Theme.palette-surface;
+                border-radius: 16px;
+                Text {
+                    text: "Working…";
+                    color: Theme.palette-foreground;
+                    font-family: "Montserrat";
+                    font-size: 20px;
+                    font-weight: 600;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                }
+            }
+        }
+    }
+}

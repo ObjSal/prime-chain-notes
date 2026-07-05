@@ -1,0 +1,92 @@
+//! Scalar plumbing and the app-seed key derivations.
+//!
+//! CONSENSUS-CRITICAL FOR RE-DERIVATION: the HKDF salt/info strings below
+//! are baked into every note ever written — the wipe-recovery story
+//! (PLAN-chain-notes.md) depends on re-deriving the identical identity key
+//! and encryption key from `GetAppSeed` after a seed restore. NEVER change
+//! them (same rule as prime-paper-wallet's backup-key derivation).
+
+use elliptic_curve::point::AffineCoordinates;
+use elliptic_curve::PrimeField;
+use hkdf::Hkdf;
+use k256::elliptic_curve;
+use k256::{ProjectivePoint, Scalar};
+use sha2::{Digest, Sha256};
+
+use crate::Error;
+
+const KEY_SALT: &[u8] = b"prime-chain-notes/key/v1";
+const ENC_SALT: &[u8] = b"prime-chain-notes/enc/v1";
+
+/// Parse 32 bytes as a scalar, rejecting 0 and values >= the curve order.
+pub(crate) fn scalar_from_bytes(bytes: &[u8; 32]) -> Option<Scalar> {
+    let ct = Scalar::from_repr((*bytes).into());
+    if bool::from(ct.is_some()) {
+        let s = ct.unwrap();
+        if bool::from(s.is_zero()) {
+            None
+        } else {
+            Some(s)
+        }
+    } else {
+        None
+    }
+}
+
+/// X-only public key plus `odd_y` flag for a private key.
+pub fn xonly_pubkey(privkey: &[u8; 32]) -> Result<([u8; 32], bool), Error> {
+    let k = scalar_from_bytes(privkey).ok_or(Error::InvalidPrivateKey)?;
+    let point = (ProjectivePoint::GENERATOR * k).to_affine();
+    let x: [u8; 32] = point.x().into();
+    Ok((x, bool::from(point.y_is_odd())))
+}
+
+pub(crate) fn double_sha256(data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(Sha256::digest(data)));
+    out
+}
+
+/// Derive the notes identity private key from the app seed. Expands
+/// HKDF-SHA256(KEY_SALT, app_seed, "identity/" || attempt_le32) and bumps
+/// `attempt` until the 32 bytes are a valid scalar (first try in all but
+/// ~1 in 2^128 cases). FROZEN — see module docs.
+pub fn derive_identity_key(app_seed: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(KEY_SALT), app_seed);
+    let mut attempt: u32 = 0;
+    loop {
+        let mut info = Vec::with_capacity(9 + 4);
+        info.extend_from_slice(b"identity/");
+        info.extend_from_slice(&attempt.to_le_bytes());
+        let mut okm = [0u8; 32];
+        hk.expand(&info, &mut okm).expect("32 bytes is a valid HKDF length");
+        if scalar_from_bytes(&okm).is_some() {
+            return okm;
+        }
+        attempt += 1;
+    }
+}
+
+/// Derive the note-content encryption key (XChaCha20-Poly1305, 32 bytes).
+/// No scalar constraint — any 32 bytes are a valid AEAD key. FROZEN.
+pub fn derive_encryption_key(app_seed: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(ENC_SALT), app_seed);
+    let mut okm = [0u8; 32];
+    hk.expand(b"note-enc/v1", &mut okm)
+        .expect("32 bytes is a valid HKDF length");
+    okm
+}
+
+/// Fresh 4-byte note id from the TRNG/OS entropy.
+pub fn generate_note_id() -> Result<[u8; 4], Error> {
+    let mut id = [0u8; 4];
+    getrandom::getrandom(&mut id).map_err(|_| Error::Entropy)?;
+    Ok(id)
+}
+
+/// Fresh 32 bytes of aux randomness for BIP340 signing.
+pub fn generate_aux_rand() -> Result<[u8; 32], Error> {
+    let mut aux = [0u8; 32];
+    getrandom::getrandom(&mut aux).map_err(|_| Error::Entropy)?;
+    Ok(aux)
+}

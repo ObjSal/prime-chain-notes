@@ -1,0 +1,53 @@
+# Workspace root: the KeyOS app binary plus the host-testable notes-core
+# library (wallet-core/pgp-core/bip85-core pattern — see ../CLAUDE.md).
+[package]
+name = "prime-chain-notes"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace]
+members = [".", "notes-core"]
+
+# KeyOS's own getrandom override (vendored in vendor/getrandom): on
+# --cfg keyos (hardware) builds it sources entropy from the os TRNG server;
+# on host/simulator builds it behaves like stock getrandom 0.2. Note ids,
+# AEAD nonces and BIP340 aux randomness all come through this path.
+[patch.crates-io]
+getrandom = { path = "vendor/getrandom" }
+
+# Debug builds (what `foundation sim` produces) would make EC math and
+# hashing sluggish; optimize just those crates.
+[profile.dev.package.k256]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.chacha20]
+opt-level = 3
+[profile.dev.package.poly1305]
+opt-level = 3
+
+[dependencies]
+notes-core = { path = "notes-core" }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# KeyOS security API (vendored — see vendor/security-api/Cargo.toml header):
+# provides GetAppSeed for the notes identity + encryption keys.
+security = { path = "vendor/security-api" }
+log = "0.4"
+log-server = { package = "xous-api-log", path = "/Users/sal/.foundation/sdk/current/lib/keyos/xous/api/log" }
+server = { path = "/Users/sal/.foundation/sdk/current/lib/keyos/server" }
+slint-keyos-platform = { path = "/Users/sal/.foundation/sdk/current/lib/keyos/slint-keyos-platform/runtime" }
+foundation-themes = { path = "/Users/sal/.foundation/sdk/current/lib/keyos/sdk/crates/foundation-themes" }
+
+[build-dependencies]
+foundation-themes = { path = "/Users/sal/.foundation/sdk/current/lib/keyos/sdk/crates/foundation-themes" }
+slint-keyos-platform-build = { path = "/Users/sal/.foundation/sdk/current/lib/keyos/slint-keyos-platform/build" }

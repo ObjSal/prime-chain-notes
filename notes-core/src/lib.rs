@@ -1,0 +1,90 @@
+//! notes-core — UI-free library for prime-chain-notes.
+//!
+//! Everything needed to turn "text typed on the device" into a signed
+//! bitcoin transaction carrying that text in OP_RETURN outputs, and to turn
+//! a companion-produced sync bundle back into readable notes: key
+//! derivation from the app seed, the PNTE envelope, XChaCha20-Poly1305
+//! sealing, BIP341 key-path transaction construction and BIP340 signing.
+//!
+//! Host-testable: `cargo test -p notes-core`. Pure Rust throughout.
+
+pub mod address;
+pub mod bundle;
+pub mod crypt;
+pub mod envelope;
+pub mod keys;
+pub mod sighash;
+pub mod sign;
+pub mod taproot;
+pub mod tx;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Error {
+    Entropy,
+    InvalidPrivateKey,
+    InvalidPublicKey,
+    TweakOutOfRange,
+    PointAtInfinity,
+    DecryptFailed,
+    Envelope(&'static str),
+    InsufficientFunds,
+    PayloadTooLarge,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::Entropy => write!(f, "entropy source failure"),
+            Error::InvalidPrivateKey => write!(f, "invalid private key"),
+            Error::InvalidPublicKey => write!(f, "invalid public key"),
+            Error::TweakOutOfRange => write!(f, "taproot tweak out of range"),
+            Error::PointAtInfinity => write!(f, "point at infinity"),
+            Error::DecryptFailed => write!(f, "decryption failed"),
+            Error::Envelope(m) => write!(f, "envelope: {m}"),
+            Error::InsufficientFunds => write!(f, "insufficient funds"),
+            Error::PayloadTooLarge => write!(f, "payload too large"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Which chain we're on. Only affects address encoding (HRP); all crypto
+/// and transaction formats are identical across networks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Network {
+    Mainnet,
+    Signet,
+    Regtest,
+}
+
+impl Network {
+    pub fn hrp(self) -> bech32::Hrp {
+        match self {
+            Network::Mainnet => bech32::hrp::BC,
+            Network::Signet => bech32::hrp::TB,
+            Network::Regtest => bech32::hrp::BCRT,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Network::Mainnet => "mainnet",
+            Network::Signet => "signet",
+            Network::Regtest => "regtest",
+        }
+    }
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "mainnet" => Some(Network::Mainnet),
+            "signet" => Some(Network::Signet),
+            "regtest" => Some(Network::Regtest),
+            _ => None,
+        }
+    }
+}
+
+/// P2TR dust threshold (sats): below this a change output is not worth
+/// creating and the remainder folds into the fee.
+pub const DUST_LIMIT: u64 = 330;

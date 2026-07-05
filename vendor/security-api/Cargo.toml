@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2024 Foundation Devices, Inc. <hello@foundation.xyz>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Vendored from the KeyOS repo (api/security @ v1.2.1, commit 9056b48) — the
+# installed SDK does not ship this API crate. `workspace = true` deps replaced
+# with the SDK's copies (crypto/server/xous) and the versions pinned by the
+# KeyOS workspace root (log/num-derive/num-traits/rkyv).
+
+[package]
+name = "security"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Secure Hardware API crate"
+publish = false
+
+[dependencies]
+bip39 = "2.1"
+crypto = { path = "/Users/sal/.foundation/sdk/current/lib/keyos/api/crypto" }
+log = "0.4.14"
+num-derive = "0.4.2"
+num-traits = "0.2.18"
+rkyv = { version = "0.8.13", default-features = false, features = ["std", "bytecheck"] }
+server = { path = "/Users/sal/.foundation/sdk/current/lib/keyos/server" }
+thiserror = "1.0"
+xous = { path = "/Users/sal/.foundation/sdk/current/lib/keyos/xous/xous-rs" }
+zeroize = { version = "1.8.1", default-features = false, features = ["zeroize_derive"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(keyos)'] }
