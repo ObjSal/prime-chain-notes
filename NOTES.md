@@ -217,3 +217,10 @@ localhost pattern and improving on it:
 - Foundation security review before any mainnet use.
 - Fee-bump (RBF) UI; the tx already signals RBF (sequence 0xfffffffd) and
   note_id survives re-signing by design.
+
+LIVE OPTICAL SCAN VERIFIED (2026-07-05): a CNB1 bundle QR displayed on a
+phone and held to the Mac webcam was decoded by the sim's system scanner
+first try — log: `cb: scan-bundle kind=qr bytes=221` → `cb: import-bundle
+src=scan-qr … utxos=3 tip=424242 ok`. Screenshot
+`screenshots/live-scan-success.png`. The optical leg needs no further
+caveats: the whole loop is proven end to end.
