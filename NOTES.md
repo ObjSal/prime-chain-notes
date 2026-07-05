@@ -218,6 +218,27 @@ localhost pattern and improving on it:
   scanAddress, note-card builder) out of viewer.html into `chain-scan.js`
   so the FROZEN-format parser exists in exactly one JS place. e2e covers
   permalink click (public) + direct URL (private placeholder).
+- Contacts picker (2026-07-05, user request): home's "Compose note" now
+  opens screen 7 ("Send to") — a wide manual-address input + narrow (72px)
+  Use button, prominent To: Self row, Scan address QR, and auto-saved
+  recents (upsert on pick AND on directed sign). Naming is a **modal
+  dialog** (tapping a row's "name" zone) — an early version reused the
+  address field for names, which the user found confusing. Recency = Vec
+  order move-to-front (no clock on-device), cap 20, state.json-only (not
+  chain-recoverable). The recents list is a Flickable (`rows*72px`
+  viewport) — scrolls once it overflows, like the notes list. Compose
+  lost its To field (gained a `to-label` line + its 118px editor back);
+  compose Back returns to the picker so the recipient can change without
+  losing the draft. Scan normalizes `bitcoin:` URIs and retries uppercase
+  payloads lowercased (our own home QR is uppercase). Every single-line
+  input got `accepted => clear-focus()` so the keyboard's "Done" key
+  dismisses it. First layout attempt let Button-based children absorb
+  vertical stretch (giant Scan button, drifting input) — pin explicit
+  heights on every non-Flickable child of a screen VerticalLayout. Added
+  a `drag` subcommand to ui-automation `simtap` (+ `sim_drag_px`) to
+  flick-scroll Flickables in tests. UI e2e gained a contacts segment
+  (scan-cancel, manual pick of a fresh bech32m address, dialog-rename to
+  "Alice", self pick as the stale-recipient check); passed repeatedly.
 - Directed notes (2026-07-05, user request; plan-reviewed): send public +
   private notes TO another taproot address. Protocol frozen: FLAG_DIRECTED
   0x02, dust output 330 sats to the recipient (OP_RETURNs → dust → change,

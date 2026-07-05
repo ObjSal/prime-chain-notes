@@ -73,11 +73,14 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
 
 ## State & sync contract
 
-- Compose "To" field (below the Private/Public pills): empty = classic
-  self-note; a valid address = **directed note** (dust output + `to=` in
-  the log; private requires a taproot recipient, sealed via dm.rs ECDH).
-  The field clears after signing so a stale recipient can't leak into the
-  next note. Cost line appends "+ 330 sats to recipient".
+- Compose recipient: set ONLY by the contacts picker (`to-address` empty
+  = self-note; a valid address = **directed note**: dust output + `to=`
+  in the log; private requires a taproot recipient, sealed via dm.rs
+  ECDH). A small `to-label` line under the header shows the target; the
+  recipient clears after signing so it can't leak into the next note.
+  Cost line appends "+ 330 sats to recipient". compose-changed's
+  Recipient::parse stays as a safety net (network switched mid-draft →
+  Continue blocked).
 - Compose fee tiers: 0 economy / 1 normal / 2 fast / **3 custom**. The
   rate field (`Compose.rate-text`) mirrors the selected tier's sat/vB;
   a manual edit flips the tier to 3 and `resolve_rate` parses the field
@@ -85,7 +88,18 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
   tier == 3.
 - Screens: 0 home · 1 notes · 2 note view · 3 compose · 4 confirm ·
   5 sync (ACTIONS only: import/export/scan + status) · 6 settings
-  (network + chunk picker) — actions and preferences deliberately split.
+  (network + chunk picker) · 7 contacts (send-to picker) — actions and
+  preferences deliberately split.
+- Contacts (screen 7): home's "Compose note" opens the picker first —
+  manual address input (Use), the prominent "To: Self" row, "Scan address
+  QR" (system scanner; payload normalized: `bitcoin:` prefix + `?query`
+  stripped, uppercase retried lowercased — our own home QR is uppercase),
+  then recents. Recency = list order, front = latest use (NO clock
+  on-device), cap 20; naming via each row's "name" zone (mode-switches
+  the input; does not bump recency). Contacts live in state.json only —
+  NOT chain-recoverable after a wipe. Picking sets `Compose.to-address`
+  + `to-label`; compose has no address editing (its Back returns to the
+  picker, preserving the draft text).
 - Networks: mainnet → testnet4 → signet → regtest (Settings cycle);
   testnet4/signet share the tb HRP. User-facing copy says "chain height",
   never "tip" (user decision — reads like a gratuity).
@@ -128,7 +142,11 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
 `cb: set-network <net>` ·
 `cb: set-chunk-size <n|auto> ok | err=<msg>` ·
 `cb: scan-bundle kind=<qr|ur> bytes=<n>` then `cb: import-bundle
-src=scan-<kind> … ok` · `cb: scan-bundle cancelled | err=<e>`
+src=scan-<kind> … ok` · `cb: scan-bundle cancelled | err=<e>` ·
+`cb: refresh-contacts n=<n>` ·
+`cb: pick-contact to=<addr|self> | err=<e>` ·
+`cb: scan-contact ok addr=<a> | cancelled | err=<e>` ·
+`cb: save-contact addr=<a> name-len=<n>`
 
 ## Build / test
 
