@@ -211,6 +211,13 @@ localhost pattern and improving on it:
   silently dropped, and private notes show an "Encrypted" placeholder —
   **no browser-side decryption ever** (the key never leaves the device).
   Covered by `test_companion_regtest.py` (button popup + standalone load).
+- `note.html` + `chain-scan.js` (2026-07-05): each viewer card gained a
+  **permalink** to a single-note page (`?address=&network=&note=<hex8>`)
+  for sharing one note; the second consumer of the PNTE port forced the
+  shared code (API map, esplora pagination, envelope decode/reassemble,
+  scanAddress, note-card builder) out of viewer.html into `chain-scan.js`
+  so the FROZEN-format parser exists in exactly one JS place. e2e covers
+  permalink click (public) + direct URL (private placeholder).
 
 ## Not yet done / next
 

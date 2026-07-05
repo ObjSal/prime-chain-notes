@@ -129,7 +129,10 @@ on-chain notes directly in the browser (deep-linkable via
 notes" button opens it prefilled): it ports the PNTE envelope
 decode/reassemble to JS, enforces the same spends-from-self rule, shows
 public notes as text and private ones as an encrypted placeholder —
-decryption stays on the device by design.
+decryption stays on the device by design. Every note card carries a
+**permalink** to `note.html?address=…&network=…&note=<id>`, a single-note
+page for sharing a link to just one note. The scanning/envelope/render
+core shared by both pages lives in `chain-scan.js`.
 
 **Relay policy, verified live (2026-07-05):** mempool.space/testnet4
 accepted a 224-byte single OP_RETURN
