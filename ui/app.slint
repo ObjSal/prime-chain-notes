@@ -390,12 +390,18 @@ export component AppWindow inherits Window {
                 if View.show-qr: VerticalLayout {
                     padding: 14px;
                     spacing: 8px;
-                    Image {
-                        source: View.qr;
-                        width: min(parent.width - 28px, 360px);
-                        height: self.width;
-                        image-rendering: pixelated;
-                        x: (parent.width - 28px - self.width) / 2;
+                    // Plain Rectangle parent: layouts ignore a child's x/y,
+                    // so centering math must live one level down.
+                    Rectangle {
+                        vertical-stretch: 1;
+                        Image {
+                            source: View.qr;
+                            width: min(parent.width, parent.height, 360px);
+                            height: self.width;
+                            image-rendering: pixelated;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                        }
                     }
                     Text {
                         text: "Scan with the companion's “Scan from device” to broadcast.";
@@ -497,6 +503,7 @@ export component AppWindow inherits Window {
                     rate-input := TextInput {
                         x: 14px;
                         width: parent.width - 28px;
+                        height: 24px;
                         y: (parent.height - self.height) / 2;
                         text <=> Compose.rate-text;
                         color: Theme.palette-foreground;
@@ -710,6 +717,7 @@ export component AppWindow inherits Window {
                     chunk-input := TextInput {
                         x: 14px;
                         width: parent.width - 28px;
+                        height: 24px;
                         y: (parent.height - self.height) / 2;
                         text <=> Settings.chunk-text;
                         color: Theme.palette-foreground;
