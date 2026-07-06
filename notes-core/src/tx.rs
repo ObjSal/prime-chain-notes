@@ -290,6 +290,26 @@ pub fn build_note_tx(
     recipient_spk: Option<&[u8]>,
     fee_rate: f64,
     tweaked_seckey: &[u8; 32],
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    build_note_tx_with_change(
+        available, output_x, payloads, recipient_spk, None, fee_rate, tweaked_seckey, aux,
+    )
+}
+
+/// Like `build_note_tx`, but when `change_out` is Some the change output
+/// pays that script instead of the notes address. Inputs are always the
+/// notes address, so sighashing (which uses the address's own spk for
+/// every prevout) is unchanged; only the change OUTPUT differs.
+#[allow(clippy::too_many_arguments)]
+pub fn build_note_tx_with_change(
+    available: &[Utxo],
+    output_x: &[u8; 32],
+    payloads: &[Vec<u8>],
+    recipient_spk: Option<&[u8]>,
+    change_out: Option<&[u8]>,
+    fee_rate: f64,
+    tweaked_seckey: &[u8; 32],
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     if payloads.is_empty() {
@@ -300,7 +320,11 @@ pub fn build_note_tx(
     let mut candidates = available.to_vec();
     candidates.sort_by(|a, b| b.value.cmp(&a.value));
 
+    // `change_spk` is the notes address's own spk — used for BOTH the
+    // input prevout scripts (sighash) and, by default, the change output.
     let change_spk = p2tr_script_pubkey(output_x);
+    // Where the change value actually goes (self unless overridden).
+    let change_out_spk = change_out.map(<[u8]>::to_vec).unwrap_or_else(|| change_spk.clone());
     let mut selected: Vec<Utxo> = Vec::new();
     let mut in_value: u64 = 0;
 
@@ -338,7 +362,8 @@ pub fn build_note_tx(
                 outputs.push(TxOut { value: DUST_LIMIT, script_pubkey: spk.to_vec() });
             }
             if change {
-                outputs.push(TxOut { value: change_value, script_pubkey: change_spk.clone() });
+                outputs
+                    .push(TxOut { value: change_value, script_pubkey: change_out_spk.clone() });
             }
 
             let mut tx = Transaction {

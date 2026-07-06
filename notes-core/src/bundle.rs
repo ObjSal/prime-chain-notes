@@ -9,7 +9,7 @@ use crate::dm;
 use crate::envelope::{self, Chunk, FLAG_DIRECTED, FLAG_PRIVATE};
 use crate::keys::{derive_encryption_key, derive_identity_key, xonly_pubkey};
 use crate::taproot::{taproot_tweak_pubkey, taproot_tweak_seckey};
-use crate::tx::{build_note_tx, NoteTx, Utxo};
+use crate::tx::{build_note_tx_with_change, NoteTx, Utxo};
 use crate::{Error, Network};
 
 /// Everything derived from the app seed that the app needs at runtime.
@@ -332,6 +332,7 @@ pub fn extract_notes(
 
 /// Shared tail of both compose paths: body → enveloped payloads → signed tx.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn compose_inner(
     identity: &Identity,
     utxos: &[Utxo],
@@ -339,16 +340,18 @@ fn compose_inner(
     flags: u8,
     body: &[u8],
     recipient_spk: Option<&[u8]>,
+    change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     let payloads = envelope::encode_chunks(note_id, flags, body, max_op_return_bytes)?;
-    build_note_tx(
+    build_note_tx_with_change(
         utxos,
         &identity.output_x,
         &payloads,
         recipient_spk,
+        change_spk,
         fee_rate,
         &identity.tweaked_seckey,
         aux,
@@ -367,13 +370,34 @@ pub fn compose_note(
     fee_rate: f64,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
+    compose_note_with_change(
+        identity, utxos, text, private, note_id, None, max_op_return_bytes, fee_rate, aux,
+    )
+}
+
+/// Like `compose_note`, but change goes to `change_spk` when Some.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_note_with_change(
+    identity: &Identity,
+    utxos: &[Utxo],
+    text: &str,
+    private: bool,
+    note_id: [u8; 4],
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
     let body = if private {
         crypt::seal(&identity.enc_key, &note_id, text.as_bytes())?
     } else {
         text.as_bytes().to_vec()
     };
     let flags = if private { FLAG_PRIVATE } else { 0 };
-    compose_inner(identity, utxos, note_id, flags, &body, None, max_op_return_bytes, fee_rate, aux)
+    compose_inner(
+        identity, utxos, note_id, flags, &body, None, change_spk, max_op_return_bytes, fee_rate,
+        aux,
+    )
 }
 
 /// Directed compose: like `compose_note` but the note is addressed TO
@@ -390,6 +414,26 @@ pub fn compose_directed_note(
     private: bool,
     note_id: [u8; 4],
     recipient: &Recipient,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    compose_directed_note_with_change(
+        identity, utxos, text, private, note_id, recipient, None, max_op_return_bytes, fee_rate,
+        aux,
+    )
+}
+
+/// Like `compose_directed_note`, but change goes to `change_spk` when Some.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_directed_note_with_change(
+    identity: &Identity,
+    utxos: &[Utxo],
+    text: &str,
+    private: bool,
+    note_id: [u8; 4],
+    recipient: &Recipient,
+    change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
@@ -414,6 +458,7 @@ pub fn compose_directed_note(
         flags,
         &body,
         Some(&recipient.spk),
+        change_spk,
         max_op_return_bytes,
         fee_rate,
         aux,
