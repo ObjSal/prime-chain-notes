@@ -397,3 +397,86 @@ pub fn build_note_tx_with_change(
     }
     Err(Error::InsufficientFunds)
 }
+
+/// Build a note tx spending EXACTLY the given inputs (coin control) —
+/// no automatic selection. Change (self or `change_out`) is the leftover
+/// after the note payloads, optional dust recipient, and fee. Fails if
+/// the inputs don't cover fee + dust.
+#[allow(clippy::too_many_arguments)]
+pub fn build_note_tx_exact(
+    inputs: &[Utxo],
+    output_x: &[u8; 32],
+    payloads: &[Vec<u8>],
+    recipient_spk: Option<&[u8]>,
+    change_out: Option<&[u8]>,
+    fee_rate: f64,
+    tweaked_seckey: &[u8; 32],
+    mut aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    if payloads.is_empty() {
+        return Err(Error::Envelope("no payloads"));
+    }
+    if inputs.is_empty() {
+        return Err(Error::InsufficientFunds);
+    }
+    let payload_lens: Vec<usize> = payloads.iter().map(Vec::len).collect();
+    let sent: u64 = if recipient_spk.is_some() { DUST_LIMIT } else { 0 };
+    let change_spk = p2tr_script_pubkey(output_x);
+    let change_out_spk = change_out.map(<[u8]>::to_vec).unwrap_or_else(|| change_spk.clone());
+    let in_value: u64 = inputs.iter().map(|u| u.value).sum();
+
+    // Prefer a change output; fall back to folding a sub-dust remainder
+    // into the fee.
+    for change in [true, false] {
+        let vsize =
+            estimate_vsize(inputs.len(), &payload_lens, recipient_spk.map(<[u8]>::len), change);
+        let fee = (vsize as f64 * fee_rate).ceil() as u64;
+        if in_value < fee + sent {
+            continue;
+        }
+        let change_value = in_value - fee - sent;
+        if change && change_value < DUST_LIMIT {
+            continue;
+        }
+        if !change && change_value > DUST_LIMIT {
+            continue;
+        }
+
+        let mut outputs: Vec<TxOut> = payloads
+            .iter()
+            .map(|p| TxOut { value: 0, script_pubkey: op_return_script(p) })
+            .collect();
+        if let Some(spk) = recipient_spk {
+            outputs.push(TxOut { value: DUST_LIMIT, script_pubkey: spk.to_vec() });
+        }
+        if change {
+            outputs.push(TxOut { value: change_value, script_pubkey: change_out_spk.clone() });
+        }
+
+        let mut tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            inputs: inputs.to_vec(),
+            outputs,
+            witnesses: Vec::new(),
+        };
+        let prevout_spks: Vec<Vec<u8>> = tx.inputs.iter().map(|_| change_spk.clone()).collect();
+        for index in 0..tx.inputs.len() {
+            let sighash = taproot_key_spend_sighash(&tx, &prevout_spks, index);
+            let sig = schnorr_sign(tweaked_seckey, &sighash, &aux()?)?;
+            tx.witnesses.push(vec![sig.to_vec()]);
+        }
+        let actual_fee = in_value - sent - if change { change_value } else { 0 };
+        return Ok(NoteTx {
+            fee: actual_fee,
+            change: if change { change_value } else { 0 },
+            sent,
+            vsize: tx.vsize(),
+            txid_hex: tx.txid_hex(),
+            raw_hex: hex::encode(tx.serialize_segwit()),
+            spent_outpoints: tx.inputs.iter().map(|i| (i.txid, i.vout)).collect(),
+            tx,
+        });
+    }
+    Err(Error::InsufficientFunds)
+}

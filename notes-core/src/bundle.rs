@@ -9,7 +9,7 @@ use crate::dm;
 use crate::envelope::{self, Chunk, FLAG_DIRECTED, FLAG_PRIVATE};
 use crate::keys::{derive_encryption_key, derive_identity_key, xonly_pubkey};
 use crate::taproot::{taproot_tweak_pubkey, taproot_tweak_seckey};
-use crate::tx::{build_note_tx_with_change, NoteTx, Utxo};
+use crate::tx::{build_note_tx_exact, build_note_tx_with_change, NoteTx, Utxo};
 use crate::{Error, Network};
 
 /// Everything derived from the app seed that the app needs at runtime.
@@ -461,6 +461,79 @@ pub fn compose_directed_note_with_change(
         change_spk,
         max_op_return_bytes,
         fee_rate,
+        aux,
+    )
+}
+
+/// Coin-control compose: spend EXACTLY `inputs` (no auto-selection).
+/// Change (self unless `change_spk`) is the leftover.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_note_exact(
+    identity: &Identity,
+    inputs: &[Utxo],
+    text: &str,
+    private: bool,
+    note_id: [u8; 4],
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let body = if private {
+        crypt::seal(&identity.enc_key, &note_id, text.as_bytes())?
+    } else {
+        text.as_bytes().to_vec()
+    };
+    let flags = if private { FLAG_PRIVATE } else { 0 };
+    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    build_note_tx_exact(
+        inputs,
+        &identity.output_x,
+        &payloads,
+        None,
+        change_spk,
+        fee_rate,
+        &identity.tweaked_seckey,
+        aux,
+    )
+}
+
+/// Coin-control directed compose: spend EXACTLY `inputs`.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_directed_note_exact(
+    identity: &Identity,
+    inputs: &[Utxo],
+    text: &str,
+    private: bool,
+    note_id: [u8; 4],
+    recipient: &Recipient,
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let body = if private {
+        let recipient_x = recipient.p2tr_x.ok_or(Error::RecipientNotTaproot)?;
+        dm::seal_directed(
+            &identity.tweaked_seckey,
+            &identity.output_x,
+            &recipient_x,
+            &note_id,
+            text.as_bytes(),
+        )?
+    } else {
+        text.as_bytes().to_vec()
+    };
+    let flags = FLAG_DIRECTED | if private { FLAG_PRIVATE } else { 0 };
+    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    build_note_tx_exact(
+        inputs,
+        &identity.output_x,
+        &payloads,
+        Some(&recipient.spk),
+        change_spk,
+        fee_rate,
+        &identity.tweaked_seckey,
         aux,
     )
 }
