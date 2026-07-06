@@ -4,7 +4,8 @@
 
 use notes_core::address::Recipient;
 use notes_core::bundle::{
-    compose_directed_note, compose_note, compose_note_with_change, estimate_note_cost,
+    compose_directed_note, compose_note, compose_note_exact, compose_note_with_change,
+    estimate_note_cost,
     extract_notes, Identity, OnchainTx, SyncBundle,
 };
 use notes_core::crypt::{self, SEAL_OVERHEAD};
@@ -731,4 +732,28 @@ fn change_can_go_to_a_custom_address() {
     assert_eq!(custom_change.script_pubkey, b_spk);
     // And it's a valid, different tx.
     assert_ne!(default_tx.txid_hex, custom_tx.txid_hex);
+}
+
+#[test]
+fn exact_inputs_spends_all_given_coins() {
+    let a = identity();
+    // Two coins; auto-select would use only the first (largest).
+    let coins = vec![
+        Utxo { txid: [1u8; 32], vout: 0, value: 60_000 },
+        Utxo { txid: [2u8; 32], vout: 0, value: 40_000 },
+    ];
+    let auto = compose_note(&a, &coins, "hi", false, [1, 2, 3, 4], 80, 1.0, || Ok([0u8; 32])).unwrap();
+    // Auto used 1 input (60k covers it); exact-with-both spends both.
+    assert_eq!(auto.spent_outpoints.len(), 1);
+    let exact = compose_note_exact(&a, &coins, "hi", false, [1, 2, 3, 4], None, 80, 1.0, || Ok([0u8; 32])).unwrap();
+    assert_eq!(exact.spent_outpoints.len(), 2, "exact spends every provided coin");
+    assert!(exact.change > auto.change, "spending both leaves more change");
+
+    // Exact with just the first coin == auto (both use that one coin).
+    let one = compose_note_exact(&a, &coins[..1], "hi", false, [1, 2, 3, 4], None, 80, 1.0, || Ok([0u8; 32])).unwrap();
+    assert_eq!(one.txid_hex, auto.txid_hex);
+
+    // Not enough value → InsufficientFunds.
+    let tiny = vec![Utxo { txid: [3u8; 32], vout: 0, value: 10 }];
+    assert!(compose_note_exact(&a, &tiny, "hi", false, [1, 2, 3, 4], None, 80, 1.0, || Ok([0u8; 32])).is_err());
 }
