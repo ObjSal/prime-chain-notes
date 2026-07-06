@@ -4,8 +4,8 @@
 
 use notes_core::address::Recipient;
 use notes_core::bundle::{
-    compose_directed_note, compose_note, estimate_note_cost, extract_notes, Identity, OnchainTx,
-    SyncBundle,
+    compose_directed_note, compose_note, compose_note_with_change, estimate_note_cost,
+    extract_notes, Identity, OnchainTx, SyncBundle,
 };
 use notes_core::crypt::{self, SEAL_OVERHEAD};
 use notes_core::envelope;
@@ -701,4 +701,34 @@ fn directed_rust_bitcoin_cross_check() {
         )
         .expect("directed tx signature must verify");
     }
+}
+
+#[test]
+fn change_can_go_to_a_custom_address() {
+    let a = identity();
+    let b = identity_b();
+    // Custom change destination = identity B's own taproot spk.
+    let b_spk = notes_core::address::address_to_script_pubkey(
+        Network::Regtest,
+        &b.address(Network::Regtest),
+    )
+    .unwrap();
+
+    let default_tx =
+        compose_note(&a, &utxos(), "hi", false, [1, 2, 3, 4], 80, 1.0, || Ok([0u8; 32])).unwrap();
+    let custom_tx = compose_note_with_change(
+        &a, &utxos(), "hi", false, [1, 2, 3, 4], Some(&b_spk), 80, 1.0, || Ok([0u8; 32]),
+    )
+    .unwrap();
+
+    // Same inputs, same note; only the change output's script differs.
+    assert_eq!(default_tx.spent_outpoints, custom_tx.spent_outpoints);
+    assert_eq!(default_tx.change, custom_tx.change);
+    let default_change = default_tx.tx.outputs.last().unwrap();
+    let custom_change = custom_tx.tx.outputs.last().unwrap();
+    assert_eq!(default_change.value, custom_change.value);
+    assert_ne!(default_change.script_pubkey, custom_change.script_pubkey);
+    assert_eq!(custom_change.script_pubkey, b_spk);
+    // And it's a valid, different tx.
+    assert_ne!(default_tx.txid_hex, custom_tx.txid_hex);
 }
