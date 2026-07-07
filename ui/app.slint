@@ -1050,6 +1050,55 @@ export component AppWindow inherits Window {
             }
         }
 
+        // Note-too-large dialog — nested in root (sibling-app overlay gotcha).
+        if Compose.show-oversize: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #00000088;
+            TouchArea { }   // swallow taps outside the panel
+            Rectangle {
+                x: 24px;
+                y: 90px + UISize.control-center-status-bar-height;
+                width: parent.width - 48px;
+                height: oversize-panel.preferred-height;
+                background: Theme.palette-surface;
+                border-radius: 16px;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                oversize-panel := VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    Text {
+                        text: "Note too large";
+                        color: Theme.palette-foreground;
+                        font-family: "Montserrat";
+                        font-size: 16px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: Compose.oversize-message;
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        SecondaryAction {
+                            horizontal-stretch: 1;
+                            text: Compose.oversize-offer-bump ? "Cancel" : "OK";
+                            clicked => { Compose.show-oversize = false; }
+                        }
+                        if Compose.oversize-offer-bump: PrimaryAction {
+                            horizontal-stretch: 1;
+                            text: "Switch to Standard";
+                            clicked => { Callbacks.oversize-bump(); }
+                        }
+                    }
+                }
+            }
+        }
+
         // Busy overlay — nested inside the root container (never a direct
         // Window child; sibling-app gotcha).
         if Ui.busy: Rectangle {

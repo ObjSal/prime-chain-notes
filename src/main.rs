@@ -34,6 +34,46 @@ const MIN_CHUNK: usize = 20;
 /// no relay policy; if an endpoint rejects, pick "80 compat" in Settings
 /// and recompose.
 const DEFAULT_CHUNK: usize = 100_000;
+/// Bitcoin standardness ceiling on a single transaction: `MAX_STANDARD_TX_WEIGHT`
+/// (400_000 WU) / 4 = 100_000 vB. Nodes won't relay a bigger tx, so this — NOT
+/// the per-output chunk size — is the hard wall on one note (a note is one tx of
+/// ≤255 OP_RETURN chunks). At a small chunk size the 255-chunk cap binds first,
+/// so raising the size to DEFAULT_CHUNK can rescue a note that overflows.
+const MAX_STANDARD_TX_VSIZE: usize = 100_000;
+
+/// Whether the composed note fits in one standard tx, and if not, whether
+/// raising the chunk size to Standard (DEFAULT_CHUNK) would rescue it.
+enum FitCheck {
+    Ok,
+    /// Over now, but fits at Standard — the user is on a smaller setting whose
+    /// 255-chunk cap binds first. Offer to switch.
+    FitsAtStandard,
+    /// Over even at Standard: the ~100 kB per-tx network wall. No setting helps.
+    HardWall,
+}
+
+fn note_fits(text_len: usize, private: bool, chunk: usize, recipient_spk_len: Option<usize>) -> bool {
+    estimate_note_cost(text_len, private, chunk, 1, recipient_spk_len)
+        .map(|(_, vsize)| vsize <= MAX_STANDARD_TX_VSIZE)
+        .unwrap_or(false) // Err = >255 chunks → over-limit
+}
+
+fn fit_check(
+    effective_chunk: usize,
+    text_len: usize,
+    private: bool,
+    recipient_spk_len: Option<usize>,
+) -> FitCheck {
+    if note_fits(text_len, private, effective_chunk, recipient_spk_len) {
+        FitCheck::Ok
+    } else if effective_chunk < DEFAULT_CHUNK
+        && note_fits(text_len, private, DEFAULT_CHUNK, recipient_spk_len)
+    {
+        FitCheck::FitsAtStandard
+    } else {
+        FitCheck::HardWall
+    }
+}
 
 const STATE_DIR: &str = "/.chain-notes";
 const STATE_PATH: &str = "/.chain-notes/state.json";
@@ -593,11 +633,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
+    // Edge-tracks whether the compose draft is over the broadcast ceiling, so
+    // the "too large" dialog pops once on crossing — not on every keystroke.
+    let compose_oversize = Rc::new(std::cell::Cell::new(false));
+
     // Keystroke cost estimator — pure arithmetic, no crypto runs (see
     // notes-core crypt::SEAL_OVERHEAD), so per-keystroke recompute is free.
     {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
+        let compose_oversize = compose_oversize.clone();
         ui.global::<Callbacks>().on_compose_changed(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
@@ -621,6 +666,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             if text_len == 0 {
                 compose.set_cost_line("Type to see the cost.".into());
                 compose.set_can_continue(false);
+                compose_oversize.set(false); // clearing the draft re-arms the dialog
                 return;
             }
             if st.utxos.is_empty() {
@@ -658,13 +704,52 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 None
             };
             let dust = if directed { notes_core::DUST_LIMIT } else { 0 };
-            match estimate_note_cost(
-                text_len,
-                compose.get_private_note(),
-                st.effective_chunk(),
-                1,
-                recipient_spk_len,
-            ) {
+            let private = compose.get_private_note();
+            let effective = st.effective_chunk();
+            let est = estimate_note_cost(text_len, private, effective, 1, recipient_spk_len);
+            let fit = fit_check(effective, text_len, private, recipient_spk_len);
+
+            // Over the per-tx broadcast ceiling (vsize > 100 kB, or > 255
+            // chunks). Show it in the cost line, gate Continue, and pop the
+            // "too large" dialog once — on the crossing, not every keystroke.
+            if !matches!(fit, FitCheck::Ok) {
+                match &est {
+                    Ok((chunks, vsize)) => compose.set_cost_line(
+                        format!("{chunks} chunk(s) · ~{vsize} vB — too large to broadcast").into(),
+                    ),
+                    Err(_) => {
+                        compose.set_cost_line("Too large to broadcast (> 255 chunks).".into())
+                    }
+                }
+                compose.set_can_continue(false);
+                if !compose_oversize.replace(true) {
+                    match fit {
+                        FitCheck::FitsAtStandard => {
+                            compose.set_oversize_offer_bump(true);
+                            compose.set_oversize_message(
+                                "This note doesn't fit at your current chunk size. \
+                                 Switch to Standard (a single large chunk) to fit it in one transaction?"
+                                    .into(),
+                            );
+                        }
+                        _ => {
+                            compose.set_oversize_offer_bump(false);
+                            compose.set_oversize_message(
+                                "This note is too large to broadcast. A single Bitcoin \
+                                 transaction can't exceed ~100 kB (the network relay limit), \
+                                 whatever the chunk size. Shorten the note, or split it across \
+                                 several notes. Multi-transaction notes are planned for a \
+                                 future release."
+                                    .into(),
+                            );
+                        }
+                    }
+                    compose.set_show_oversize(true);
+                }
+                return;
+            }
+            compose_oversize.set(false);
+            match est {
                 Ok((chunks, vsize)) => {
                     let fee = (vsize as f64 * rate).ceil() as u64;
                     if fee + dust > st.balance() {
@@ -1253,6 +1338,27 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             refresh_home();
             // Re-price the draft immediately so the compose cost line is
             // already current when the user returns to it.
+            ui.global::<Callbacks>().invoke_compose_changed();
+        });
+    }
+
+    // Compose "too large" dialog → raise the chunk size to Standard (auto) and
+    // reprice the draft in place. Only offered when the note fits at Standard.
+    {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_oversize_bump(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            {
+                let mut st = state.borrow_mut();
+                st.chunk_override = None; // Standard / auto = DEFAULT_CHUNK
+                save_state(&fs, &st);
+            }
+            log::info!("cb: set-chunk-size auto ok (oversize-bump)");
+            let compose = ui.global::<Compose>();
+            compose.set_show_oversize(false);
+            ui.global::<Settings>().set_chunk_mode(0); // mirror into the settings pill
             ui.global::<Callbacks>().invoke_compose_changed();
         });
     }
