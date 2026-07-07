@@ -206,6 +206,7 @@ fn bundle_from_txs(txs: &[(&notes_core::tx::NoteTx, bool, Option<u64>)]) -> Sync
                     .collect(),
                 pays_self: false,
                 sender: None,
+                author_candidates: Vec::new(),
                 recipient: None,
             })
             .collect(),
@@ -363,6 +364,85 @@ fn compose_directed_private_roundtrip() {
     let notes = extract_notes(&leaked, &c, NET);
     assert_eq!(notes.len(), 1);
     assert!(notes[0].text.is_none(), "not addressed to C — must stay sealed");
+}
+
+/// Externally-funded directed-private note: the tx is funded and signed by a
+/// third-party wallet (F), so the first taproot input is F, not the author A.
+/// A's key rides along only as a dust-to-self output surfaced in
+/// `author_candidates`. B must still decrypt by trying the candidate keys and
+/// attribute the note to A — never to the funder F. A wrong candidate never
+/// spuriously authenticates.
+#[test]
+fn externally_funded_directed_private_decodes_via_candidate() {
+    let a = identity(); // author
+    let b = identity_b(); // recipient
+    let f = Identity::from_app_seed(&[0x11u8; 32]).unwrap(); // external funder
+    let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let note = compose_directed_note(
+        &a, &utxos(), "paid by cold storage", true, [7, 0, 0, 7], &to_b, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+
+    // B's view of an EXTERNALLY funded tx: pays B, does NOT spend from B, and
+    // the first-input sender is the funder F. A's key is present only as a
+    // candidate (the dust-to-self output the composer adds for discoverability).
+    let mut bundle = bundle_from_txs(&[(&note, false, Some(100))]);
+    bundle.notes_onchain[0].pays_self = true;
+    bundle.notes_onchain[0].sender = Some(f.address(NET));
+    bundle.notes_onchain[0].author_candidates =
+        vec![f.address(NET), a.address(NET), b.address(NET)];
+    let notes = extract_notes(&bundle, &b, NET);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].received && notes[0].directed && notes[0].private);
+    assert_eq!(notes[0].text.as_deref(), Some("paid by cold storage"));
+    // Attributed to the real author A, not the funder F.
+    assert_eq!(notes[0].sender.as_deref(), Some(a.address(NET).as_str()));
+
+    // Legacy bundle (only the funder as sender, no candidates) must NOT decrypt
+    // — proving the candidate set is precisely what enables external funding.
+    let mut legacy = bundle_from_txs(&[(&note, false, Some(100))]);
+    legacy.notes_onchain[0].pays_self = true;
+    legacy.notes_onchain[0].sender = Some(f.address(NET));
+    let notes = extract_notes(&legacy, &b, NET);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].text.is_none(), "no candidate → funder key cannot decrypt");
+
+    // Wrong-but-taproot candidates never spuriously authenticate (AAD/AEAD).
+    let c = Identity::from_app_seed(&[8u8; 32]).unwrap();
+    let mut wrong = bundle_from_txs(&[(&note, false, Some(100))]);
+    wrong.notes_onchain[0].pays_self = true;
+    wrong.notes_onchain[0].sender = Some(f.address(NET));
+    wrong.notes_onchain[0].author_candidates = vec![f.address(NET), c.address(NET)];
+    let notes = extract_notes(&wrong, &b, NET);
+    assert!(notes[0].text.is_none(), "wrong candidates must fail the AAD");
+}
+
+/// Author-side recovery of an EXTERNALLY-FUNDED directed-private note. The
+/// author's tx does not spend from them (a funder paid), so a rescan sees it as
+/// "received" — but open_sent with the recipient candidate (the note's dust
+/// output) restores it to the author's own notebook: not received, recipient set.
+#[test]
+fn externally_funded_author_recovers_own_directed_private() {
+    let a = identity(); // author
+    let b = identity_b(); // recipient
+    let f = Identity::from_app_seed(&[0x11u8; 32]).unwrap(); // funder
+    let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let note = compose_directed_note(
+        &a, &utxos(), "my own words, externally paid", true, [4, 2, 4, 2], &to_b, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+
+    // A's rescan of the externally-funded tx: it pays A (dust-to-self) but does
+    // NOT spend from A; the input sender is the funder; candidates include B.
+    let mut bundle = bundle_from_txs(&[(&note, false, Some(100))]);
+    bundle.notes_onchain[0].pays_self = true;
+    bundle.notes_onchain[0].sender = Some(f.address(NET));
+    bundle.notes_onchain[0].author_candidates = vec![f.address(NET), b.address(NET)];
+    let notes = extract_notes(&bundle, &a, NET);
+    assert_eq!(notes.len(), 1);
+    assert!(!notes[0].received, "author's own note must not read as received");
+    assert_eq!(notes[0].recipient.as_deref(), Some(b.address(NET).as_str()));
+    assert_eq!(notes[0].text.as_deref(), Some("my own words, externally paid"));
 }
 
 /// The 68-byte AAD binds the sender: attributing the same sealed body to a

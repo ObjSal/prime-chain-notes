@@ -94,6 +94,14 @@ export global Sync {
     in-out property <string> result: "";
 }
 
+// Signing an external transaction (PSBT) for a wallet whose coins fund a note
+// composed on the desktop peer. Screen 8.
+export global SignPsbt {
+    in-out property <string> summary: "";
+    in-out property <image> qr;
+    in-out property <bool> has-qr: false;
+}
+
 export global Settings {
     // OP_RETURN chunk-size: 0 standard (100000, Core v30 relay default) ·
     // 1 compat-80 · 2 custom. Purely device-side — bundles carry no relay
@@ -117,6 +125,7 @@ export global Callbacks {
     callback import-bundle();
     callback scan-bundle();         // system QR scanner → bundle import
     callback export-pending();
+    callback sign-psbt();           // system QR scanner → sign our inputs → screen 8
     callback cycle-network();       // mainnet → testnet4 → signet → regtest → …
     callback chunk-changed();       // chunk-mode pill tapped / bytes field edited
     callback refresh-contacts();    // rebuild Contacts.rows from state
