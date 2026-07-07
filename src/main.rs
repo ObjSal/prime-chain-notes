@@ -1278,6 +1278,80 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
+    // Sign an external transaction (PSBT): scan it, sign every input that pays
+    // THIS device's taproot address, and hand back the signed PSBT as a QR.
+    {
+        let ui_weak = ui_weak.clone();
+        let identity = identity.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_sign_psbt(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let Some(id) = identity.as_ref() else {
+                ui.global::<Sync>().set_result("Device locked — no signing key.".into());
+                return;
+            };
+            let opts = ScanQrOptions {
+                header_title: "Scan transaction".into(),
+                message: "Point at the desktop app's PSBT QR".into(),
+                ..ScanQrOptions::default()
+            };
+            let data = match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
+                Ok(Some(ScanQrResult::Qr(d))) | Ok(Some(ScanQrResult::Ur2(_, d))) => d,
+                Ok(_) => {
+                    log::info!("cb: sign-psbt cancelled");
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("cb: sign-psbt err=scanner {e:?}");
+                    ui.global::<Sync>().set_result(format!("QR scanner unavailable: {e:?}").into());
+                    return;
+                }
+            };
+            let bytes = normalize_psbt_bytes(&data);
+            let mut psbt = match notes_core::psbt::Psbt::deserialize(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("cb: sign-psbt err={e}");
+                    ui.global::<Sync>().set_result(format!("Not a PSBT: {e}").into());
+                    return;
+                }
+            };
+            let (ours, signed) =
+                match psbt.sign_own_taproot(&id.output_x, &id.tweaked_seckey, generate_aux_rand) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        ui.global::<Sync>().set_result(format!("Sign failed: {e}").into());
+                        return;
+                    }
+                };
+            log::info!("cb: sign-psbt inputs={ours} signed={signed} ok");
+            if ours == 0 {
+                ui.global::<Sync>()
+                    .set_result("No inputs belong to this device's address.".into());
+                return;
+            }
+            let hex_str = hex::encode_upper(psbt.serialize());
+            let txid = psbt.unsigned_tx.txid_hex();
+            let file = format!("{OUTBOX_DIR}/{txid}.psbt.hex");
+            let _ = ensure_dir(&fs, OUTBOX_DIR, Location::User)
+                .and_then(|_| write_file(&fs, &file, Location::User, hex_str.as_bytes()));
+            let fee = psbt_fee(&psbt);
+            let note = psbt_note_summary(&psbt);
+            let sp = ui.global::<SignPsbt>();
+            sp.set_summary(
+                format!("Signed {signed} of {ours} input(s) · fee {fee} sats\n{note}").into(),
+            );
+            if hex_str.len() <= MAX_QR_HEX_CHARS {
+                sp.set_qr(qr_image(&hex_str));
+                sp.set_has_qr(true);
+            } else {
+                sp.set_has_qr(false);
+            }
+            ui.global::<Ui>().set_error("".into());
+            ui.global::<Ui>().set_screen(8);
+        });
+    }
+
     {
         let state = state.clone();
         let fs = fs.clone();
@@ -1403,4 +1477,47 @@ fn qr_image(payload: &str) -> Image {
         Color::from_rgb_u8(0, 0, 0),
         Color::from_rgb_u8(255, 255, 255),
     )
+}
+
+/// Raw PSBT bytes from a scanned payload: the system scanner reassembles a
+/// crypto-psbt UR into raw bytes; a plain QR may instead carry a hex string.
+fn normalize_psbt_bytes(data: &[u8]) -> Vec<u8> {
+    if data.starts_with(b"psbt\xff") {
+        return data.to_vec();
+    }
+    if let Ok(s) = std::str::from_utf8(data) {
+        if let Ok(b) = hex::decode(s.trim()) {
+            if b.starts_with(b"psbt\xff") {
+                return b;
+            }
+        }
+    }
+    data.to_vec()
+}
+
+/// Fee = sum(input amounts from witness_utxo) − sum(output amounts).
+fn psbt_fee(p: &notes_core::psbt::Psbt) -> u64 {
+    let ins: u64 = p.inputs.iter().filter_map(|i| i.witness_utxo.as_ref().map(|w| w.value)).sum();
+    let outs: u64 = p.unsigned_tx.outputs.iter().map(|o| o.value).sum();
+    ins.saturating_sub(outs)
+}
+
+/// A one-line note summary decoded from the PSBT's OP_RETURN output.
+fn psbt_note_summary(p: &notes_core::psbt::Psbt) -> String {
+    for o in &p.unsigned_tx.outputs {
+        if let Some(payload) = notes_core::tx::op_return_payload(&o.script_pubkey) {
+            let Some(chunk) = notes_core::envelope::decode(payload) else { continue };
+            if chunk.flags & notes_core::envelope::FLAG_PRIVATE != 0 {
+                return "Note: encrypted".into();
+            }
+            if let Ok(body) = notes_core::envelope::reassemble(&[chunk]) {
+                if let Ok(t) = String::from_utf8(body) {
+                    let short: String = t.chars().take(40).collect();
+                    return format!("Note: {short}");
+                }
+            }
+            return "Note: (public)".into();
+        }
+    }
+    "Note: (no note found)".into()
 }

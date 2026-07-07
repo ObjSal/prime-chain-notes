@@ -80,9 +80,16 @@ pub struct OnchainTx {
     #[serde(default)]
     pub pays_self: bool,
     /// First taproot input prevout address — the (unforgeable) author of a
-    /// received note.
+    /// received note under self-funding, and the default display sender.
     #[serde(default)]
     pub sender: Option<String>,
+    /// Every taproot address appearing in the tx (input prevouts AND outputs).
+    /// When a note is funded by an EXTERNAL wallet the author's key is not the
+    /// spending input but a dust output back to their own address, so decode
+    /// tries each of these as the directed-private ECDH sender until the AEAD
+    /// authenticates. Optional/defaulted: legacy bundles fall back to `sender`.
+    #[serde(default)]
+    pub author_candidates: Vec<String>,
     /// First non-self, non-OP_RETURN output address — the recipient of an
     /// own directed note (lets the sender re-derive the DM key after a wipe).
     #[serde(default)]
@@ -206,6 +213,9 @@ pub fn extract_notes(
         height: Option<u64>,
         blocktime: Option<u64>,
         recipient: Option<String>,
+        /// Union of taproot addresses seen in the carrying tx(s) — candidate
+        /// authors for a received directed-private note (external funding).
+        author_candidates: Vec<String>,
     }
     let mut by_id: Vec<([u8; 4], Pending)> = Vec::new();
 
@@ -235,6 +245,7 @@ pub fn extract_notes(
                             height: None,
                             blocktime: None,
                             recipient: None,
+                            author_candidates: Vec::new(),
                         },
                     ));
                     &mut by_id.last_mut().expect("just pushed").1
@@ -250,6 +261,11 @@ pub fn extract_notes(
             }
             if entry.recipient.is_none() {
                 entry.recipient = tx.recipient.clone();
+            }
+            for cand in &tx.author_candidates {
+                if !entry.author_candidates.contains(cand) {
+                    entry.author_candidates.push(cand.clone());
+                }
             }
             // A note's height is its FIRST confirmation.
             if entry.height.is_none() || tx.height < entry.height {
@@ -267,12 +283,15 @@ pub fn extract_notes(
         let flags = pending.chunks[0].flags;
         let private = flags & FLAG_PRIVATE != 0;
         let directed = flags & FLAG_DIRECTED != 0;
-        let received = matches!(pending.origin, Origin::Received(_));
-        let sender = match &pending.origin {
+        let mut received = matches!(pending.origin, Origin::Received(_));
+        // `sender` starts as the first-input address (display default); it and
+        // `recipient`/`received` are corrected below once a directed-private
+        // note authenticates under a specific candidate key (external funding).
+        let mut sender = match &pending.origin {
             Origin::Received(s) => s.clone(),
             Origin::Own => None,
         };
-        let recipient = if received { None } else { pending.recipient.clone() };
+        let mut recipient = if received { None } else { pending.recipient.clone() };
 
         let plaintext = if !private {
             Some(body)
@@ -280,22 +299,65 @@ pub fn extract_notes(
             // Own self-note: the frozen enc_key path, byte-for-byte as v1.
             crypt::open(&identity.enc_key, &note_id, &body).ok()
         } else if received {
-            // Received directed-private: reciprocal ECDH with the sender key.
-            sender
-                .as_deref()
-                .and_then(|s| p2tr_x_of_address(network, s))
-                .and_then(|sender_x| {
-                    dm::open_received(
+            // Received directed-private. The author is the first-input address
+            // for self-funded notes, or a dust-to-self output for externally-
+            // funded ones — so try the input sender, then every taproot address
+            // in the tx, and accept whichever AEAD-authenticates (~2^-128 for a
+            // wrong key). If none opens as RECEIVED, we may instead be the
+            // AUTHOR who funded the note externally (our own tx doesn't spend
+            // from us, so it looks "received"): retry each candidate as the
+            // RECIPIENT via open_sent, restoring our note to our own notebook.
+            let mut candidates: Vec<[u8; 32]> = Vec::new();
+            let push_cand = |addr: &str, out: &mut Vec<[u8; 32]>| {
+                if let Some(x) = p2tr_x_of_address(network, addr) {
+                    if x != identity.output_x && !out.contains(&x) {
+                        out.push(x);
+                    }
+                }
+            };
+            if let Some(s) = sender.as_deref() {
+                push_cand(s, &mut candidates);
+            }
+            for addr in &pending.author_candidates {
+                push_cand(addr, &mut candidates);
+            }
+            let mut recovered = None;
+            for cand in &candidates {
+                if let Ok(pt) = dm::open_received(
+                    &identity.tweaked_seckey,
+                    &identity.output_x,
+                    cand,
+                    &note_id,
+                    &body,
+                ) {
+                    // Attribute the note to the authenticated author.
+                    sender = Some(taproot_address(network, cand));
+                    recovered = Some(pt);
+                    break;
+                }
+            }
+            if recovered.is_none() {
+                for cand in &candidates {
+                    if let Ok(pt) = dm::open_sent(
                         &identity.tweaked_seckey,
                         &identity.output_x,
-                        &sender_x,
+                        cand,
                         &note_id,
                         &body,
-                    )
-                    .ok()
-                })
+                    ) {
+                        // Our own externally-funded note — not received.
+                        received = false;
+                        sender = None;
+                        recipient = Some(taproot_address(network, cand));
+                        recovered = Some(pt);
+                        break;
+                    }
+                }
+            }
+            recovered
         } else {
-            // Own sent directed-private: re-derive via the dust-output key.
+            // Own sent directed-private (self-funded): re-derive via the
+            // dust-output recipient key.
             recipient
                 .as_deref()
                 .and_then(|r| p2tr_x_of_address(network, r))
@@ -330,8 +392,43 @@ pub fn extract_notes(
     notes
 }
 
+/// Seal (if private) and envelope a note body into its OP_RETURN payloads,
+/// plus the recipient scriptPubKey for a directed note. This is the exact
+/// body/flags/envelope logic the on-device compose path uses, factored out so
+/// an EXTERNAL (PSBT) funder can produce byte-identical on-chain note bytes
+/// without holding the funding key. Directed-private notes stay decryptable
+/// under external funding because the author key rides on a dust-to-self
+/// output (see `extract_notes`' candidate-key search).
+pub fn sealed_note_payloads(
+    identity: &Identity,
+    text: &str,
+    private: bool,
+    recipient: Option<&Recipient>,
+    note_id: [u8; 4],
+    max_op_return_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>), Error> {
+    let body = if private {
+        if let Some(r) = recipient {
+            let recipient_x = r.p2tr_x.ok_or(Error::RecipientNotTaproot)?;
+            dm::seal_directed(
+                &identity.tweaked_seckey,
+                &identity.output_x,
+                &recipient_x,
+                &note_id,
+                text.as_bytes(),
+            )?
+        } else {
+            crypt::seal(&identity.enc_key, &note_id, text.as_bytes())?
+        }
+    } else {
+        text.as_bytes().to_vec()
+    };
+    let flags = recipient.map_or(0, |_| FLAG_DIRECTED) | if private { FLAG_PRIVATE } else { 0 };
+    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    Ok((payloads, recipient.map(|r| r.spk.clone())))
+}
+
 /// Shared tail of both compose paths: body → enveloped payloads → signed tx.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn compose_inner(
     identity: &Identity,

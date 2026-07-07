@@ -260,6 +260,18 @@ $("buildBtn").addEventListener("click", async () => {
         const recipient =
           (outs.find((o) => /^(bc|tb|bcrt)1p/.test(o.scriptpubkey_address)) || outs[0])
             ?.scriptpubkey_address || null;
+        // Every taproot address in the tx (inputs AND outputs) except our own:
+        // candidate authors for a received directed-private note. Under
+        // external funding the author's key is a dust-to-self output, not the
+        // spending input, so the device tries each until the AEAD authenticates.
+        const authorCandidates = [];
+        for (const a of [
+          ...t.vin.map((i) => i.prevout && i.prevout.scriptpubkey_address),
+          ...t.vout.map((o) => o.scriptpubkey_address),
+        ]) {
+          if (a && /^(bc|tb|bcrt)1p/.test(a) && a !== address && !authorCandidates.includes(a))
+            authorCandidates.push(a);
+        }
         return {
           txid: t.txid,
           height: t.status.confirmed ? t.status.block_height : null,
@@ -267,6 +279,7 @@ $("buildBtn").addEventListener("click", async () => {
           spends_from_self: spendsFromSelf,
           pays_self: paysSelf,
           sender,
+          author_candidates: authorCandidates,
           recipient,
           payloads,
         };

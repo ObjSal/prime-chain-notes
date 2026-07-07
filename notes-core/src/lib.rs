@@ -14,6 +14,7 @@ pub mod crypt;
 pub mod dm;
 pub mod envelope;
 pub mod keys;
+pub mod psbt;
 pub mod sighash;
 pub mod sign;
 pub mod taproot;
@@ -31,6 +32,7 @@ pub enum Error {
     InsufficientFunds,
     PayloadTooLarge,
     RecipientNotTaproot,
+    Psbt(&'static str),
 }
 
 impl core::fmt::Display for Error {
@@ -48,6 +50,7 @@ impl core::fmt::Display for Error {
             Error::RecipientNotTaproot => {
                 write!(f, "private directed notes need a taproot (bc1p…) recipient")
             }
+            Error::Psbt(m) => write!(f, "psbt: {m}"),
         }
     }
 }
