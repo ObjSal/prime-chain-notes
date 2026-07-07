@@ -35,6 +35,10 @@ export global Compose {
     in-out property <string> rate-text: "";
     in-out property <string> cost-line: "";
     in-out property <bool> can-continue: false;
+    // "Note too large to broadcast" dialog (per-tx ~100 kB standardness wall).
+    in-out property <bool> show-oversize: false;
+    in-out property <bool> oversize-offer-bump: false; // true → offer Standard
+    in-out property <string> oversize-message: "";
 }
 
 export global Confirm {
@@ -106,6 +110,7 @@ export global Callbacks {
     callback refresh-home();
     callback compose-changed();     // every keystroke / toggle / tier change
     callback compose-continue();    // build + sign, then screen 4
+    callback oversize-bump();       // raise chunk size to Standard from the dialog
     callback confirm-sign();        // persist + export, then note view
     callback refresh-notes();
     callback open-note(string);     // note id (hex)
