@@ -1485,6 +1485,14 @@ fn normalize_psbt_bytes(data: &[u8]) -> Vec<u8> {
     if data.starts_with(b"psbt\xff") {
         return data.to_vec();
     }
+    // A spec crypto-psbt UR message wraps the PSBT in a CBOR byte string
+    // (BCR-2020-006) — what Sparrow, our desktop app, and the KeyOS scanner
+    // hand back. Unwrap it.
+    if let Some(inner) = cbor_unwrap_bstr(data) {
+        if inner.starts_with(b"psbt\xff") {
+            return inner;
+        }
+    }
     if let Ok(s) = std::str::from_utf8(data) {
         if let Ok(b) = hex::decode(s.trim()) {
             if b.starts_with(b"psbt\xff") {
@@ -1493,6 +1501,23 @@ fn normalize_psbt_bytes(data: &[u8]) -> Vec<u8> {
         }
     }
     data.to_vec()
+}
+
+/// Minimal CBOR byte-string unwrap (major type 2) — enough for crypto-psbt;
+/// avoids a CBOR dependency on-device.
+fn cbor_unwrap_bstr(data: &[u8]) -> Option<Vec<u8>> {
+    let b0 = *data.first()?;
+    let (len, hdr) = match b0 {
+        0x40..=0x57 => ((b0 - 0x40) as usize, 1),
+        0x58 => (*data.get(1)? as usize, 2),
+        0x59 => (u16::from_be_bytes([*data.get(1)?, *data.get(2)?]) as usize, 3),
+        0x5a => (
+            u32::from_be_bytes([*data.get(1)?, *data.get(2)?, *data.get(3)?, *data.get(4)?]) as usize,
+            5,
+        ),
+        _ => return None,
+    };
+    data.get(hdr..hdr + len).map(<[u8]>::to_vec)
 }
 
 /// Fee = sum(input amounts from witness_utxo) − sum(output amounts).
