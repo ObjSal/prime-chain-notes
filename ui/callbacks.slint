@@ -33,6 +33,12 @@ export global Compose {
     // tiers while tier < 3; a manual edit flips tier to 3 (custom) and the
     // field becomes the source of truth.
     in-out property <string> rate-text: "";
+    // Gift amount (directed notes only): sats the recipient output carries
+    // instead of the default dust. Default "330" (= DUST_LIMIT); a value
+    // below dust is bumped back up to 330 on the Rust side. The collapsible
+    // panel is shown only when this is a directed note (to-address != "").
+    in-out property <string> gift-sats: "330";
+    in-out property <bool> gift-expanded: false;
     in-out property <string> cost-line: "";
     in-out property <bool> can-continue: false;
     // "Note too large to broadcast" dialog (per-tx ~100 kB standardness wall).

@@ -554,9 +554,10 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // Fee-rate field: tracks the selected tier; typing here flips
-            // the tier to Custom and the entered sat/vB takes over.
-            HorizontalLayout {
+            // Custom fee-rate field — revealed ONLY when the Custom tier is
+            // selected (tapping the pill above is the toggle). The three
+            // preset tiers need no field, so it stays out of the way.
+            if Compose.tier == 3: HorizontalLayout {
                 vertical-stretch: 0;
                 spacing: 8px;
                 Rectangle {
@@ -577,10 +578,7 @@ export component AppWindow inherits Window {
                         font-family: "SourceCodePro";
                         font-size: 18px;
                         single-line: true;
-                        edited => {
-                            Compose.tier = 3;
-                            Callbacks.compose-changed();
-                        }
+                        edited => { Callbacks.compose-changed(); }
                         accepted => { self.clear-focus(); }
                     }
                 }
@@ -590,6 +588,74 @@ export component AppWindow inherits Window {
                     font-family: "Montserrat";
                     font-size: 16px;
                     vertical-alignment: center;
+                }
+            }
+
+            // Gift amount — directed notes only. Collapsible panel (styled
+            // like the compose panels): the recipient output carries this
+            // many sats instead of the default dust. Default/min = 330.
+            if Compose.to-address != "": Rectangle {
+                vertical-stretch: 0;
+                border-radius: 12px;
+                background: Theme.palette-surface;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                height: gift-col.preferred-height;
+                gift-col := VerticalLayout {
+                    padding: 10px;
+                    spacing: 8px;
+                    Rectangle {
+                        height: 22px;
+                        TouchArea { clicked => { Compose.gift-expanded = !Compose.gift-expanded; } }
+                        HorizontalLayout {
+                            Text {
+                                text: "Gift · \{Compose.gift-sats} sats";
+                                color: Theme.palette-muted;
+                                font-family: "SourceCodePro";
+                                font-size: 14px;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { }
+                            Image {
+                                source: Compose.gift-expanded
+                                    ? @image-url("../resources/icons/chevron-up.svg")
+                                    : @image-url("../resources/icons/chevron-down.svg");
+                                colorize: Theme.palette-muted;
+                                width: 16px;
+                                height: 16px;
+                                y: (parent.height - 16px) / 2;
+                            }
+                        }
+                    }
+                    if Compose.gift-expanded: Text {
+                        text: "Sats sent to the recipient with your note. Minimum 330 (dust).";
+                        color: Theme.palette-muted;
+                        font-family: "SourceCodePro";
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    if Compose.gift-expanded: Rectangle {
+                        height: 44px;
+                        background: Theme.palette-background;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: gift-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                        clip: true;
+                        gift-input := TextInput {
+                            x: 14px;
+                            width: parent.width - 28px;
+                            height: 24px;
+                            y: (parent.height - self.height) / 2;
+                            text <=> Compose.gift-sats;
+                            color: Theme.palette-foreground;
+                            font-family: "SourceCodePro";
+                            font-size: 18px;
+                            single-line: true;
+                            input-type: number;
+                            edited => { Callbacks.compose-changed(); }
+                            accepted => { self.clear-focus(); }
+                        }
+                    }
                 }
             }
 
