@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use notes_core::address::Recipient;
 use notes_core::bundle::{
-    compose_directed_note, compose_note, decode_scanned, estimate_note_cost, extract_notes,
-    Identity, SyncBundle,
+    compose_directed_note_with_change_amount, compose_note, decode_scanned, estimate_note_cost,
+    extract_notes, Identity, SyncBundle,
 };
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::tx::{NoteTx, Utxo};
@@ -318,6 +318,21 @@ fn resolve_rate(tier: i32, rate_text: &str, st: &State) -> Result<f64, String> {
     } else {
         Ok(st.fee_rate(tier))
     }
+}
+
+/// Sats the recipient (gift) output of a directed note carries. The gift
+/// field parsed, floored at DUST_LIMIT — empty/garbage falls back to dust,
+/// and a sub-dust value is bumped up (the tx builder rejects below-dust).
+/// Self-notes have no recipient output, so this returns 0 and is unused.
+fn resolve_gift(directed: bool, gift_text: &str) -> u64 {
+    if !directed {
+        return 0;
+    }
+    gift_text
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(notes_core::DUST_LIMIT)
+        .max(notes_core::DUST_LIMIT)
 }
 
 fn preview_of(text: &str) -> String {
@@ -703,7 +718,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             } else {
                 None
             };
-            let dust = if directed { notes_core::DUST_LIMIT } else { 0 };
+            let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
             let private = compose.get_private_note();
             let effective = st.effective_chunk();
             let est = estimate_note_cost(text_len, private, effective, 1, recipient_spk_len);
@@ -752,9 +767,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             match est {
                 Ok((chunks, vsize)) => {
                     let fee = (vsize as f64 * rate).ceil() as u64;
-                    if fee + dust > st.balance() {
+                    if fee + gift > st.balance() {
                         compose.set_cost_line(
-                            format!("Needs ~{} sats — balance is {}.", fee + dust, st.balance())
+                            format!("Needs ~{} sats — balance is {}.", fee + gift, st.balance())
                                 .into(),
                         );
                         compose.set_can_continue(false);
@@ -763,7 +778,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             format!(
                                 "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}",
                                 sats_line(fee, st.btc_usd),
-                                if directed { " + 330 sats to recipient" } else { "" }
+                                if directed {
+                                    format!(" + {gift} sats to recipient")
+                                } else {
+                                    String::new()
+                                }
                             )
                             .into(),
                         );
@@ -800,6 +819,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let directed = !to_address.is_empty();
                 let tier = compose.get_tier();
                 let rate_text = compose.get_rate_text().to_string();
+                let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
                 let st = state.borrow();
                 let result = identity
                     .as_ref()
@@ -815,13 +835,17 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         let note = if directed {
                             let recipient = Recipient::parse(st.network(), &to_address)
                                 .map_err(|e| e.to_string())?;
-                            compose_directed_note(
+                            // Gift amount: the recipient output carries `gift`
+                            // sats (>= dust). change_spk None = change to self.
+                            compose_directed_note_with_change_amount(
                                 id,
                                 &st.core_utxos(),
                                 &text,
                                 private,
                                 note_id,
                                 &recipient,
+                                gift,
+                                None,
                                 st.effective_chunk(),
                                 rate,
                                 || generate_aux_rand(),
@@ -850,13 +874,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             .filter(|o| o.script_pubkey.first() == Some(&0x6a))
                             .count() as u64;
                         log::info!(
-                            "cb: compose len={} private={} to={} chunks={} fee={} vsize={} txid={} ok",
+                            "cb: compose len={} private={} to={} chunks={} fee={} vsize={} gift={} txid={} ok",
                             text.len(),
                             private,
                             if directed { to_address.as_str() } else { "self" },
                             chunks,
                             note.fee,
                             note.vsize,
+                            note.sent,
                             note.txid_hex
                         );
                         let balance_after = st.balance() - note.fee - note.sent;
@@ -878,7 +903,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 note.vsize,
                                 note.tx.inputs.len(),
                                 sats_line(note.fee, st.btc_usd),
-                                if directed { " + 330 sats to recipient" } else { "" },
+                                if directed {
+                                    format!(" + {} sats to recipient", note.sent)
+                                } else {
+                                    String::new()
+                                },
                                 note.change,
                                 balance_after,
                                 note.txid_hex
@@ -1008,6 +1037,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // A stale recipient must never silently direct the next note.
                 ui.global::<Compose>().set_to_address("".into());
                 ui.global::<Compose>().set_to_label("".into());
+                // Gift resets with the recipient so a large gift can't leak
+                // into the next note.
+                ui.global::<Compose>().set_gift_sats("330".into());
+                ui.global::<Compose>().set_gift_expanded(false);
                 ui.global::<Ui>().set_busy(false);
                 refresh_notes();
                 ui.global::<Ui>().set_screen(2);
