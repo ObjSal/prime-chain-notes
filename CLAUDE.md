@@ -67,6 +67,25 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
   cannot contaminate it. Directed-note txs: OP_RETURNs, then a
   DUST_LIMIT=330 output to the recipient, then change — the app's UTXO
   ledger takes change at vout `chunks + 1` for directed notes.
+- **Gift amount (variable recipient value) — notes-core is READY, the Prime
+  UI is not yet.** `notes-core` already exposes variable-amount directed
+  compose: `compose_directed_note_with_change_amount` /
+  `compose_directed_note_exact_amount` (and the `build_note_tx_*` layer's
+  `recipient_amount: u64` param), where the recipient output carries
+  `recipient_amount` sats instead of a hardcoded dust — validated
+  `>= DUST_LIMIT`. The chain-notes-app peer already ships this end-to-end
+  (a collapsible "Gift · N sats" panel on directed compose, default/min =
+  dust, live cost) on macOS/iOS/Android. This Prime app does NOT yet expose
+  it: `src/main.rs` computes `let dust = if directed { DUST_LIMIT } else { 0 }`
+  (~line 706) and calls the plain `compose_directed_note` (~line 818, always
+  dust); the cost line hardcodes "+ 330 sats to recipient" (~line 81 below).
+  **To add gifts here:** a Slint gift-amount field on compose (directed only,
+  default 330, min DUST_LIMIT), size fee/change/cost off it, and switch the
+  compose call to a variable-amount notes-core variant (plain
+  `compose_directed_note` has no amount arg — either add a
+  `compose_directed_note_amount` to notes-core the same additive way, or
+  switch to `compose_directed_note_with_change_amount`). Bump the notes-core
+  pin and re-run tests; keep old callers byte-identical.
 - getrandom patch: after bumping deps re-run
   `cargo update getrandom@<ver> --precise 0.2.10` or the TRNG override
   silently drops out (check for "Patch … was not used" warnings).
