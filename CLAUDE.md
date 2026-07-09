@@ -28,7 +28,7 @@ notes-core/            # UI-free, host-testable: cargo test -p notes-core
   src/envelope.rs      # PNTE || v1 || flags || note_id || seq/total (FROZEN)
   src/crypt.rs         # seal/open, SEAL_OVERHEAD=40 (cost estimator depends on it)
   src/dm.rs            # directed notes: static-static x-only ECDH + HKDF (FROZEN)
-  src/bundle.rs        # SyncBundle JSON, extract_notes, compose_note, Identity
+  src/bundle.rs        # SyncBundle JSON, extract_notes (+_watch, key-less), compose_note, Identity
   examples/notes_cli.rs  # host CLI (device role) for the e2e scripts
 src/main.rs            # app: screens, callbacks, state.json persistence
 ui/{app.slint, callbacks.slint}
