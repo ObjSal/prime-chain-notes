@@ -430,6 +430,7 @@ pub fn sealed_note_payloads(
 
 /// Shared tail of both compose paths: body → enveloped payloads → signed tx.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn compose_inner(
     identity: &Identity,
     utxos: &[Utxo],
@@ -437,6 +438,7 @@ fn compose_inner(
     flags: u8,
     body: &[u8],
     recipient_spk: Option<&[u8]>,
+    recipient_amount: u64,
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
@@ -448,6 +450,7 @@ fn compose_inner(
         &identity.output_x,
         &payloads,
         recipient_spk,
+        recipient_amount,
         change_spk,
         fee_rate,
         &identity.tweaked_seckey,
@@ -492,8 +495,8 @@ pub fn compose_note_with_change(
     };
     let flags = if private { FLAG_PRIVATE } else { 0 };
     compose_inner(
-        identity, utxos, note_id, flags, &body, None, change_spk, max_op_return_bytes, fee_rate,
-        aux,
+        identity, utxos, note_id, flags, &body, None, crate::DUST_LIMIT, change_spk,
+        max_op_return_bytes, fee_rate, aux,
     )
 }
 
@@ -535,6 +538,29 @@ pub fn compose_directed_note_with_change(
     fee_rate: f64,
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
+    compose_directed_note_with_change_amount(
+        identity, utxos, text, private, note_id, recipient, crate::DUST_LIMIT, change_spk,
+        max_op_return_bytes, fee_rate, aux,
+    )
+}
+
+/// Like `compose_directed_note_with_change`, but the recipient (gift) output
+/// carries `recipient_amount` sats (must be >= DUST_LIMIT) instead of the
+/// default dust — lets a directed note double as a gift.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_directed_note_with_change_amount(
+    identity: &Identity,
+    utxos: &[Utxo],
+    text: &str,
+    private: bool,
+    note_id: [u8; 4],
+    recipient: &Recipient,
+    recipient_amount: u64,
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
     let body = if private {
         let recipient_x = recipient.p2tr_x.ok_or(Error::RecipientNotTaproot)?;
         dm::seal_directed(
@@ -555,6 +581,7 @@ pub fn compose_directed_note_with_change(
         flags,
         &body,
         Some(&recipient.spk),
+        recipient_amount,
         change_spk,
         max_op_return_bytes,
         fee_rate,
@@ -588,6 +615,7 @@ pub fn compose_note_exact(
         &identity.output_x,
         &payloads,
         None,
+        crate::DUST_LIMIT,
         change_spk,
         fee_rate,
         &identity.tweaked_seckey,
@@ -604,6 +632,28 @@ pub fn compose_directed_note_exact(
     private: bool,
     note_id: [u8; 4],
     recipient: &Recipient,
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    compose_directed_note_exact_amount(
+        identity, inputs, text, private, note_id, recipient, crate::DUST_LIMIT, change_spk,
+        max_op_return_bytes, fee_rate, aux,
+    )
+}
+
+/// Like `compose_directed_note_exact`, but the recipient (gift) output carries
+/// `recipient_amount` sats (must be >= DUST_LIMIT).
+#[allow(clippy::too_many_arguments)]
+pub fn compose_directed_note_exact_amount(
+    identity: &Identity,
+    inputs: &[Utxo],
+    text: &str,
+    private: bool,
+    note_id: [u8; 4],
+    recipient: &Recipient,
+    recipient_amount: u64,
     change_spk: Option<&[u8]>,
     max_op_return_bytes: usize,
     fee_rate: f64,
@@ -628,6 +678,7 @@ pub fn compose_directed_note_exact(
         &identity.output_x,
         &payloads,
         Some(&recipient.spk),
+        recipient_amount,
         change_spk,
         fee_rate,
         &identity.tweaked_seckey,

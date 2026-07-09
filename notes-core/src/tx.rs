@@ -293,7 +293,8 @@ pub fn build_note_tx(
     aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     build_note_tx_with_change(
-        available, output_x, payloads, recipient_spk, None, fee_rate, tweaked_seckey, aux,
+        available, output_x, payloads, recipient_spk, DUST_LIMIT, None, fee_rate, tweaked_seckey,
+        aux,
     )
 }
 
@@ -307,6 +308,9 @@ pub fn build_note_tx_with_change(
     output_x: &[u8; 32],
     payloads: &[Vec<u8>],
     recipient_spk: Option<&[u8]>,
+    // Value of the recipient (directed) output. Ignored when recipient_spk is
+    // None (self-note). Must be >= DUST_LIMIT.
+    recipient_amount: u64,
     change_out: Option<&[u8]>,
     fee_rate: f64,
     tweaked_seckey: &[u8; 32],
@@ -315,8 +319,11 @@ pub fn build_note_tx_with_change(
     if payloads.is_empty() {
         return Err(Error::Envelope("no payloads"));
     }
+    if recipient_spk.is_some() && recipient_amount < DUST_LIMIT {
+        return Err(Error::Envelope("gift amount below dust limit"));
+    }
     let payload_lens: Vec<usize> = payloads.iter().map(Vec::len).collect();
-    let sent: u64 = if recipient_spk.is_some() { DUST_LIMIT } else { 0 };
+    let sent: u64 = if recipient_spk.is_some() { recipient_amount } else { 0 };
     let mut candidates = available.to_vec();
     candidates.sort_by(|a, b| b.value.cmp(&a.value));
 
@@ -359,7 +366,7 @@ pub fn build_note_tx_with_change(
                 .map(|p| TxOut { value: 0, script_pubkey: op_return_script(p) })
                 .collect();
             if let Some(spk) = recipient_spk {
-                outputs.push(TxOut { value: DUST_LIMIT, script_pubkey: spk.to_vec() });
+                outputs.push(TxOut { value: sent, script_pubkey: spk.to_vec() });
             }
             if change {
                 outputs
@@ -408,6 +415,7 @@ pub fn build_note_tx_exact(
     output_x: &[u8; 32],
     payloads: &[Vec<u8>],
     recipient_spk: Option<&[u8]>,
+    recipient_amount: u64,
     change_out: Option<&[u8]>,
     fee_rate: f64,
     tweaked_seckey: &[u8; 32],
@@ -419,8 +427,11 @@ pub fn build_note_tx_exact(
     if inputs.is_empty() {
         return Err(Error::InsufficientFunds);
     }
+    if recipient_spk.is_some() && recipient_amount < DUST_LIMIT {
+        return Err(Error::Envelope("gift amount below dust limit"));
+    }
     let payload_lens: Vec<usize> = payloads.iter().map(Vec::len).collect();
-    let sent: u64 = if recipient_spk.is_some() { DUST_LIMIT } else { 0 };
+    let sent: u64 = if recipient_spk.is_some() { recipient_amount } else { 0 };
     let change_spk = p2tr_script_pubkey(output_x);
     let change_out_spk = change_out.map(<[u8]>::to_vec).unwrap_or_else(|| change_spk.clone());
     let in_value: u64 = inputs.iter().map(|u| u.value).sum();
@@ -447,7 +458,7 @@ pub fn build_note_tx_exact(
             .map(|p| TxOut { value: 0, script_pubkey: op_return_script(p) })
             .collect();
         if let Some(spk) = recipient_spk {
-            outputs.push(TxOut { value: DUST_LIMIT, script_pubkey: spk.to_vec() });
+            outputs.push(TxOut { value: sent, script_pubkey: spk.to_vec() });
         }
         if change {
             outputs.push(TxOut { value: change_value, script_pubkey: change_out_spk.clone() });

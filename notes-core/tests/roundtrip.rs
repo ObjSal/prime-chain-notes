@@ -586,6 +586,50 @@ fn scan_import_is_idempotent() {
 }
 
 #[test]
+fn directed_note_custom_gift_amount() {
+    use notes_core::bundle::compose_directed_note_with_change_amount;
+    use notes_core::DUST_LIMIT;
+
+    let sender = identity_b();
+    let recip = identity();
+    let to_recip = Recipient::parse(NET, &recip.address(NET)).unwrap();
+
+    // Default directed note sends exactly dust to the recipient.
+    let dust_note = compose_directed_note(
+        &sender, &utxos(), "hi", false, [1, 2, 3, 4], &to_recip, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+    assert_eq!(dust_note.sent, DUST_LIMIT, "default gift is dust");
+
+    // A custom gift amount lands verbatim in the recipient output, and the fee
+    // math balances: inputs = fee + gift + change.
+    let gift = 50_000u64;
+    let gift_note = compose_directed_note_with_change_amount(
+        &sender, &utxos(), "happy birthday", false, [1, 2, 3, 5], &to_recip, gift, None, 80, 1.0,
+        || Ok(AUX),
+    )
+    .unwrap();
+    assert_eq!(gift_note.sent, gift, "gift amount reaches the recipient output");
+    let inputs_total: u64 = gift_note.tx.inputs.iter().map(|i| i.value).sum();
+    assert_eq!(inputs_total, gift_note.fee + gift_note.sent + gift_note.change);
+
+    // The recipient can still read the note (delivery/index unaffected).
+    let mut rb = bundle_from_txs(&[(&gift_note, false, Some(20))]);
+    rb.notes_onchain[0].pays_self = true;
+    rb.notes_onchain[0].sender = Some(sender.address(NET));
+    let received = extract_notes(&rb, &recip, NET);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].text.as_deref(), Some("happy birthday"));
+
+    // Below dust is rejected.
+    let err = compose_directed_note_with_change_amount(
+        &sender, &utxos(), "too small", false, [1, 2, 3, 6], &to_recip, DUST_LIMIT - 1, None, 80,
+        1.0, || Ok(AUX),
+    );
+    assert!(err.is_err(), "gift below dust must be rejected");
+}
+
+#[test]
 fn address_decode_matches_rust_bitcoin() {
     use std::str::FromStr;
     // Any-network v0 + v1 decodes must equal rust-bitcoin's scriptPubKey.
