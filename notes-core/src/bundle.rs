@@ -201,6 +201,23 @@ pub fn extract_notes(
     identity: &Identity,
     network: Network,
 ) -> Vec<RecoveredNote> {
+    extract_notes_inner(bundle, Some(identity), network)
+}
+
+/// Watch-only [`extract_notes`]: everything a public observer of the address
+/// can recover — note structure, origins, senders/recipients, public text —
+/// with no key material. Every private body stays sealed (`text: None`),
+/// including own self-notes, and received directed-private notes keep their
+/// display-default sender (no candidate-key authentication is possible).
+pub fn extract_notes_watch(bundle: &SyncBundle, network: Network) -> Vec<RecoveredNote> {
+    extract_notes_inner(bundle, None, network)
+}
+
+fn extract_notes_inner(
+    bundle: &SyncBundle,
+    keys: Option<&Identity>,
+    network: Network,
+) -> Vec<RecoveredNote> {
     #[derive(PartialEq, Eq, Clone)]
     enum Origin {
         Own,
@@ -295,10 +312,14 @@ pub fn extract_notes(
 
         let plaintext = if !private {
             Some(body)
+        } else if keys.is_none() {
+            None // watch-only: no decryption key on this device
         } else if !directed {
             // Own self-note: the frozen enc_key path, byte-for-byte as v1.
+            let identity = keys.expect("gated above");
             crypt::open(&identity.enc_key, &note_id, &body).ok()
         } else if received {
+            let identity = keys.expect("gated above");
             // Received directed-private. The author is the first-input address
             // for self-funded notes, or a dust-to-self output for externally-
             // funded ones — so try the input sender, then every taproot address
@@ -358,6 +379,7 @@ pub fn extract_notes(
         } else {
             // Own sent directed-private (self-funded): re-derive via the
             // dust-output recipient key.
+            let identity = keys.expect("gated above");
             recipient
                 .as_deref()
                 .and_then(|r| p2tr_x_of_address(network, r))
