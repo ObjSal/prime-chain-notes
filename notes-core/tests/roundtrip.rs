@@ -6,7 +6,7 @@ use notes_core::address::Recipient;
 use notes_core::bundle::{
     compose_directed_note, compose_note, compose_note_exact, compose_note_with_change,
     estimate_note_cost,
-    extract_notes, Identity, OnchainTx, SyncBundle,
+    extract_notes, extract_notes_watch, Identity, OnchainTx, SyncBundle,
 };
 use notes_core::crypt::{self, SEAL_OVERHEAD};
 use notes_core::envelope;
@@ -327,6 +327,66 @@ fn compose_directed_public_roundtrip() {
     assert!(!notes[0].received && notes[0].directed);
     assert_eq!(notes[0].recipient.as_deref(), Some(b.address(NET).as_str()));
     assert_eq!(notes[0].text.as_deref(), Some("hello bob, love alice"));
+}
+
+/// Watch-only scan: identical structure to the keyed scan — same notes,
+/// origins, senders/recipients, public text — but every private body stays
+/// sealed (text: None), including own self-notes.
+#[test]
+fn watch_scan_matches_keyed_scan_minus_private_text() {
+    let a = identity();
+    let b = identity_b();
+    let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
+
+    let pub_note =
+        compose_note(&a, &utxos(), "public hello", false, [1, 0, 0, 0], 80, 1.0, || Ok(AUX))
+            .unwrap();
+    let priv_note =
+        compose_note(&a, &utxos(), "secret plans", true, [2, 0, 0, 0], 80, 1.0, || Ok(AUX))
+            .unwrap();
+    let sent_priv = compose_directed_note(
+        &a, &utxos(), "for bob only", true, [3, 0, 0, 0], &to_b, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+    let from_b = compose_directed_note(
+        &b, &utxos(), "hi alice", false, [4, 0, 0, 0], &Recipient::parse(NET, &a.address(NET)).unwrap(), 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+
+    // A's address history as the companion would bundle it.
+    let mut bundle = bundle_from_txs(&[
+        (&pub_note, true, Some(100)),
+        (&priv_note, true, Some(101)),
+        (&sent_priv, true, Some(102)),
+        (&from_b, false, Some(103)),
+    ]);
+    bundle.notes_onchain[2].recipient = Some(b.address(NET));
+    bundle.notes_onchain[3].pays_self = true;
+    bundle.notes_onchain[3].sender = Some(b.address(NET));
+
+    let keyed = extract_notes(&bundle, &a, NET);
+    let watch = extract_notes_watch(&bundle, NET);
+    assert_eq!(keyed.len(), 4);
+    assert_eq!(watch.len(), keyed.len());
+    for (w, k) in watch.iter().zip(&keyed) {
+        assert_eq!(w.note_id, k.note_id);
+        assert_eq!(w.txids, k.txids);
+        assert_eq!(w.height, k.height);
+        assert_eq!(w.private, k.private);
+        assert_eq!(w.directed, k.directed);
+        assert_eq!(w.received, k.received);
+        assert_eq!(w.sender, k.sender);
+        assert_eq!(w.recipient, k.recipient);
+        // The one permitted difference: private bodies never decrypt.
+        if k.private {
+            assert!(w.text.is_none(), "watch scan must not decrypt {:02x?}", w.note_id);
+        } else {
+            assert_eq!(w.text, k.text);
+        }
+    }
+    // The keyed scan DID read the private ones — the comparison is real.
+    assert_eq!(keyed[1].text.as_deref(), Some("secret plans"));
+    assert_eq!(keyed[2].text.as_deref(), Some("for bob only"));
 }
 
 /// A → B, private: B decrypts via reciprocal ECDH; A re-derives the key
