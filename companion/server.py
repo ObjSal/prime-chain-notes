@@ -212,6 +212,16 @@ def handle_api(handler, method, path, query, body):
         chain_only = len(parts) >= 7 and parts[6] == "chain"
         after = query.get("after_txid", [None])[0]
         txs = [esplora_tx(t, tip) for t in txids]
+        # The watch wallet is SHARED across every address ever queried, so
+        # listtransactions returns other addresses' txs too — keep only txs
+        # that actually touch this address (an input prevout or an output),
+        # like real esplora. Without this, gap-limit descriptor scans never
+        # find an unused address and walk forever.
+        txs = [
+            t for t in txs
+            if any((v.get("prevout") or {}).get("scriptpubkey_address") == address for v in t["vin"])
+            or any(o.get("scriptpubkey_address") == address for o in t["vout"])
+        ]
         if chain_only:
             txs = [t for t in txs if t["status"]["confirmed"]]
         if after:
