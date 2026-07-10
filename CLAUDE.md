@@ -109,8 +109,32 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
   in the chain-notes-app peer.)
 - Screens: 0 home · 1 notes · 2 note view · 3 compose · 4 confirm ·
   5 sync (ACTIONS only: import/export/scan + status) · 6 settings
-  (network + chunk picker) · 7 contacts (send-to picker) — actions and
-  preferences deliberately split.
+  (network + chunk picker + Coins / "Sweep funds…" row) · 7 contacts
+  (send-to picker) · 8 "Signed" hand-off (external-PSBT result AND the
+  sweep flow's exit: summary + broadcast QR + Done → home;
+  `SignPsbt.back-screen` picks where Back goes) · 9 coins (viewer-first:
+  the UTXO ledger, ONE "Consolidate into one coin…" button on top,
+  disabled under 2 coins) · 10 sweep/consolidate (compose-like, shared
+  via `Sweep.kind`: destination line, fee-tier pills with the
+  collapse-on-Custom rate field, read-only "Inputs · N coins · T sats
+  (all)" summary, live cost line, Continue → confirm dialog → sign) —
+  actions and preferences deliberately split.
+- Sweep/consolidate (mirrors the chain-notes-app UX, minus anything
+  external-wallet — a Prime holds its own keys, so NO "pay fee from
+  another wallet" option exists here by design): sweep is reached from
+  Settings → "Sweep funds…" through the contacts picker in
+  `Contacts.pick-mode == "sweep"` (header "Sweep to", NO "To: Self" card
+  — sweep-to-self IS consolidate, which lives on the Coins screen);
+  consolidate = the same screen 10 with dest = self
+  (`p2tr_script_pubkey(output_x)`). Both spend ALL spendable coins by
+  design (`build_sweep_tx`; `estimate_sweep_vsize` keeps the preview
+  byte-exact by construction — additive notes-core API). Signing updates
+  the ledger (inputs out; a consolidate's single output comes back at
+  vout 0, unconfirmed chaining works — the e2e sweeps an unconfirmed
+  consolidated coin), exports `<txid>.hex` to internal + Airlock outbox,
+  and hands off on screen 8. Sweeps are NOT tracked as notes/records —
+  the outbox file persists, and the next bundle import resyncs the
+  ledger wholesale either way.
 - Contacts (screen 7): home's "Compose note" opens the picker first —
   manual address input (Use), the prominent "To: Self" row, "Scan address
   QR" (system scanner; payload normalized: `bitcoin:` prefix + `?query`
@@ -167,7 +191,12 @@ src=scan-<kind> … ok` · `cb: scan-bundle cancelled | err=<e>` ·
 `cb: refresh-contacts n=<n>` ·
 `cb: pick-contact to=<addr|self> | err=<e>` ·
 `cb: scan-contact ok addr=<a> | cancelled | err=<e>` ·
-`cb: save-contact addr=<a> name-len=<n>`
+`cb: save-contact addr=<a> name-len=<n>` ·
+`cb: refresh-coins n=<n> total=<sats>` ·
+`cb: sweep-open kind=<sweep|consolidate> to=<addr|self>` ·
+`cb: sweep kind=<k> to=<addr|self> inputs=<n> amount=<recv> fee=<f>
+vsize=<v> txid=<t> ok | err=<e>` ·
+`cb: sign-sweep kind=<k> txid=<t> fee=<f> internal=<ok|err> airlock=<ok|err>`
 
 ## Build / test
 

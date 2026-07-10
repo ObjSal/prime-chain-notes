@@ -1,8 +1,8 @@
 import { Theme, UISize, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize } from "@ui/theme.slint";
-import { Callbacks, Ui, Home, Compose, Confirm, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow } from "callbacks.slint";
+import { Callbacks, Ui, Home, Compose, Confirm, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep } from "callbacks.slint";
 import { Button } from "@ui/button.slint";
 
-export { Callbacks, Ui, Home, Compose, Confirm, Notes, View, Sync, SignPsbt, Settings, Contacts, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
+export { Callbacks, Ui, Home, Compose, Confirm, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
 
 component PrimaryAction inherits Button {
     background: Theme.palette-primary;
@@ -327,6 +327,7 @@ export component AppWindow inherits Window {
                 text: "Compose note";
                 disabled: Home.address == "";
                 clicked => {
+                    Contacts.pick-mode = "compose";
                     Callbacks.refresh-contacts();
                     Ui.screen = 7;
                 }
@@ -815,7 +816,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "Signed";
-                back => { Ui.screen = 5; }
+                back => { Ui.screen = SignPsbt.back-screen; }
             }
             Text {
                 text: SignPsbt.summary;
@@ -841,7 +842,7 @@ export component AppWindow inherits Window {
                 }
             }
             Text {
-                text: "Scan this with the desktop app to broadcast. Also saved to /chain-notes/outbox.";
+                text: "Scan this with the companion or desktop app to broadcast. Also saved to /chain-notes/outbox.";
                 color: Theme.palette-muted;
                 font-family: "SourceCodePro";
                 font-size: 13px;
@@ -853,6 +854,225 @@ export component AppWindow inherits Window {
                 text: "Done";
                 clicked => { Callbacks.refresh-home(); Ui.screen = 0; }
             }
+        }
+
+        // ------------------------------------ screen 9: coins (viewer-first)
+        // The UTXO ledger as of the last sync bundle. ONE action — the
+        // consolidate button on top — opens the shared sweep screen (10).
+        if Ui.screen == 9: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 12px;
+
+            ScreenHeader {
+                title: "Coins";
+                back => { Ui.screen = 6; }
+            }
+
+            Text {
+                text: Coins.summary;
+                color: Theme.palette-foreground;
+                font-family: "Montserrat";
+                font-size: 17px;
+                font-weight: 600;
+            }
+
+            PrimaryAction {
+                width: 100%;
+                text: "Consolidate into one coin…";
+                disabled: !Coins.can-consolidate;
+                clicked => { Callbacks.consolidate-open(); }
+            }
+
+            if !Coins.can-consolidate: Text {
+                text: Coins.rows.length == 0
+                    ? "No spendable coins — fund the address and import a sync bundle."
+                    : "Nothing to consolidate — you already have a single coin.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+
+            Flickable {
+                vertical-stretch: 1;
+                viewport-height: Coins.rows.length * 72px;
+                VerticalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    for coin in Coins.rows: Rectangle {
+                        height: 64px;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: Theme.palette-border;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 4px;
+                            Text {
+                                text: coin.label;
+                                color: Theme.palette-foreground;
+                                font-family: "Montserrat";
+                                font-size: 18px;
+                                font-weight: 600;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: coin.meta;
+                                color: Theme.palette-muted;
+                                font-family: "SourceCodePro";
+                                font-size: 13px;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------- screen 10: sweep / consolidate (compose-like)
+        // Shared flow: destination line (picker- or self-set), fee tiers with
+        // the collapse-on-Custom rate field, read-only inputs summary, live
+        // cost line. A sweep spends ALL coins by design — no coin picking.
+        if Ui.screen == 10: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 8px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 10px;
+
+            ScreenHeader {
+                vertical-stretch: 0;
+                title: Sweep.kind == "consolidate" ? "Consolidate" : "Sweep";
+                // Sweep: back to the destination picker (still in sweep
+                // mode); consolidate: back to the coins list.
+                back => {
+                    if Sweep.kind == "consolidate" {
+                        Callbacks.refresh-coins();
+                        Ui.screen = 9;
+                    } else {
+                        Callbacks.refresh-contacts();
+                        Ui.screen = 7;
+                    }
+                }
+            }
+
+            Text {
+                vertical-stretch: 0;
+                text: Sweep.dest-label;
+                color: Theme.palette-muted;
+                font-family: "SourceCodePro";
+                font-size: 14px;
+                overflow: elide;
+            }
+
+            HorizontalLayout {
+                vertical-stretch: 0;
+                spacing: 6px;
+                PillOption {
+                    label: "Economy";
+                    selected: Sweep.tier == 0;
+                    horizontal-stretch: 1;
+                    tapped => { Sweep.tier = 0; Callbacks.sweep-changed(); }
+                }
+                PillOption {
+                    label: "Normal";
+                    selected: Sweep.tier == 1;
+                    horizontal-stretch: 1;
+                    tapped => { Sweep.tier = 1; Callbacks.sweep-changed(); }
+                }
+                PillOption {
+                    label: "Fast";
+                    selected: Sweep.tier == 2;
+                    horizontal-stretch: 1;
+                    tapped => { Sweep.tier = 2; Callbacks.sweep-changed(); }
+                }
+                PillOption {
+                    label: "Custom";
+                    selected: Sweep.tier == 3;
+                    horizontal-stretch: 1;
+                    tapped => { Sweep.tier = 3; Callbacks.sweep-changed(); }
+                }
+            }
+
+            if Sweep.tier == 3: HorizontalLayout {
+                vertical-stretch: 0;
+                spacing: 8px;
+                Rectangle {
+                    height: 44px;
+                    horizontal-stretch: 1;
+                    background: Theme.palette-surface;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: sweep-rate-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                    clip: true;
+                    sweep-rate-input := TextInput {
+                        x: 14px;
+                        width: parent.width - 28px;
+                        height: 24px;
+                        y: (parent.height - self.height) / 2;
+                        text <=> Sweep.rate-text;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 18px;
+                        single-line: true;
+                        edited => { Callbacks.sweep-changed(); }
+                        accepted => { self.clear-focus(); }
+                    }
+                }
+                Text {
+                    text: "sat/vB";
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 16px;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Read-only inputs summary — a sweep always spends every coin.
+            Rectangle {
+                vertical-stretch: 0;
+                border-radius: 12px;
+                background: Theme.palette-surface;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                height: 42px;
+                Text {
+                    x: 14px;
+                    width: parent.width - 28px;
+                    height: parent.height;
+                    text: Sweep.inputs-line;
+                    color: Theme.palette-muted;
+                    font-family: "SourceCodePro";
+                    font-size: 14px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+            Text {
+                vertical-stretch: 0;
+                text: Sweep.cost-line;
+                color: Theme.palette-muted;
+                font-family: "SourceCodePro";
+                font-size: 14px;
+                wrap: word-wrap;
+            }
+
+            PrimaryAction {
+                vertical-stretch: 0;
+                width: 100%;
+                text: "Continue";
+                disabled: !Sweep.can-continue;
+                clicked => { Callbacks.sweep-continue(); }
+            }
+
+            Rectangle { vertical-stretch: 1; }
         }
 
         // -------------------------------------------- screen 6: settings
@@ -874,6 +1094,30 @@ export component AppWindow inherits Window {
                 width: 100%;
                 text: "Network: " + Home.network;
                 clicked => { Callbacks.cycle-network(); }
+            }
+
+            // Funds — viewer-first Coins (consolidate lives there) and the
+            // sweep flow (destination picked first, compose-like screen).
+            HorizontalLayout {
+                spacing: 8px;
+                SecondaryAction {
+                    horizontal-stretch: 1;
+                    text: "Coins";
+                    clicked => {
+                        Callbacks.refresh-coins();
+                        Ui.screen = 9;
+                    }
+                }
+                SecondaryAction {
+                    horizontal-stretch: 1;
+                    text: "Sweep funds…";
+                    disabled: Home.address == "";
+                    clicked => {
+                        Contacts.pick-mode = "sweep";
+                        Callbacks.refresh-contacts();
+                        Ui.screen = 7;
+                    }
+                }
             }
 
             Text {
@@ -965,14 +1209,23 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 vertical-stretch: 0;
-                title: "Send to";
-                back => { Callbacks.refresh-home(); Ui.screen = 0; }
+                title: Contacts.pick-mode == "sweep" ? "Sweep to" : "Send to";
+                back => {
+                    if Contacts.pick-mode == "sweep" {
+                        Contacts.pick-mode = "compose";
+                        Ui.screen = 6;
+                    } else {
+                        Callbacks.refresh-home();
+                        Ui.screen = 0;
+                    }
+                }
             }
 
             Text {
                 vertical-stretch: 0;
                 height: 18px;
-                text: Contacts.input-error != "" ? Contacts.input-error : "Recipient address";
+                text: Contacts.input-error != "" ? Contacts.input-error
+                    : Contacts.pick-mode == "sweep" ? "Destination address" : "Recipient address";
                 color: Contacts.input-error != "" ? Theme.palette-danger : Theme.palette-muted;
                 font-family: "Montserrat";
                 font-size: 14px;
@@ -1025,7 +1278,9 @@ export component AppWindow inherits Window {
             }
 
             // First and handiest option: the classic self-notebook note.
-            Rectangle {
+            // Hidden in sweep mode — sweep-to-self is the Coins screen's
+            // consolidate, not a picker choice.
+            if Contacts.pick-mode != "sweep": Rectangle {
                 vertical-stretch: 0;
                 height: 56px;
                 border-radius: 12px;
@@ -1216,6 +1471,57 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                             text: "Switch to Standard";
                             clicked => { Callbacks.oversize-bump(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sweep/consolidate confirm dialog — modal over screen 10, nested in
+        // root (sibling-app overlay gotcha). Anchored near the top like the
+        // other dialogs; the tx is already built + signed at this point.
+        if Sweep.show-confirm: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #00000088;
+            TouchArea { }   // swallow taps outside the panel
+            Rectangle {
+                x: 24px;
+                y: 90px + UISize.control-center-status-bar-height;
+                width: parent.width - 48px;
+                height: sweep-confirm-panel.preferred-height;
+                background: Theme.palette-surface;
+                border-radius: 16px;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                sweep-confirm-panel := VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    Text {
+                        text: Sweep.kind == "consolidate" ? "Consolidate coins?" : "Sweep funds?";
+                        color: Theme.palette-foreground;
+                        font-family: "Montserrat";
+                        font-size: 16px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: Sweep.confirm-summary;
+                        color: Theme.palette-muted;
+                        font-family: "SourceCodePro";
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        SecondaryAction {
+                            horizontal-stretch: 1;
+                            text: "Cancel";
+                            clicked => { Sweep.show-confirm = false; }
+                        }
+                        PrimaryAction {
+                            horizontal-stretch: 1;
+                            text: "Sign & export";
+                            clicked => { Callbacks.sweep-sign(); }
                         }
                     }
                 }

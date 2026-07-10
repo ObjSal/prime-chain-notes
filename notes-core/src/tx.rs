@@ -227,9 +227,25 @@ pub struct NoteTx {
     pub spent_outpoints: Vec<([u8; 32], u32)>,
 }
 
+/// Predicted vsize of a sweep tx BEFORE it exists: `n_inputs` key-path
+/// P2TR inputs into a single output of `dest_spk_len` script bytes.
+/// Byte-exact vs `build_sweep_tx` by construction — it is the same
+/// arithmetic that function prices its fee with.
+pub fn estimate_sweep_vsize(n_inputs: usize, dest_spk_len: usize) -> usize {
+    let base = 4
+        + varint_len(n_inputs)
+        + n_inputs * 41
+        + 1
+        + (8 + varint_len(dest_spk_len) + dest_spk_len)
+        + 4;
+    let witness = 2 + n_inputs * 66;
+    (base * 4 + witness).div_ceil(4)
+}
+
 /// Build and sign a sweep: spend ALL `available` UTXOs (ours, key-path)
 /// into a single external output `dest_spk`, everything minus fee. Used to
-/// move funds off the notes address (e.g. returning testnet coins).
+/// move funds off the notes address (e.g. returning testnet coins) and,
+/// with `dest_spk` = our own address, to consolidate coins into one.
 pub fn build_sweep_tx(
     available: &[Utxo],
     our_output_x: &[u8; 32],
@@ -241,11 +257,8 @@ pub fn build_sweep_tx(
     if available.is_empty() {
         return Err(Error::InsufficientFunds);
     }
-    let n = available.len();
     let in_value: u64 = available.iter().map(|u| u.value).sum();
-    let base = 4 + varint_len(n) + n * 41 + 1 + (8 + varint_len(dest_spk.len()) + dest_spk.len()) + 4;
-    let witness = 2 + n * 66;
-    let vsize = (base * 4 + witness).div_ceil(4);
+    let vsize = estimate_sweep_vsize(available.len(), dest_spk.len());
     let fee = (vsize as f64 * fee_rate).ceil() as u64;
     if in_value <= fee || in_value - fee < DUST_LIMIT {
         return Err(Error::InsufficientFunds);
