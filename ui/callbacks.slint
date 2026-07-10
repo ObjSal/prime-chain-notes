@@ -1,7 +1,9 @@
 // Globals shared between Rust and the UI. Screen map:
 // 0 = home, 1 = notes list, 2 = note view, 3 = compose, 4 = confirm-sign,
 // 5 = sync (actions: import/export), 6 = settings (network, chunk size),
-// 7 = contacts (send-to picker: self / recents / scan / manual entry).
+// 7 = contacts (send-to picker: self / recents / scan / manual entry),
+// 8 = signed external PSBT, 9 = coins (viewer-first UTXO list),
+// 10 = sweep/consolidate (compose-like, shared via Sweep.kind).
 
 export global Ui {
     in-out property <int> screen: 0;
@@ -70,6 +72,11 @@ export struct ContactRow {
 }
 
 export global Contacts {
+    // What a pick feeds: "compose" (default) sets the compose recipient;
+    // "sweep" sets the sweep destination (the "To: Self" card is hidden —
+    // sweep-to-self is the Coins screen's consolidate). Set by the screen
+    // that opens the picker.
+    in-out property <string> pick-mode: "compose";
     // Recency order, front = most recently used (no clock on-device).
     in-out property <[ContactRow]> rows;
     // Manual address entry.
@@ -101,11 +108,45 @@ export global Sync {
 }
 
 // Signing an external transaction (PSBT) for a wallet whose coins fund a note
-// composed on the desktop peer. Screen 8.
+// composed on the desktop peer — and the shared "Signed" hand-off screen the
+// sweep/consolidate flow reuses (summary + broadcast QR + Done). Screen 8.
 export global SignPsbt {
     in-out property <string> summary: "";
     in-out property <image> qr;
     in-out property <bool> has-qr: false;
+    // Where Back returns to: 5 (sync) for external PSBTs, 0 (home) after a
+    // sweep/consolidate — money flows return home.
+    in-out property <int> back-screen: 5;
+}
+
+export struct CoinRow {
+    label: string,    // "12345 sats"
+    meta: string,     // "txid ab12cd34…9f · output 0"
+}
+
+// Screen 9 — viewer-first coins list: the UTXO ledger as of the last sync
+// bundle, with ONE action (consolidate) opening the shared sweep screen.
+export global Coins {
+    in-out property <[CoinRow]> rows;
+    in-out property <string> summary: "";   // "3 coins · 45000 sats"
+    in-out property <bool> can-consolidate: false; // 2+ coins
+}
+
+// Screen 10 — compose-like sweep/consolidate flow, shared via `kind`.
+// Destination comes from the picker (sweep) or is self (consolidate);
+// the screen itself has no address editing, like compose.
+export global Sweep {
+    in-out property <string> kind: "sweep";  // "sweep" | "consolidate"
+    in-out property <string> dest: "";       // "" = self (consolidate)
+    in-out property <string> dest-label: "";
+    in-out property <int> tier: 1;           // 0 economy · 1 normal · 2 fast · 3 custom
+    in-out property <string> rate-text: "";
+    in-out property <string> inputs-line: ""; // "Inputs · 3 coins · 45000 sats (all)"
+    in-out property <string> cost-line: "";
+    in-out property <bool> can-continue: false;
+    // Confirm dialog (modal over screen 10): summary + Sign & export.
+    in-out property <bool> show-confirm: false;
+    in-out property <string> confirm-summary: "";
 }
 
 export global Settings {
@@ -139,4 +180,9 @@ export global Callbacks {
                                     // bump recency, set Compose.to-*, → screen 3
     callback scan-contact();        // system QR scanner → upsert (unnamed) + pick
     callback save-contact-name();   // reads Contacts.naming-address + input-text
+    callback refresh-coins();       // rebuild Coins.rows from the UTXO ledger
+    callback consolidate-open();    // Coins → sweep screen with kind=consolidate
+    callback sweep-changed();       // tier pill / custom rate edited → reprice
+    callback sweep-continue();      // build + sign, then the confirm dialog
+    callback sweep-sign();          // persist ledger + export + QR → screen 8
 }

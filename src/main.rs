@@ -9,8 +9,9 @@ use notes_core::bundle::{
     compose_directed_note_with_change_amount, compose_note, decode_scanned, estimate_note_cost,
     extract_notes, Identity, SyncBundle,
 };
+use notes_core::address::p2tr_script_pubkey;
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
-use notes_core::tx::{NoteTx, Utxo};
+use notes_core::tx::{build_sweep_tx, estimate_sweep_vsize, NoteTx, Utxo};
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
 use slint_keyos_platform::app_ui;
@@ -212,6 +213,13 @@ struct Plan {
     recipient: Option<String>,
 }
 
+/// A built-and-signed sweep/consolidate waiting for user confirmation.
+struct SweepPlan {
+    tx: NoteTx,
+    kind: &'static str,      // "sweep" | "consolidate"
+    dest: Option<String>,    // None = self (consolidate)
+}
+
 // ------------------------------------------------------------- helpers
 
 fn load_state(fs: &Fs) -> State {
@@ -390,6 +398,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     let state = Rc::new(RefCell::new(load_state(&fs)));
     let plan: Rc<RefCell<Option<Plan>>> = Rc::new(RefCell::new(None));
+    let sweep_plan: Rc<RefCell<Option<SweepPlan>>> = Rc::new(RefCell::new(None));
 
     // Identity from GetAppSeed — PIN-gated on hardware. Everything (address,
     // signing key, encryption key) re-derives from the device seed backup.
@@ -519,6 +528,105 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         }
     };
 
+    // Coins screen (9): the UTXO ledger as of the last sync bundle, biggest
+    // first. Viewer-first — consolidate is the screen's single action.
+    let refresh_coins = {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let st = state.borrow();
+            let mut recs: Vec<&UtxoRec> = st.utxos.iter().collect();
+            recs.sort_by_key(|u| std::cmp::Reverse(u.value));
+            let rows: Vec<CoinRow> = recs
+                .iter()
+                .map(|u| CoinRow {
+                    label: format!("{} sats", u.value).into(),
+                    meta: format!("txid {} · output {}", short_addr(&u.txid), u.vout).into(),
+                })
+                .collect();
+            let coins = ui.global::<Coins>();
+            coins.set_summary(
+                format!("{} coin(s) · {}", rows.len(), sats_line(st.balance(), st.btc_usd)).into(),
+            );
+            coins.set_can_consolidate(rows.len() >= 2);
+            log::info!("cb: refresh-coins n={} total={}", rows.len(), st.balance());
+            coins.set_rows(Rc::new(VecModel::from(rows)).into());
+        }
+    };
+
+    // Sweep screen (10) repricing — every tier tap / rate keystroke. Pure
+    // arithmetic (estimate_sweep_vsize is byte-exact vs build_sweep_tx).
+    let update_sweep = {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let sweep = ui.global::<Sweep>();
+            let st = state.borrow();
+            let tier = sweep.get_tier();
+            if tier != 3 {
+                sweep.set_rate_text(format!("{}", st.fee_rate(tier)).into());
+            }
+            let n = st.utxos.len();
+            let total = st.balance();
+            sweep.set_inputs_line(format!("Inputs · {n} coin(s) · {total} sats (all)").into());
+            if n == 0 {
+                sweep.set_cost_line("Nothing to sweep — no spendable coins.".into());
+                sweep.set_can_continue(false);
+                return;
+            }
+            let rate = match resolve_rate(tier, sweep.get_rate_text().as_str(), &st) {
+                Ok(r) => r,
+                Err(e) => {
+                    sweep.set_cost_line(e.into());
+                    sweep.set_can_continue(false);
+                    return;
+                }
+            };
+            let consolidate = sweep.get_kind() == "consolidate";
+            let dest_spk_len = if consolidate {
+                34 // our own P2TR
+            } else {
+                match Recipient::parse(st.network(), sweep.get_dest().as_str()) {
+                    Ok(r) => r.spk.len(),
+                    Err(_) => {
+                        sweep.set_cost_line(
+                            format!("Destination is not a valid {} address.", st.network).into(),
+                        );
+                        sweep.set_can_continue(false);
+                        return;
+                    }
+                }
+            };
+            let vsize = estimate_sweep_vsize(n, dest_spk_len);
+            let fee = (vsize as f64 * rate).ceil() as u64;
+            if total <= fee || total - fee < notes_core::DUST_LIMIT {
+                sweep.set_cost_line(
+                    format!("Balance {total} sats can't cover the ~{fee} sat fee.").into(),
+                );
+                sweep.set_can_continue(false);
+                return;
+            }
+            let recv = total - fee;
+            sweep.set_cost_line(
+                if consolidate {
+                    format!(
+                        "Consolidates {n} coins into one · ~{vsize} vB · fee ~{} @ {rate} sat/vB · keeps {recv} sats",
+                        sats_line(fee, st.btc_usd)
+                    )
+                } else {
+                    format!(
+                        "Sweeps {total} sats · ~{vsize} vB · fee ~{} @ {rate} sat/vB · destination receives {recv} sats",
+                        sats_line(fee, st.btc_usd)
+                    )
+                }
+                .into(),
+            );
+            sweep.set_can_continue(true);
+        }
+    };
+
     // The single pick funnel (self row / recent row / manual entry / scan):
     // validates, bumps recency, sets the compose recipient + label, and
     // navigates. Invalid manual input stays on the picker with an error.
@@ -526,12 +634,19 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let fs = fs.clone();
+        let update_sweep = update_sweep.clone();
         move |addr_raw: &str| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let addr = addr_raw.trim().to_string();
             let contacts_g = ui.global::<Contacts>();
+            let sweep_mode = contacts_g.get_pick_mode() == "sweep";
             let compose = ui.global::<Compose>();
             if addr.is_empty() {
+                // Self: compose only — the sweep picker hides the Self card
+                // (sweep-to-self is the Coins screen's consolidate).
+                if sweep_mode {
+                    return;
+                }
                 compose.set_to_address("".into());
                 compose.set_to_label("to: self — my notebook".into());
                 log::info!("cb: pick-contact to=self");
@@ -545,15 +660,29 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 }
                 upsert_contact(&mut st, &addr);
                 save_state(&fs, &st);
-                compose.set_to_address(addr.as_str().into());
-                compose.set_to_label(to_label_for(&st, &addr).into());
-                log::info!("cb: pick-contact to={addr}");
+                if sweep_mode {
+                    let sweep = ui.global::<Sweep>();
+                    sweep.set_kind("sweep".into());
+                    sweep.set_dest(addr.as_str().into());
+                    sweep.set_dest_label(to_label_for(&st, &addr).into());
+                    sweep.set_tier(1);
+                    log::info!("cb: sweep-open kind=sweep to={addr}");
+                } else {
+                    compose.set_to_address(addr.as_str().into());
+                    compose.set_to_label(to_label_for(&st, &addr).into());
+                    log::info!("cb: pick-contact to={addr}");
+                }
             }
             contacts_g.set_input_text("".into());
             contacts_g.set_input_error("".into());
             contacts_g.set_naming_address("".into());
-            ui.global::<Callbacks>().invoke_compose_changed();
-            ui.global::<Ui>().set_screen(3);
+            if sweep_mode {
+                update_sweep();
+                ui.global::<Ui>().set_screen(10);
+            } else {
+                ui.global::<Callbacks>().invoke_compose_changed();
+                ui.global::<Ui>().set_screen(3);
+            }
         }
     };
 
@@ -645,6 +774,224 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             contacts_g.set_naming_address("".into());
             contacts_g.set_name_text("".into());
             refresh_contacts();
+        });
+    }
+
+    {
+        let refresh_coins = refresh_coins.clone();
+        ui.global::<Callbacks>().on_refresh_coins(move || refresh_coins());
+    }
+
+    // Coins → the shared sweep screen with kind=consolidate, dest=self.
+    {
+        let ui_weak = ui_weak.clone();
+        let update_sweep = update_sweep.clone();
+        ui.global::<Callbacks>().on_consolidate_open(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let sweep = ui.global::<Sweep>();
+            sweep.set_kind("consolidate".into());
+            sweep.set_dest("".into());
+            sweep.set_dest_label("to: self — one consolidated coin".into());
+            sweep.set_tier(1);
+            log::info!("cb: sweep-open kind=consolidate to=self");
+            update_sweep();
+            ui.global::<Ui>().set_screen(10);
+        });
+    }
+
+    {
+        let update_sweep = update_sweep.clone();
+        ui.global::<Callbacks>().on_sweep_changed(move || update_sweep());
+    }
+
+    // Build + sign the sweep (ALL coins, key-path), then the confirm dialog.
+    {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let identity = identity.clone();
+        let sweep_plan = sweep_plan.clone();
+        ui.global::<Callbacks>().on_sweep_continue(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            ui.global::<Ui>().set_busy(true);
+            let ui_weak = ui_weak.clone();
+            let state = state.clone();
+            let identity = identity.clone();
+            let sweep_plan = sweep_plan.clone();
+            // Let the busy overlay paint one frame before the blocking work.
+            Timer::single_shot(Duration::from_millis(150), move || {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                let sweep = ui.global::<Sweep>();
+                let consolidate = sweep.get_kind() == "consolidate";
+                let kind = if consolidate { "consolidate" } else { "sweep" };
+                let dest = sweep.get_dest().trim().to_string();
+                let tier = sweep.get_tier();
+                let rate_text = sweep.get_rate_text().to_string();
+                let st = state.borrow();
+                let result = identity
+                    .as_ref()
+                    .as_ref()
+                    .ok_or_else(|| "identity unavailable".to_string())
+                    .and_then(|id| {
+                        let rate = resolve_rate(tier, &rate_text, &st)?;
+                        let dest_spk = if consolidate {
+                            p2tr_script_pubkey(&id.output_x)
+                        } else {
+                            Recipient::parse(st.network(), &dest).map_err(|e| e.to_string())?.spk
+                        };
+                        build_sweep_tx(
+                            &st.core_utxos(),
+                            &id.output_x,
+                            dest_spk,
+                            rate,
+                            &id.tweaked_seckey,
+                            || generate_aux_rand(),
+                        )
+                        .map_err(|e| e.to_string())
+                    });
+                ui.global::<Ui>().set_busy(false);
+                match result {
+                    Ok(tx) => {
+                        let total: u64 = st.balance();
+                        let recv = tx.tx.outputs[0].value;
+                        log::info!(
+                            "cb: sweep kind={kind} to={} inputs={} amount={recv} fee={} vsize={} txid={} ok",
+                            if consolidate { "self" } else { dest.as_str() },
+                            tx.tx.inputs.len(),
+                            tx.fee,
+                            tx.vsize,
+                            tx.txid_hex
+                        );
+                        sweep.set_confirm_summary(
+                            format!(
+                                "{}\n\ninputs: {} coin(s) · {total} sats\nfee: {}\n{}: {recv} sats\n\ntxid:\n{}",
+                                if consolidate {
+                                    "Consolidates every coin into one — back to your own address."
+                                } else {
+                                    "Sweeps EVERYTHING to the destination — this empties the notes address."
+                                },
+                                tx.tx.inputs.len(),
+                                sats_line(tx.fee, st.btc_usd),
+                                if consolidate { "new coin" } else { "destination receives" },
+                                tx.txid_hex
+                            )
+                            .into(),
+                        );
+                        *sweep_plan.borrow_mut() = Some(SweepPlan {
+                            tx,
+                            kind: if consolidate { "consolidate" } else { "sweep" },
+                            dest: (!consolidate).then(|| dest.clone()),
+                        });
+                        sweep.set_show_confirm(true);
+                    }
+                    Err(e) => {
+                        log::warn!("cb: sweep kind={kind} err={e}");
+                        sweep.set_cost_line(format!("Cannot build: {e}").into());
+                    }
+                }
+            });
+        });
+    }
+
+    // Confirmed: persist the ledger effect, export the signed tx (internal +
+    // Airlock outbox), and hand off on the shared "Signed" screen (8) with
+    // the broadcast QR. Money flows return home from there.
+    {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let sweep_plan = sweep_plan.clone();
+        let fs = fs.clone();
+        let refresh_home = refresh_home.clone();
+        ui.global::<Callbacks>().on_sweep_sign(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let Some(p) = sweep_plan.borrow_mut().take() else { return };
+            ui.global::<Ui>().set_busy(true);
+            let ui_weak = ui_weak.clone();
+            let state = state.clone();
+            let fs = fs.clone();
+            let refresh_home = refresh_home.clone();
+            Timer::single_shot(Duration::from_millis(150), move || {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                let mut st = state.borrow_mut();
+
+                // Ledger: every input is spent; a consolidate's single
+                // output comes straight back as our own (unconfirmed) coin.
+                let spent: Vec<(String, u32)> = p
+                    .tx
+                    .spent_outpoints
+                    .iter()
+                    .map(|(txid, vout)| {
+                        let mut t = *txid;
+                        t.reverse();
+                        (hex::encode(t), *vout)
+                    })
+                    .collect();
+                let inputs = spent.len();
+                st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                let recv = p.tx.tx.outputs[0].value;
+                if p.kind == "consolidate" {
+                    st.utxos.push(UtxoRec { txid: p.tx.txid_hex.clone(), vout: 0, value: recv });
+                }
+
+                let file = format!("{OUTBOX_DIR}/{}.hex", p.tx.txid_hex);
+                let internal = ensure_dir(&fs, OUTBOX_DIR, Location::User)
+                    .and_then(|_| write_file(&fs, &file, Location::User, p.tx.raw_hex.as_bytes()));
+                let airlock = ensure_airlock_mounted(&fs).and_then(|_| {
+                    let r = ensure_dir(&fs, OUTBOX_DIR, Location::Airlock).and_then(|_| {
+                        write_file(&fs, &file, Location::Airlock, p.tx.raw_hex.as_bytes())
+                    });
+                    unmount_airlock(&fs);
+                    r
+                });
+                save_state(&fs, &st);
+                log::info!(
+                    "cb: sign-sweep kind={} txid={} fee={} internal={} airlock={}",
+                    p.kind,
+                    p.tx.txid_hex,
+                    p.tx.fee,
+                    if internal.is_ok() { "ok" } else { "err" },
+                    if airlock.is_ok() { "ok" } else { "err" },
+                );
+                drop(st);
+
+                let sp = ui.global::<SignPsbt>();
+                sp.set_summary(
+                    format!(
+                        "{}\nfee {} sats · {} vB\ntxid: {}",
+                        match (p.kind, &p.dest) {
+                            ("consolidate", _) =>
+                                format!("Consolidated {inputs} coin(s) into one · {recv} sats"),
+                            (_, Some(d)) =>
+                                format!("Swept {inputs} coin(s) · {recv} sats to {}", short_addr(d)),
+                            _ => format!("Swept {inputs} coin(s) · {recv} sats"),
+                        },
+                        p.tx.fee,
+                        p.tx.vsize,
+                        p.tx.txid_hex
+                    )
+                    .into(),
+                );
+                if p.tx.raw_hex.len() <= MAX_QR_HEX_CHARS {
+                    sp.set_qr(qr_image(&p.tx.raw_hex.to_uppercase()));
+                    sp.set_has_qr(true);
+                } else {
+                    sp.set_has_qr(false);
+                }
+                sp.set_back_screen(0);
+
+                // Reset the sweep flow so nothing leaks into the next run.
+                let sweep = ui.global::<Sweep>();
+                sweep.set_show_confirm(false);
+                sweep.set_dest("".into());
+                sweep.set_dest_label("".into());
+                sweep.set_tier(1);
+                sweep.set_cost_line("".into());
+                sweep.set_can_continue(false);
+                ui.global::<Contacts>().set_pick_mode("compose".into());
+
+                ui.global::<Ui>().set_busy(false);
+                refresh_home();
+                ui.global::<Ui>().set_screen(8);
+            });
         });
     }
 
