@@ -219,6 +219,13 @@ def handle_api(handler, method, path, query, body):
             txs = txs[idx + 1:] if idx is not None else []
         return txs[:50 if not chain_only else PAGE_SIZE]
 
+    # /regtest/api/tx/{txid}[/hex] — single-tx lookup (esplora shape / raw hex),
+    # what the chain-notes-app watch-mode bump/rebroadcast path reads.
+    if method == "GET" and len(parts) >= 5 and parts[3] == "tx" and parts[4]:
+        if len(parts) >= 6 and parts[5] == "hex":
+            return cli("getrawtransaction", parts[4])
+        return esplora_tx(parts[4], tip_height())
+
     if method == "POST" and path == "/regtest/api/tx":
         raw_hex = body.decode().strip()
         accept = cli_json("testmempoolaccept", json.dumps([raw_hex]))[0]
