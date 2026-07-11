@@ -33,7 +33,7 @@ API = "https://mempool.space/testnet4/api"
 
 WIF = os.environ["TESTNET4_WIF"]
 FUND_ADDR = os.environ["TESTNET4_ADDRESS"]
-GIFT_DIR = Path(os.environ.get("GIFT_WALLET_DIR", "/Users/user/Projects/Gifts/bitcoin-gift-wallet"))
+GIFT_DIR = Path(os.environ.get("GIFT_WALLET_DIR", os.path.expanduser("~/Projects/Gifts/bitcoin-gift-wallet")))
 FUND_SATS = 10_000
 NOTE_TEXT = (
     "prime-chain-notes testnet4 verification: a single OP_RETURN well above the old 80-byte "

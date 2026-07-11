@@ -33,7 +33,7 @@ wasm-bindgen-test = "0.3.18"
 # the os TRNG server. Path adjusted from the in-tree ../../xous/xous-rs to
 # the installed SDK copy.
 [target.'cfg(keyos)'.dependencies]
-xous = { path = "/Users/user/.foundation/sdk/current/lib/keyos/xous/xous-rs" }
+xous = { path = "../../../keyos-sdk/lib/keyos/xous/xous-rs" }
 
 [features]
 # Implement std-only traits for getrandom::Error
