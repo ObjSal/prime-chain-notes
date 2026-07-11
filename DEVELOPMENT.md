@@ -61,6 +61,12 @@ python3 companion/server.py 8091 --regtest  # + managed local regtest node
 
 Playwright tests drive the real rendered page: `tests/test_companion_regtest.py` (hermetic, incl. a fake-camera scan), `tests/test_companion_qr.py` (bundle-QR round-trips cross-checked against foundation-ur) and `tests/test_companion_testnet4.py` (live), plus a no-network node unit test for the shared scan core (`node tests/test_chain_scan.js`).
 
+## Caveats
+
+- Every note costs a real transaction fee and lives on a public blockchain forever. Private notes hide content — not existence, size, or timing.
+- A directed note publicly and permanently links the sender and recipient addresses on-chain.
+- Experimental software that signs real spends: Foundation asks wallet-adjacent apps to pass their security review (hello@foundation.xyz) before mainnet use.
+
 ## About
 
 Scaffolded from `foundation new prime-chain-notes --template default-app`, then customized. Normally checked out as a git submodule of a `prime/` workspace; see **`CLAUDE.md`** for architecture detail, frozen protocol invariants, and the log contract, and **`NOTES.md`** for verified results and platform gotchas.

@@ -36,12 +36,6 @@ Compose a note on your Passport Prime, seal it with a key only your device seed 
 - **Read-only viewer** (`viewer.html`) — renders any address's on-chain notes in the browser: public notes as text, private ones as sealed placeholders. Decryption stays on the device by design.
 - **Note permalinks** (`note.html`) — share a link to a single note.
 
-## Honest caveats
-
-- Every note costs a real transaction fee and lives on a public blockchain forever. Private notes hide content — not existence, size, or timing.
-- A directed note publicly and permanently links the sender and recipient addresses on-chain.
-- Experimental software that signs real spends: Foundation asks wallet-adjacent apps to pass their security review (hello@foundation.xyz) before mainnet use.
-
 ## Get it running
 
 With the Foundation SDK installed, build and launch in the simulator with:
