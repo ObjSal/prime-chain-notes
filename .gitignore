@@ -1,5 +1,6 @@
 target/
 ui/ui
-resources
+resources/*
+!resources/icon.svg
 manifest.toml
 companion/tests/screenshots/
