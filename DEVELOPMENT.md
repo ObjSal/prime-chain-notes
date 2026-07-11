@@ -35,7 +35,7 @@ nix develop ~/.foundation/sdk/current --command foundation sim
 ../ui-automation/tests/chain-notes.sh    # full UI e2e (manages sim + bitcoind)
 ```
 
-Fresh clone: recreate the SDK links the repo intentionally doesn't track (`ln -s ~/.foundation/sdk/current/ui/ui ui/ui`, plus `resources/{fonts,images}` symlinks + copied `icons/` — see NOTES.md), and run `foundation sim` once to generate `manifest.toml`.
+Fresh clone: recreate the SDK links the repo intentionally doesn't track (`ln -s ~/.foundation/sdk/current ../keyos-sdk` — a sibling of this app directory that the Cargo manifests resolve the KeyOS SDK crates through — plus `ln -s ~/.foundation/sdk/current/ui/ui ui/ui` and the `resources/{fonts,images}` symlinks + copied `icons/`, see NOTES.md), and run `foundation sim` once to generate `manifest.toml`.
 
 ## What's verified
 

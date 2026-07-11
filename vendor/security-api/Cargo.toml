@@ -16,14 +16,14 @@ publish = false
 
 [dependencies]
 bip39 = "2.1"
-crypto = { path = "/Users/sal/.foundation/sdk/current/lib/keyos/api/crypto" }
+crypto = { path = "../../../keyos-sdk/lib/keyos/api/crypto" }
 log = "0.4.14"
 num-derive = "0.4.2"
 num-traits = "0.2.18"
 rkyv = { version = "0.8.13", default-features = false, features = ["std", "bytecheck"] }
-server = { path = "/Users/sal/.foundation/sdk/current/lib/keyos/server" }
+server = { path = "../../../keyos-sdk/lib/keyos/server" }
 thiserror = "1.0"
-xous = { path = "/Users/sal/.foundation/sdk/current/lib/keyos/xous/xous-rs" }
+xous = { path = "../../../keyos-sdk/lib/keyos/xous/xous-rs" }
 zeroize = { version = "1.8.1", default-features = false, features = ["zeroize_derive"] }
 
 [lints.rust]
