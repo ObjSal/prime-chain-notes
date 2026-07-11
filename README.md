@@ -171,3 +171,26 @@ bundles carry no relay policy.
 Design docs live in the workspace: `../PLAN-chain-notes.md` (this app) and
 `../FUTURE-chain-chat.md` (the address-to-address messaging sibling that
 reuses this core).
+
+## License & disclaimer
+
+Licensed under the GNU General Public License v3.0 or later — see [COPYING](COPYING). Sections 15–17 of that license disclaim all warranty and limit liability; the notes below restate that in plain language.
+
+This is experimental software and it has **not been independently audited**.
+It is provided **"as is", without warranty of any kind**, express or implied,
+including but not limited to the warranties of merchantability, fitness for a
+particular purpose, and non-infringement.
+
+**Use it at your own risk.** To the maximum extent permitted by law, in no
+event shall the authors, copyright holders, or contributors be liable for any
+claim, damages, or other liability — including, without limitation,
+**loss of bitcoin or other funds, loss of keys or seeds, or loss of data** — whether in an action of contract, tort, or
+otherwise, arising from, out of, or in connection with this software or its
+use.
+
+Nothing in this project is financial, investment, legal, or tax advice. You
+are solely responsible for verifying addresses, amounts, fees, and backups
+before moving funds, and for complying with the laws of your jurisdiction.
+Test on test networks, or with amounts you can afford to lose, first.
+
+Everything this app writes to the blockchain is **public and permanent** — including the transaction metadata around encrypted notes (addresses, timing, amounts). Notes cannot be edited or deleted once broadcast. Do not put anything on-chain you may later need gone.
