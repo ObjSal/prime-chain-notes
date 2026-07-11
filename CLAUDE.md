@@ -50,7 +50,12 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
   `identity/<attempt>`, `note-enc/v1`, `dm-enc/v1`, the PNTE envelope
   layout (flags bit0 private, bit1 directed), and the directed-note AAD
   `sender_x(32) || recipient_x(32) || note_id(4)`. Every confirmed note
-  depends on them. Directed-private key = HKDF(dm/v1,
+  depends on them. The **notebook** (indexed) derivations are FROZEN the
+  same way: `Identity::from_app_seed_indexed` — index 0 delegates to the
+  original rules byte-identically (pre-notebooks state IS notebook 0),
+  index ≥ 1 expands infos `identity/nb/<index_le32>/<attempt_le32>` and
+  `note-enc/nb/<index_le32>/v1` under the same salts (vectors pinned in
+  `tests/vectors.rs::notebook_derivation_vectors`). Directed-private key = HKDF(dm/v1,
   x(my_tweaked_seckey · lift_x(peer_output_x))) — symmetric both ways,
   frozen vector in `tests/vectors.rs`.
 - **Pure-Rust only on device** (no C under armv7a-unknown-xous-elf).

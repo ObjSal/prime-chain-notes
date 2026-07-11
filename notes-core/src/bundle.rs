@@ -7,7 +7,10 @@ use crate::address::{p2tr_x_of_address, taproot_address, Recipient};
 use crate::crypt;
 use crate::dm;
 use crate::envelope::{self, Chunk, FLAG_DIRECTED, FLAG_PRIVATE};
-use crate::keys::{derive_encryption_key, derive_identity_key, xonly_pubkey};
+use crate::keys::{
+    derive_encryption_key, derive_encryption_key_indexed, derive_identity_key,
+    derive_identity_key_indexed, xonly_pubkey,
+};
 use crate::taproot::{taproot_tweak_pubkey, taproot_tweak_seckey};
 use crate::tx::{build_note_tx_exact, build_note_tx_with_change, NoteTx, Utxo};
 use crate::{Error, Network};
@@ -31,6 +34,25 @@ impl Identity {
             output_x,
             tweaked_seckey,
             enc_key: derive_encryption_key(app_seed),
+        })
+    }
+
+    /// [`Self::from_app_seed`] for notebook `index` (the notebooks
+    /// feature): index 0 IS the original identity — byte-identical keys,
+    /// so pre-notebooks state migrates as notebook 0 — and each higher
+    /// index derives an independent address + enc key from the same app
+    /// seed (additive FROZEN rules in keys.rs). All notebooks re-derive
+    /// from the device seed backup.
+    pub fn from_app_seed_indexed(app_seed: &[u8; 32], index: u32) -> Result<Self, Error> {
+        let identity_key = derive_identity_key_indexed(app_seed, index);
+        let (internal_x, _) = xonly_pubkey(&identity_key)?;
+        let (output_x, _) = taproot_tweak_pubkey(&internal_x, None)?;
+        let tweaked_seckey = taproot_tweak_seckey(&identity_key, None)?;
+        Ok(Identity {
+            internal_x,
+            output_x,
+            tweaked_seckey,
+            enc_key: derive_encryption_key_indexed(app_seed, index),
         })
     }
 
