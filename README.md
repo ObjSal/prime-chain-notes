@@ -1,4 +1,4 @@
-# Chain Notes — a Passport Prime app
+# <img src="resources/icon.svg" alt="" width="42" align="top" /> Chain Notes — a Passport Prime app
 
 **Personal notes on the bitcoin blockchain**, from a device that has no
 network on purpose. Compose text on Foundation's **Passport Prime**
