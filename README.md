@@ -5,11 +5,11 @@
 Compose a note on your Passport Prime, seal it with a key only your device seed can re-derive — or leave it deliberately public — and the app builds and signs a real bitcoin transaction carrying the note. An online companion page broadcasts it and scans the chain; the device and the companion exchange nothing but files and QR codes. Your address history *is* the notebook: wipe the device, restore your seed, rescan the chain — every note comes back, private ones decrypted, with nothing stored anywhere else.
 
 <p align="center">
-  <img src="screenshots/cn5-home.png" alt="Home — address QR, balance, sync status" width="270">
+  <img src="screenshots/home.png" alt="Home — address QR, balance, sync status" width="270">
   &nbsp;
-  <img src="screenshots/cn4-auto.png" alt="Compose — live keystroke cost estimate with fee tiers" width="270">
+  <img src="screenshots/notes.png" alt="The notebook — private, public, sent and received notes" width="270">
   &nbsp;
-  <img src="screenshots/cn-note.png" alt="A private note restored from chain data after a device wipe" width="270">
+  <img src="screenshots/compose.png" alt="Compose — live keystroke cost estimate with fee tiers" width="270">
 </p>
 
 ## Features
@@ -22,6 +22,12 @@ Compose a note on your Passport Prime, seal it with a key only your device seed 
 - **Coins, sweep & consolidate** — a viewer-first Coins screen, one-tap consolidate, and a guided sweep flow that sends everything to any address you pick, all signed on-device.
 - **Every network** — mainnet, testnet4, signet, and regtest, with the relay policy verified live on testnet4.
 
+<p align="center">
+  <img src="screenshots/contacts.png" alt="Send to — contacts picker with recents and QR scan" width="270">
+  &nbsp;
+  <img src="screenshots/note.png" alt="A private note, decrypted on-device" width="270">
+</p>
+
 ## The companion
 
 **Hosted at [objsal.github.io/chain-notes-companion](https://objsal.github.io/chain-notes-companion/)** — the online half, and no more than that: it builds sync bundles from public chain data and broadcasts what the device signed. It never sees a key.
@@ -29,12 +35,6 @@ Compose a note on your Passport Prime, seal it with a key only your device seed 
 - **Sync & broadcast** (`index.html`) — builds bundles (shown as a file or a static/animated QR) and broadcasts the device's transactions, via mempool.space or your own local node.
 - **Read-only viewer** (`viewer.html`) — renders any address's on-chain notes in the browser: public notes as text, private ones as sealed placeholders. Decryption stays on the device by design.
 - **Note permalinks** (`note.html`) — share a link to a single note.
-
-<p align="center">
-  <img src="screenshots/cn5-settings.png" alt="Settings — network and chunk-size policy" width="270">
-  &nbsp;
-  <img src="screenshots/t4-probe.png" alt="Companion broadcasting on testnet4" width="270">
-</p>
 
 ## Honest caveats
 
