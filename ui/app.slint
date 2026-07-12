@@ -343,11 +343,8 @@ export component AppWindow inherits Window {
                 text: "Sync";
                 clicked => { Ui.screen = 5; }
             }
-            SecondaryAction {
-                width: 100%;
-                text: "Settings";
-                clicked => { Ui.screen = 6; }
-            }
+            // No Settings here — it is wallet-level (network, chunk, wallet
+            // coins/sweep), reachable from the notebook list.
         }
 
         // ------------------------------------------- screen 1: notes list
@@ -1157,7 +1154,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "Settings";
-                back => { Callbacks.refresh-home(); Ui.screen = 0; }
+                back => { Ui.screen = 20; }
             }
 
             SecondaryAction {
@@ -1442,6 +1439,11 @@ export component AppWindow inherits Window {
                 width: 100%;
                 text: "+  New notebook";
                 clicked => { NotebookCb.create(); }
+            }
+            SecondaryAction {
+                width: 100%;
+                text: "Settings";
+                clicked => { Callbacks.refresh-home(); Ui.screen = 6; }
             }
 
             if Ui.error != "": Text {

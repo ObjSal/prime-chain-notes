@@ -150,11 +150,26 @@ user creates the first notebook deliberately.
   callback. ASCII markers ([x]/[ ], caret ^/v) — the device font tofus
   fancy glyphs. Verified live in the sim (toggling Self hid the 3 own
   notes, left the 1 received; `cb: toggle-sender excluded=<b> hidden=<n>`).
-- **NOT yet ported (phase 2b remainder)**: wallet-wide Activity (device has
-  no separate activity feed — notes are per-notebook by design, which is
-  correct; likely N/A), settings restructure (list-only / wallet-level +
-  making network device-level — needs a per-network state-file decision,
-  see below).
+- **Network + chunk are WALLET-LEVEL** (Sal 2026-07-11): a `DeviceConfig`
+  (`config.json`, `{network, chunk_override}`) holds the shared network;
+  state files are per-(network, notebook) — `state-<net>-<account>.json`
+  — so each notebook keeps a separate ledger on each chain. `boot_config`
+  migrates the pre-2b per-notebook `state-<account>.json` (each with its
+  own network) into the per-network layout, device network = notebook 0's.
+  Runtime cells `net` + `device_chunk`; `load_state(fs, net, account)`,
+  `save_state` routes by `state.network`; `switch_notebook`/`refresh_*`
+  load for the device net; `cycle_network` flushes the active notebook,
+  cycles the shared network, persists config, reloads the active ledger
+  for the new chain (identity is network-independent — only the address
+  ENCODING changes, no re-derivation). Verified live: switching testnet4
+  → signet emptied Main (no signet ledger), switching back restored its
+  85500 sats — per-network isolation with data preserved.
+- **Settings is LIST-only** (wallet-level): the Settings button moved from
+  the per-notebook home to the notebook list; Settings shows the device
+  network + chunk + wallet Coins/Sweep, and its Back returns to the list.
+- **NOT ported**: wallet-wide Activity — the device has no separate
+  activity feed (notes are per-notebook by design, which is correct), so
+  N/A.
 - **chain-notes.sh (sim e2e) is boot-to-list aware**: waits for
   `cb: notebooks list`, then taps the migrated "Main" row to reach home
   before its existing flow (the seeded legacy `state.json` migrates to
