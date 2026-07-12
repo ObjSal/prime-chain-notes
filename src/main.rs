@@ -1,3 +1,4 @@
+mod notebooks;
 mod theme;
 
 use std::cell::RefCell;
@@ -11,7 +12,9 @@ use notes_core::bundle::{
 };
 use notes_core::address::p2tr_script_pubkey;
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
-use notes_core::tx::{build_sweep_tx, estimate_sweep_vsize, NoteTx, Utxo};
+use notes_core::tx::{
+    build_sweep_tx, build_sweep_tx_multi, estimate_sweep_vsize, NoteTx, SweepSource, Utxo,
+};
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
 use slint_keyos_platform::app_ui;
@@ -77,7 +80,9 @@ fn fit_check(
 }
 
 const STATE_DIR: &str = "/.chain-notes";
-const STATE_PATH: &str = "/.chain-notes/state.json";
+const STATE_PATH: &str = "/.chain-notes/state.json"; // legacy (pre-notebooks)
+const NOTEBOOKS_PATH: &str = "/.chain-notes/notebooks.json";
+const CONFIG_PATH: &str = "/.chain-notes/config.json"; // device-level {network, chunk}
 const INBOX_DIR: &str = "/chain-notes/inbox";
 const OUTBOX_DIR: &str = "/chain-notes/outbox";
 
@@ -128,6 +133,12 @@ const MAX_CONTACTS: usize = 20;
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 struct State {
+    /// Which notebook (indexed identity) this state belongs to. NOT
+    /// persisted — the file path (`state-<account>.json`) implies it; set
+    /// on load. Lets `save_state` route without threading the account
+    /// through every call site.
+    #[serde(skip)]
+    account: u32,
     network: String,
     notes: Vec<NoteRec>,
     utxos: Vec<UtxoRec>,
@@ -136,6 +147,11 @@ struct State {
     bundle_time: Option<u64>,
     /// User-picked chunk size; None = DEFAULT_CHUNK. Purely device-side.
     chunk_override: Option<usize>,
+    /// Sender filter: sender keys (addresses, or "self") hidden from this
+    /// notebook's notes list. The EXCLUSION set persists — anything not
+    /// listed shows, so a new sender is visible by default.
+    #[serde(default)]
+    excluded_senders: Vec<String>,
     fee_economy: f64,
     fee_normal: f64,
     fee_fast: f64,
@@ -145,6 +161,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         State {
+            account: 0,
             network: "mainnet".into(),
             notes: Vec::new(),
             utxos: Vec::new(),
@@ -152,6 +169,7 @@ impl Default for State {
             tip_height: None,
             bundle_time: None,
             chunk_override: None,
+            excluded_senders: Vec::new(),
             fee_economy: 1.0,
             fee_normal: 2.0,
             fee_fast: 5.0,
@@ -189,6 +207,42 @@ impl State {
             .unwrap_or(DEFAULT_CHUNK)
     }
 
+    /// The sender-filter key of a note: the counterparty for received
+    /// notes, else "self" (own notes — self and directed-from-us).
+    fn sender_key(n: &NoteRec) -> String {
+        match &n.from {
+            Some(f) => f.clone(),
+            None => "self".to_string(),
+        }
+    }
+
+    /// Distinct sender keys with counts, newest activity first.
+    fn senders(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for n in self.notes.iter().rev() {
+            let k = Self::sender_key(n);
+            match out.iter_mut().find(|(x, _)| *x == k) {
+                Some((_, c)) => *c += 1,
+                None => out.push((k, 1)),
+            }
+        }
+        out
+    }
+
+    fn is_excluded(&self, key: &str) -> bool {
+        self.excluded_senders.iter().any(|s| s == key)
+    }
+
+    fn set_excluded(&mut self, key: &str, excluded: bool) {
+        if excluded {
+            if !self.is_excluded(key) {
+                self.excluded_senders.push(key.to_string());
+            }
+        } else {
+            self.excluded_senders.retain(|s| s != key);
+        }
+    }
+
     fn fee_rate(&self, tier: i32) -> f64 {
         let rate = match tier {
             0 => self.fee_economy,
@@ -218,24 +272,189 @@ struct SweepPlan {
     tx: NoteTx,
     kind: &'static str,      // "sweep" | "consolidate"
     dest: Option<String>,    // None = self (consolidate)
+    // Wallet-level: which outpoints (display txid, vout) each source
+    // notebook contributed, so signing can update every source's ledger;
+    // and the destination notebook a consolidate's new coin lands in.
+    spent_by_account: Vec<(u32, Vec<(String, u32)>)>,
+    dest_account: u32,
 }
 
 // ------------------------------------------------------------- helpers
 
-fn load_state(fs: &Fs) -> State {
-    read_text(fs, STATE_PATH, Location::User)
+/// Derive a notebook's identity from the app seed (None if locked).
+fn derive_identity(app_seed: &Option<[u8; 32]>, account: u32) -> Option<Identity> {
+    app_seed
+        .as_ref()
+        .and_then(|s| Identity::from_app_seed_indexed(s, account).ok())
+}
+
+/// Every ACTIVE notebook with spendable coins, as
+/// (account, output_x, tweaked_seckey, coins) — the inputs to a
+/// wallet-level sweep/consolidate (`build_sweep_tx_multi`). Reads each
+/// notebook's state from disk, so flush the active notebook first.
+fn wallet_sources(
+    fs: &Fs,
+    ix: &notebooks::NotebookIndex,
+    app_seed: &Option<[u8; 32]>,
+    net: &str,
+) -> Vec<(u32, [u8; 32], [u8; 32], Vec<Utxo>)> {
+    ix.active()
+        .filter_map(|m| {
+            let st = load_state(fs, net, m.account);
+            let coins = st.core_utxos();
+            if coins.is_empty() {
+                return None;
+            }
+            let id = derive_identity(app_seed, m.account)?;
+            Some((m.account, id.output_x, id.tweaked_seckey, coins))
+        })
+        .collect()
+}
+
+/// Coin count + total across the wallet's notebooks ON `net`.
+fn wallet_balance(fs: &Fs, ix: &notebooks::NotebookIndex, net: &str) -> (usize, u64) {
+    let mut n = 0;
+    let mut total = 0;
+    for m in ix.active() {
+        let st = load_state(fs, net, m.account);
+        n += st.utxos.len();
+        total += st.balance();
+    }
+    (n, total)
+}
+
+/// Device-level settings shared by every notebook (Sal 2026-07-11:
+/// network is wallet-wide). Persisted at CONFIG_PATH.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct DeviceConfig {
+    network: String,
+    chunk_override: Option<usize>,
+}
+impl Default for DeviceConfig {
+    fn default() -> Self {
+        DeviceConfig { network: "mainnet".into(), chunk_override: None }
+    }
+}
+impl DeviceConfig {
+    fn network(&self) -> Network {
+        Network::from_str_opt(&self.network).unwrap_or(Network::Mainnet)
+    }
+}
+
+fn load_config(fs: &Fs) -> Option<DeviceConfig> {
+    read_text(fs, CONFIG_PATH, Location::User)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+}
+
+fn save_config(fs: &Fs, cfg: &DeviceConfig) {
+    if let Ok(json) = serde_json::to_string(cfg) {
+        let _ = ensure_dir(fs, STATE_DIR, Location::User)
+            .and_then(|_| write_file(fs, CONFIG_PATH, Location::User, json.as_bytes()));
+    }
+}
+
+/// Pre-2b per-notebook state path (had its own network field).
+fn state_path_v1(account: u32) -> String {
+    format!("/.chain-notes/state-{account}.json")
+}
+
+/// Per-(network, notebook) state file: each notebook has a separate ledger
+/// on each network (network is device-level now).
+fn state_path(net: &str, account: u32) -> String {
+    format!("/.chain-notes/state-{net}-{account}.json")
+}
+
+/// Load a notebook's state for `net`, stamping network + account so
+/// `save_state` routes back to the same file.
+fn load_state(fs: &Fs, net: &str, account: u32) -> State {
+    let mut st: State = read_text(fs, &state_path(net, account), Location::User)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    st.account = account;
+    st.network = net.to_string();
+    st
+}
+
+fn save_state(fs: &Fs, state: &State) {
+    let json = serde_json::to_string(state).expect("state serializes");
+    let path = state_path(&state.network, state.account);
+    if let Err(e) = ensure_dir(fs, STATE_DIR, Location::User)
+        .and_then(|_| write_file(fs, &path, Location::User, json.as_bytes()))
+    {
+        log::warn!("state save failed: {e}");
+    }
+}
+
+fn load_notebooks(fs: &Fs) -> notebooks::NotebookIndex {
+    read_text(fs, NOTEBOOKS_PATH, Location::User)
         .ok()
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default()
 }
 
-fn save_state(fs: &Fs, state: &State) {
-    let json = serde_json::to_string(state).expect("state serializes");
+fn save_notebooks(fs: &Fs, ix: &notebooks::NotebookIndex) {
+    let json = serde_json::to_string(ix).expect("index serializes");
     if let Err(e) = ensure_dir(fs, STATE_DIR, Location::User)
-        .and_then(|_| write_file(fs, STATE_PATH, Location::User, json.as_bytes()))
+        .and_then(|_| write_file(fs, NOTEBOOKS_PATH, Location::User, json.as_bytes()))
     {
-        log::warn!("state save failed: {e}");
+        log::warn!("notebook index save failed: {e}");
     }
+}
+
+/// One-time migration for a pre-notebooks install: an existing
+/// `state.json` (with no notebook index yet) becomes notebook 0 "Main".
+/// Returns the index to use. A fresh install returns an empty index — the
+/// device has no onboarding, so first boot shows an empty notebook list
+/// and the user creates their first notebook deliberately.
+fn boot_notebooks(fs: &Fs) -> notebooks::NotebookIndex {
+    if read_text(fs, NOTEBOOKS_PATH, Location::User).is_ok() {
+        return load_notebooks(fs);
+    }
+    let mut ix = notebooks::NotebookIndex::default();
+    if let Ok(json) = read_text(fs, STATE_PATH, Location::User) {
+        // Legacy single-identity install → notebook 0 "Main" (v1 file;
+        // boot_config then moves it to the per-network layout).
+        let _ = ensure_dir(fs, STATE_DIR, Location::User)
+            .and_then(|_| write_file(fs, &state_path_v1(0), Location::User, json.as_bytes()));
+        ix.ensure(0);
+        ix.rename(0, notebooks::FIRST_NOTEBOOK_NAME);
+        log::info!("cb: notebooks migrated legacy state -> Main");
+    }
+    save_notebooks(fs, &ix);
+    ix
+}
+
+/// Device config, migrating pre-2b per-notebook state files
+/// (`state-<account>.json`, each with its own network) into the
+/// per-network layout (`state-<net>-<account>.json`) on first boot. The
+/// device network becomes notebook 0's (else the lowest notebook's, else
+/// mainnet); each notebook's ledger is preserved under its own network, so
+/// switching the device network later reveals each notebook's chain data.
+fn boot_config(fs: &Fs, ix: &notebooks::NotebookIndex) -> DeviceConfig {
+    if let Some(cfg) = load_config(fs) {
+        return cfg;
+    }
+    let mut dev: Option<(String, Option<usize>)> = None;
+    for m in &ix.notebooks {
+        let Ok(json) = read_text(fs, &state_path_v1(m.account), Location::User) else { continue };
+        let st: State = serde_json::from_str(&json).unwrap_or_default();
+        let net = st.network.clone();
+        // Re-route to the per-network file.
+        let _ = ensure_dir(fs, STATE_DIR, Location::User).and_then(|_| {
+            write_file(fs, &state_path(&net, m.account), Location::User, json.as_bytes())
+        });
+        if m.account == 0 || dev.is_none() {
+            dev = Some((net, st.chunk_override));
+        }
+    }
+    let (network, chunk_override) = dev.unwrap_or_else(|| ("mainnet".into(), None));
+    let cfg = DeviceConfig { network, chunk_override };
+    save_config(fs, &cfg);
+    log::info!("cb: config migrated network={} (per-network state files)", cfg.network);
+    cfg
 }
 
 fn read_text(fs: &Fs, path: &str, loc: Location) -> Result<String, String> {
@@ -396,37 +615,54 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let fs = cx.fs.clone();
     let ui_weak = ui.as_weak();
 
-    let state = Rc::new(RefCell::new(load_state(&fs)));
     let plan: Rc<RefCell<Option<Plan>>> = Rc::new(RefCell::new(None));
     let sweep_plan: Rc<RefCell<Option<SweepPlan>>> = Rc::new(RefCell::new(None));
 
-    // Identity from GetAppSeed — PIN-gated on hardware. Everything (address,
-    // signing key, encryption key) re-derives from the device seed backup.
-    let identity: Rc<Option<Identity>> = Rc::new(
-        match Security::default()
-            .app_seed()
-            .map_err(|_| "Device locked or seed unavailable".to_string())
-            .and_then(|app_seed| Identity::from_app_seed(&app_seed).map_err(|e| e.to_string()))
-        {
-            Ok(id) => Some(id),
-            Err(e) => {
-                log::warn!("identity unavailable: {e}");
-                ui.global::<Ui>().set_error(e.into());
+    // The app seed (GetAppSeed, PIN-gated on hardware) — kept so each
+    // notebook's identity can be derived on demand
+    // (`Identity::from_app_seed_indexed`, index = notebook account).
+    let app_seed: Rc<Option<[u8; 32]>> = Rc::new(
+        match Security::default().app_seed() {
+            Ok(seed) => Some(seed),
+            Err(_) => {
+                log::warn!("identity unavailable: device locked or seed unavailable");
+                ui.global::<Ui>().set_error("Device locked or seed unavailable".into());
                 None
             }
         },
     );
 
+    // Notebooks: the index (account -> name/archived) + the ACTIVE notebook.
+    // A notebook = an indexed identity; boot lands on the notebook LIST and
+    // the active notebook is set when the user taps a row (empty on a fresh
+    // install — the device has no onboarding).
+    let notebooks: Rc<RefCell<notebooks::NotebookIndex>> =
+        Rc::new(RefCell::new(boot_notebooks(&fs)));
+    // Device-level network (wallet-wide): one setting shared by every
+    // notebook; each notebook's ledger is per-network on disk.
+    let device_cfg = boot_config(&fs, &notebooks.borrow());
+    let net: Rc<RefCell<String>> = Rc::new(RefCell::new(device_cfg.network.clone()));
+    let device_chunk: Rc<RefCell<Option<usize>>> =
+        Rc::new(RefCell::new(device_cfg.chunk_override));
+    let active: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+    // The ACTIVE notebook's state + identity (both swap on notebook switch);
+    // an empty placeholder until a notebook is opened.
+    let state = Rc::new(RefCell::new(State::default()));
+    let identity: Rc<RefCell<Option<Identity>>> = Rc::new(RefCell::new(None));
+
+
     let refresh_home = {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let identity = identity.clone();
+        let net = net.clone();
+        let device_chunk = device_chunk.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
             let home = ui.global::<Home>();
-            home.set_network(st.network.clone().into());
-            if let Some(id) = identity.as_ref() {
+            home.set_network(net.borrow().clone().into()); // device-level network
+            if let Some(id) = identity.borrow().as_ref() {
                 let addr = id.address(st.network());
                 home.set_qr(qr_image(&addr.to_uppercase()));
                 home.set_address(addr.into());
@@ -453,12 +689,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 .into(),
             );
             let settings = ui.global::<Settings>();
-            settings.set_chunk_mode(match st.chunk_override {
+            let dchunk = *device_chunk.borrow();
+            settings.set_chunk_mode(match dchunk {
                 None => 0,
                 Some(80) => 1,
                 Some(_) => 2,
             });
-            settings.set_chunk_text(format!("{}", st.effective_chunk()).into());
+            let eff = dchunk.map(|c| c.clamp(MIN_CHUNK, DEFAULT_CHUNK)).unwrap_or(DEFAULT_CHUNK);
+            settings.set_chunk_text(format!("{eff}").into());
             log::info!(
                 "cb: home balance={} utxos={} tip={}",
                 st.balance(),
@@ -474,7 +712,37 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
-            let mut recs: Vec<&NoteRec> = st.notes.iter().collect();
+            // Sender filter: build the checklist + filter the list. A note
+            // is hidden iff its sender key is in the persisted exclusion set.
+            let senders: Vec<SenderRow> = st
+                .senders()
+                .into_iter()
+                .map(|(key, count)| {
+                    let label = if key == "self" {
+                        "Self".to_string()
+                    } else {
+                        st.contacts
+                            .iter()
+                            .find(|c| c.address == key && !c.name.is_empty())
+                            .map(|c| c.name.clone())
+                            .unwrap_or_else(|| short_addr(&key))
+                    };
+                    SenderRow {
+                        excluded: st.is_excluded(&key),
+                        key: key.into(),
+                        label: label.into(),
+                        sub: format!("{count} note(s)").into(),
+                    }
+                })
+                .collect();
+            let hidden = senders.iter().filter(|s| s.excluded).count();
+            let notes_g = ui.global::<Notes>();
+            notes_g.set_senders(Rc::new(VecModel::from(senders)).into());
+            notes_g.set_hidden_label(
+                if hidden == 0 { "".to_string() } else { format!("{hidden} sender(s) hidden") }.into(),
+            );
+            let mut recs: Vec<&NoteRec> =
+                st.notes.iter().filter(|n| !st.is_excluded(&State::sender_key(n))).collect();
             // Pending first, then newest confirmed first.
             recs.sort_by_key(|n| match n.height {
                 None => (0u8, 0i64),
@@ -500,8 +768,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     badge: if n.private { "PRIVATE" } else { "PUBLIC" }.into(),
                 })
                 .collect();
-            log::info!("cb: refresh-notes n={}", rows.len());
-            ui.global::<Notes>().set_rows(Rc::new(VecModel::from(rows)).into());
+            log::info!("cb: refresh-notes n={} hidden={hidden}", rows.len());
+            notes_g.set_rows(Rc::new(VecModel::from(rows)).into());
         }
     };
 
@@ -533,24 +801,56 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let refresh_coins = {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let app_seed = app_seed.clone();
+        let net = net.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let st = state.borrow();
-            let mut recs: Vec<&UtxoRec> = st.utxos.iter().collect();
-            recs.sort_by_key(|u| std::cmp::Reverse(u.value));
-            let rows: Vec<CoinRow> = recs
+            // Wallet-wide: every ACTIVE notebook's coins, each tagged with
+            // its notebook. Flush the active notebook first so its file is
+            // current, then read all from disk.
+            save_state(&fs, &state.borrow());
+            let ix = notebooks.borrow();
+            let active_net = net.borrow().clone();
+            let btc_usd = state.borrow().btc_usd;
+            // (value, notebook name, txid, vout) across the wallet.
+            let mut all: Vec<(u64, String, String, u32)> = Vec::new();
+            let mut nb_with_coins = 0usize;
+            for m in ix.active() {
+                let st2 = load_state(&fs, &active_net, m.account);
+                if st2.utxos.is_empty() {
+                    continue;
+                }
+                nb_with_coins += 1;
+                let short = derive_identity(&app_seed, m.account)
+                    .map(|id| short_addr(&id.address(st2.network())))
+                    .unwrap_or_default();
+                let name = notebook_name(&ix, m.account, &short);
+                for u in &st2.utxos {
+                    all.push((u.value, name.clone(), u.txid.clone(), u.vout));
+                }
+            }
+            all.sort_by_key(|(v, ..)| std::cmp::Reverse(*v));
+            let total: u64 = all.iter().map(|(v, ..)| v).sum();
+            let rows: Vec<CoinRow> = all
                 .iter()
-                .map(|u| CoinRow {
-                    label: format!("{} sats", u.value).into(),
-                    meta: format!("txid {} · output {}", short_addr(&u.txid), u.vout).into(),
+                .map(|(v, name, txid, vout)| CoinRow {
+                    label: format!("{v} sats · {name}").into(),
+                    meta: format!("txid {} · output {}", short_addr(txid), vout).into(),
                 })
                 .collect();
             let coins = ui.global::<Coins>();
             coins.set_summary(
-                format!("{} coin(s) · {}", rows.len(), sats_line(st.balance(), st.btc_usd)).into(),
+                format!(
+                    "{} coin(s) · {} across {nb_with_coins} notebook(s)",
+                    rows.len(),
+                    sats_line(total, btc_usd)
+                )
+                .into(),
             );
             coins.set_can_consolidate(rows.len() >= 2);
-            log::info!("cb: refresh-coins n={} total={}", rows.len(), st.balance());
+            log::info!("cb: refresh-coins n={} total={total} notebooks={nb_with_coins}", rows.len());
             coins.set_rows(Rc::new(VecModel::from(rows)).into());
         }
     };
@@ -560,6 +860,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let update_sweep = {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let sweep = ui.global::<Sweep>();
@@ -568,9 +870,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             if tier != 3 {
                 sweep.set_rate_text(format!("{}", st.fee_rate(tier)).into());
             }
-            let n = st.utxos.len();
-            let total = st.balance();
-            sweep.set_inputs_line(format!("Inputs · {n} coin(s) · {total} sats (all)").into());
+            // Wallet-level: inputs are EVERY notebook's coins (flush the
+            // active one first so its file reflects the latest ledger).
+            save_state(&fs, &st);
+            let (n, total) = wallet_balance(&fs, &notebooks.borrow(), &st.network);
+            sweep.set_inputs_line(format!("Inputs · {n} coin(s) · {total} sats (all notebooks)").into());
             if n == 0 {
                 sweep.set_cost_line("Nothing to sweep — no spendable coins.".into());
                 sweep.set_can_continue(false);
@@ -625,6 +929,115 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             );
             sweep.set_can_continue(true);
         }
+    };
+
+    // A notebook's display name: its local name, else its address short
+    // form (never empty — rows and the home title read this).
+    fn notebook_name(ix: &notebooks::NotebookIndex, account: u32, addr_short: &str) -> String {
+        match ix.get(account).map(|m| m.name.clone()) {
+            Some(n) if !n.trim().is_empty() => n,
+            _ => addr_short.to_string(),
+        }
+    }
+
+    // Rebuild the notebook list (screen 20) from the index + each
+    // notebook's state file. Device has no live balance — the row meta is
+    // address-short · note count.
+    let refresh_notebooks = {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let active = active.clone();
+        let app_seed = app_seed.clone();
+        let net = net.clone();
+        Rc::new(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let ix = notebooks.borrow();
+            let active_acct = *active.borrow();
+            let dev_net = net.borrow().clone();
+            let build = |m: &notebooks::NotebookMeta| -> NotebookRow {
+                let st = load_state(&fs, &dev_net, m.account);
+                let addr = derive_identity(&app_seed, m.account)
+                    .map(|id| id.address(Network::from_str_opt(&dev_net).unwrap_or(Network::Mainnet)))
+                    .unwrap_or_default();
+                let short = short_addr(&addr);
+                let n = st.notes.len();
+                NotebookRow {
+                    account: m.account as i32,
+                    name: notebook_name(&ix, m.account, &short).into(),
+                    meta: format!("{short} · {n} note{}", if n == 1 { "" } else { "s" }).into(),
+                    active: active_acct == Some(m.account),
+                }
+            };
+            let rows: Vec<NotebookRow> = ix.active().map(build).collect();
+            let archived: Vec<NotebookRow> =
+                ix.notebooks.iter().filter(|m| m.archived).map(build).collect();
+            let nb = ui.global::<NotebooksUi>();
+            nb.set_empty_line(
+                if rows.is_empty() {
+                    if ix.archived_count() > 0 {
+                        "All notebooks are archived.".into()
+                    } else {
+                        "No notebooks yet — create one to start writing.".into()
+                    }
+                } else {
+                    "".into()
+                },
+            );
+            nb.set_archived_label(
+                if archived.is_empty() {
+                    "".to_string()
+                } else {
+                    format!("Archived ({})", archived.len())
+                }
+                .into(),
+            );
+            log::info!("cb: notebooks list n={} archived={}", rows.len(), archived.len());
+            nb.set_rows(Rc::new(VecModel::from(rows)).into());
+            nb.set_archived_rows(Rc::new(VecModel::from(archived)).into());
+        })
+    };
+
+    // Open a notebook: save the current one, swap identity + state to the
+    // target account, refresh every per-notebook view, and show its home.
+    let switch_notebook = {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let state = state.clone();
+        let identity = identity.clone();
+        let active = active.clone();
+        let notebooks = notebooks.clone();
+        let app_seed = app_seed.clone();
+        let net = net.clone();
+        let device_chunk = device_chunk.clone();
+        let refresh_home = refresh_home.clone();
+        let refresh_notes = refresh_notes.clone();
+        let refresh_coins = refresh_coins.clone();
+        let refresh_contacts = refresh_contacts.clone();
+        Rc::new(move |account: u32| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if active.borrow().is_some() {
+                save_state(&fs, &state.borrow());
+            }
+            *active.borrow_mut() = Some(account);
+            *identity.borrow_mut() = derive_identity(&app_seed, account);
+            let mut loaded = load_state(&fs, &net.borrow(), account);
+            loaded.chunk_override = *device_chunk.borrow(); // chunk is device-level
+            *state.borrow_mut() = loaded;
+            let short = identity
+                .borrow()
+                .as_ref()
+                .map(|id| short_addr(&id.address(state.borrow().network())))
+                .unwrap_or_default();
+            let title = notebook_name(&notebooks.borrow(), account, &short);
+            ui.global::<NotebooksUi>().set_title(title.into());
+            log::info!("cb: open-notebook account={account}");
+            refresh_home();
+            refresh_notes();
+            refresh_coins();
+            refresh_contacts();
+            ui.global::<Ui>().set_screen(0);
+        })
     };
 
     // The single pick funnel (self row / recent row / manual entry / scan):
@@ -810,6 +1223,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let identity = identity.clone();
         let sweep_plan = sweep_plan.clone();
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let app_seed = app_seed.clone();
+        let active = active.clone();
         ui.global::<Callbacks>().on_sweep_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
@@ -817,6 +1234,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let state = state.clone();
             let identity = identity.clone();
             let sweep_plan = sweep_plan.clone();
+            let fs = fs.clone();
+            let notebooks = notebooks.clone();
+            let app_seed = app_seed.clone();
+            let active = active.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
@@ -827,47 +1248,79 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let tier = sweep.get_tier();
                 let rate_text = sweep.get_rate_text().to_string();
                 let st = state.borrow();
-                let result = identity
-                    .as_ref()
+                // Flush the active notebook, then gather EVERY notebook's
+                // coins — a wallet-level sweep/consolidate, one multi-key tx.
+                save_state(&fs, &st);
+                let sources_raw =
+                    wallet_sources(&fs, &notebooks.borrow(), &app_seed, &st.network);
+                let dest_account = active.borrow().unwrap_or(0);
+                let id_guard = identity.borrow();
+                let result = id_guard
                     .as_ref()
                     .ok_or_else(|| "identity unavailable".to_string())
                     .and_then(|id| {
                         let rate = resolve_rate(tier, &rate_text, &st)?;
+                        if sources_raw.is_empty() {
+                            return Err("No spendable coins in the wallet.".to_string());
+                        }
                         let dest_spk = if consolidate {
                             p2tr_script_pubkey(&id.output_x)
                         } else {
                             Recipient::parse(st.network(), &dest).map_err(|e| e.to_string())?.spk
                         };
-                        build_sweep_tx(
-                            &st.core_utxos(),
-                            &id.output_x,
-                            dest_spk,
-                            rate,
-                            &id.tweaked_seckey,
-                            || generate_aux_rand(),
-                        )
-                        .map_err(|e| e.to_string())
+                        let sources: Vec<SweepSource> = sources_raw
+                            .iter()
+                            .map(|(_, ox, sk, coins)| SweepSource {
+                                utxos: coins,
+                                output_x: *ox,
+                                tweaked_seckey: sk,
+                            })
+                            .collect();
+                        build_sweep_tx_multi(&sources, dest_spk, rate, generate_aux_rand)
+                            .map_err(|e| e.to_string())
                     });
                 ui.global::<Ui>().set_busy(false);
                 match result {
                     Ok(tx) => {
-                        let total: u64 = st.balance();
+                        let total: u64 = sources_raw.iter().flat_map(|(_, _, _, c)| c).map(|u| u.value).sum();
                         let recv = tx.tx.outputs[0].value;
+                        let n_notebooks = sources_raw.len();
+                        // Spent outpoints per source notebook (display txid).
+                        let spent_by_account: Vec<(u32, Vec<(String, u32)>)> = sources_raw
+                            .iter()
+                            .map(|(acct, _, _, coins)| {
+                                let outs = coins
+                                    .iter()
+                                    .map(|u| {
+                                        let mut t = u.txid;
+                                        t.reverse();
+                                        (hex::encode(t), u.vout)
+                                    })
+                                    .collect();
+                                (*acct, outs)
+                            })
+                            .collect();
                         log::info!(
-                            "cb: sweep kind={kind} to={} inputs={} amount={recv} fee={} vsize={} txid={} ok",
+                            "cb: sweep kind={kind} to={} inputs={} notebooks={n_notebooks} amount={recv} fee={} vsize={} txid={} ok",
                             if consolidate { "self" } else { dest.as_str() },
                             tx.tx.inputs.len(),
                             tx.fee,
                             tx.vsize,
                             tx.txid_hex
                         );
+                        // On-chain linkage warning when >1 notebook contributes.
+                        let link = if n_notebooks > 1 {
+                            "\n\nHeads up: this spends coins from several notebooks in one tx, publicly linking their addresses on-chain."
+                        } else {
+                            ""
+                        };
                         sweep.set_confirm_summary(
                             format!(
-                                "{}\n\ninputs: {} coin(s) · {total} sats\nfee: {}\n{}: {recv} sats\n\ntxid:\n{}",
+                                "{}\n\ninputs: {} coin(s) from {n_notebooks} notebook(s) · {total} sats\nfee: {}\n{}: {recv} sats{link}\n\ntxid:\n{}",
                                 if consolidate {
-                                    "Consolidates every coin into one — back to your own address."
+                                    "Consolidates the WHOLE wallet into one coin at this notebook's address."
                                 } else {
-                                    "Sweeps EVERYTHING to the destination — this empties the notes address."
+                                    "Sweeps the WHOLE wallet to the destination — this empties every notebook."
                                 },
                                 tx.tx.inputs.len(),
                                 sats_line(tx.fee, st.btc_usd),
@@ -880,6 +1333,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             tx,
                             kind: if consolidate { "consolidate" } else { "sweep" },
                             dest: (!consolidate).then(|| dest.clone()),
+                            spent_by_account,
+                            dest_account,
                         });
                         sweep.set_show_confirm(true);
                     }
@@ -900,6 +1355,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let sweep_plan = sweep_plan.clone();
         let fs = fs.clone();
+        let active = active.clone();
+        let net = net.clone();
         let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_sweep_sign(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -908,28 +1365,38 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let ui_weak = ui_weak.clone();
             let state = state.clone();
             let fs = fs.clone();
+            let active = active.clone();
+            let net = net.clone();
             let refresh_home = refresh_home.clone();
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
                 let mut st = state.borrow_mut();
+                let active_acct = active.borrow().unwrap_or(p.dest_account);
 
-                // Ledger: every input is spent; a consolidate's single
-                // output comes straight back as our own (unconfirmed) coin.
-                let spent: Vec<(String, u32)> = p
-                    .tx
-                    .spent_outpoints
-                    .iter()
-                    .map(|(txid, vout)| {
-                        let mut t = *txid;
-                        t.reverse();
-                        (hex::encode(t), *vout)
-                    })
-                    .collect();
-                let inputs = spent.len();
-                st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                // Wallet-level ledger: remove each notebook's spent inputs
+                // from its own state file (the active one via the live
+                // `st`); a consolidate's single output lands in the
+                // destination notebook as its new (unconfirmed) coin.
+                let inputs: usize = p.spent_by_account.iter().map(|(_, o)| o.len()).sum();
                 let recv = p.tx.tx.outputs[0].value;
+                for (acct, spent) in &p.spent_by_account {
+                    if *acct == active_acct {
+                        st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                    } else {
+                        let mut other = load_state(&fs, &net.borrow(), *acct);
+                        other.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                        save_state(&fs, &other);
+                    }
+                }
                 if p.kind == "consolidate" {
-                    st.utxos.push(UtxoRec { txid: p.tx.txid_hex.clone(), vout: 0, value: recv });
+                    let coin = UtxoRec { txid: p.tx.txid_hex.clone(), vout: 0, value: recv };
+                    if p.dest_account == active_acct {
+                        st.utxos.push(coin);
+                    } else {
+                        let mut dest = load_state(&fs, &net.borrow(), p.dest_account);
+                        dest.utxos.push(coin);
+                        save_state(&fs, &dest);
+                    }
                 }
 
                 let file = format!("{OUTBOX_DIR}/{}.hex", p.tx.txid_hex);
@@ -1168,8 +1635,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let rate_text = compose.get_rate_text().to_string();
                 let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
                 let st = state.borrow();
-                let result = identity
-                    .as_ref()
+                let id_guard = identity.borrow();
+                let result = id_guard
                     .as_ref()
                     .ok_or_else(|| "identity unavailable".to_string())
                     .and_then(|id| {
@@ -1437,7 +1904,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let identity = identity.clone();
         let fs = fs.clone();
         Rc::new(move |json: &str, src: &str| -> Result<String, String> {
-            let id = identity.as_ref().as_ref().ok_or("identity unavailable")?;
+            let id_guard = identity.borrow();
+            let id = id_guard.as_ref().ok_or("identity unavailable")?;
             {
                 let bundle =
                     SyncBundle::from_json(json).map_err(|e| format!("bad bundle: {e}"))?;
@@ -1666,7 +2134,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         ui.global::<Callbacks>().on_sign_psbt(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let Some(id) = identity.as_ref() else {
+            let id_guard = identity.borrow();
+            let Some(id) = id_guard.as_ref() else {
                 ui.global::<Sync>().set_result("Device locked — no signing key.".into());
                 return;
             };
@@ -1733,21 +2202,48 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
 
     {
+        let ui_weak = ui_weak.clone();
         let state = state.clone();
+        let identity = identity.clone();
         let fs = fs.clone();
+        let net = net.clone();
+        let active = active.clone();
+        let device_chunk = device_chunk.clone();
         let refresh_home = refresh_home.clone();
+        let refresh_notes = refresh_notes.clone();
+        let refresh_coins = refresh_coins.clone();
+        let refresh_notebooks = refresh_notebooks.clone();
         ui.global::<Callbacks>().on_cycle_network(move || {
-            let mut st = state.borrow_mut();
-            st.network = match st.network.as_str() {
-                "mainnet" => "testnet4".into(),
-                "testnet4" => "signet".into(),
-                "signet" => "regtest".into(),
-                _ => "mainnet".into(),
-            };
-            log::info!("cb: set-network {}", st.network);
-            save_state(&fs, &st);
-            drop(st);
+            // Network is device-level (wallet-wide): flush the active
+            // notebook, cycle the shared network, persist it in config, and
+            // reload the active notebook's ledger for the new chain (each
+            // notebook keeps a per-network ledger in state-<net>-<account>).
+            if active.borrow().is_some() {
+                save_state(&fs, &state.borrow());
+            }
+            let next = match net.borrow().as_str() {
+                "mainnet" => "testnet4",
+                "testnet4" => "signet",
+                "signet" => "regtest",
+                _ => "mainnet",
+            }
+            .to_string();
+            *net.borrow_mut() = next.clone();
+            save_config(&fs, &DeviceConfig { network: next.clone(), chunk_override: *device_chunk.borrow() });
+            log::info!("cb: set-network {next}");
+            if let Some(account) = *active.borrow() {
+                let mut fresh = load_state(&fs, &next, account);
+                fresh.chunk_override = *device_chunk.borrow();
+                *state.borrow_mut() = fresh;
+            }
+            // Identity is network-independent (same key) — only the address
+            // ENCODING changes, so no re-derivation; refresh the views that
+            // show addresses/ledgers.
+            let _ = (&ui_weak, &identity);
             refresh_home();
+            refresh_notes();
+            refresh_coins();
+            refresh_notebooks();
         });
     }
 
@@ -1755,6 +2251,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let fs = fs.clone();
+        let net = net.clone();
+        let device_chunk = device_chunk.clone();
         let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_chunk_changed(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -1786,6 +2284,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             );
             settings.set_chunk_error("".into());
             save_state(&fs, &st);
+            // Chunk is device-level (wallet-wide): persist it in config too.
+            *device_chunk.borrow_mut() = st.chunk_override;
+            save_config(&fs, &DeviceConfig { network: net.borrow().clone(), chunk_override: st.chunk_override });
             drop(st);
             // Reflect the effective size back into the field (auto/compat),
             // without touching a valid custom value.
@@ -1826,13 +2327,179 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         ui.global::<Callbacks>().on_refresh_notes(move || refresh_notes());
     }
     {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let fs = fs.clone();
+        let refresh_notes = refresh_notes.clone();
+        ui.global::<Callbacks>().on_toggle_sender(move |key, excluded| {
+            let Some(_ui) = ui_weak.upgrade() else { return };
+            {
+                let mut st = state.borrow_mut();
+                st.set_excluded(key.as_str(), excluded);
+                save_state(&fs, &st);
+                log::info!(
+                    "cb: toggle-sender excluded={excluded} hidden={}",
+                    st.excluded_senders.len()
+                );
+            }
+            refresh_notes();
+        });
+    }
+    {
         let refresh_contacts = refresh_contacts.clone();
         ui.global::<Callbacks>().on_refresh_contacts(move || refresh_contacts());
     }
 
-    refresh_home();
-    refresh_notes();
-    refresh_contacts();
+    // ---- notebook callbacks (screen 20 list) ----
+    {
+        let switch_notebook = switch_notebook.clone();
+        ui.global::<NotebookCb>().on_open(move |account| switch_notebook(account.max(0) as u32));
+    }
+    {
+        // Create: open the name dialog in create mode (-2). Nothing is
+        // derived/persisted until Save — the device create is name-only
+        // (no address picker: no network on-device to probe used/new).
+        let ui_weak = ui_weak.clone();
+        ui.global::<NotebookCb>().on_create(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let nb = ui.global::<NotebooksUi>();
+            nb.set_name_text("".into());
+            nb.set_name_account(-2);
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let notebooks = notebooks.clone();
+        ui.global::<NotebookCb>().on_rename(move |account| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let nb = ui.global::<NotebooksUi>();
+            // Prefill the RAW local name (the display name may be an addr
+            // short form, which must not become a name by accident).
+            let raw = notebooks
+                .borrow()
+                .get(account.max(0) as u32)
+                .map(|m| m.name.clone())
+                .unwrap_or_default();
+            nb.set_name_text(raw.into());
+            nb.set_name_account(account);
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        ui.global::<NotebookCb>().on_name_cancel(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.global::<NotebooksUi>().set_name_account(-1);
+            }
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let active = active.clone();
+        let app_seed = app_seed.clone();
+        let refresh_notebooks = refresh_notebooks.clone();
+        let switch_notebook = switch_notebook.clone();
+        ui.global::<NotebookCb>().on_name_save(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let nb = ui.global::<NotebooksUi>();
+            let sel = nb.get_name_account();
+            if sel == -1 {
+                return;
+            }
+            let name = nb.get_name_text().trim().to_string();
+            nb.set_name_account(-1);
+            nb.set_name_text("".into());
+            if sel == -2 {
+                // CREATE: derive the next unused account, add + name it,
+                // persist the index, and open it.
+                if app_seed.is_none() {
+                    ui.global::<Ui>().set_error("Device locked — can't create a notebook.".into());
+                    return;
+                }
+                let account = notebooks.borrow().next_account();
+                {
+                    let mut ix = notebooks.borrow_mut();
+                    ix.ensure(account);
+                    if !name.is_empty() {
+                        ix.rename(account, &name);
+                    }
+                    save_notebooks(&fs, &ix);
+                }
+                log::info!("cb: create-notebook account={account}");
+                refresh_notebooks();
+                switch_notebook(account);
+            } else {
+                let account = sel as u32;
+                {
+                    let mut ix = notebooks.borrow_mut();
+                    ix.rename(account, &name);
+                    save_notebooks(&fs, &ix);
+                }
+                log::info!("cb: rename-notebook account={account}");
+                refresh_notebooks();
+                // If it's the open notebook, update its home title.
+                if *active.borrow() == Some(account) {
+                    let title = notebooks
+                        .borrow()
+                        .get(account)
+                        .map(|m| m.name.clone())
+                        .filter(|n| !n.trim().is_empty());
+                    if let Some(t) = title {
+                        nb.set_title(t.into());
+                    }
+                }
+            }
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let net = net.clone();
+        let refresh_notebooks = refresh_notebooks.clone();
+        ui.global::<NotebookCb>().on_archive(move |account, archived| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let account = account.max(0) as u32;
+            if archived {
+                // Guard: a notebook with coins must be emptied first
+                // (sweep/consolidate). Zero active notebooks is allowed.
+                let bal = load_state(&fs, &net.borrow(), account).balance();
+                if bal > 0 {
+                    ui.global::<Ui>()
+                        .set_error(format!("This notebook holds {bal} sats — empty it first.").into());
+                    return;
+                }
+            }
+            {
+                let mut ix = notebooks.borrow_mut();
+                ix.set_archived(account, archived);
+                save_notebooks(&fs, &ix);
+            }
+            log::info!("cb: archive-notebook account={account} archived={archived}");
+            refresh_notebooks();
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let state = state.clone();
+        let active = active.clone();
+        let refresh_notebooks = refresh_notebooks.clone();
+        ui.global::<NotebookCb>().on_back_to_list(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if active.borrow().is_some() {
+                save_state(&fs, &state.borrow());
+            }
+            refresh_notebooks();
+            ui.global::<Ui>().set_screen(20);
+        });
+    }
+
+    // Boot: the notebook list is the main screen. Migrate/seed the index,
+    // then land on the list (a fresh install starts empty).
+    refresh_notebooks();
+    ui.global::<Ui>().set_screen(20);
 
     ui.run().expect("UI running");
 }

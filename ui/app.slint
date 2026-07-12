@@ -1,8 +1,8 @@
 import { Theme, UISize, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize } from "@ui/theme.slint";
-import { Callbacks, Ui, Home, Compose, Confirm, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep } from "callbacks.slint";
+import { Callbacks, Ui, Home, Compose, Confirm, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow } from "callbacks.slint";
 import { Button } from "@ui/button.slint";
 
-export { Callbacks, Ui, Home, Compose, Confirm, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
+export { Callbacks, Ui, Home, Compose, Confirm, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
 
 component PrimaryAction inherits Button {
     background: Theme.palette-primary;
@@ -259,22 +259,20 @@ export component AppWindow inherits Window {
         background: Theme.palette-background;
 
         // ------------------------------------------------ screen 0: home
+        // A NOTEBOOK's home (its address, notes, compose). The header back
+        // returns to the notebook list (screen 20 — the main screen).
         if Ui.screen == 0: VerticalLayout {
             width: parent.width;
             height: parent.height;
             padding-left: 24px;
             padding-right: 24px;
-            padding-top: 24px + UISize.control-center-status-bar-height;
+            padding-top: 16px + UISize.control-center-status-bar-height;
             padding-bottom: 24px;
             spacing: 14px;
 
-            Text {
-                text: "Chain Notes";
-                color: Theme.palette-foreground;
-                font-family: "Montserrat";
-                font-size: 26px;
-                font-weight: 700;
-                horizontal-alignment: center;
+            ScreenHeader {
+                title: NotebooksUi.title;
+                back => { Callbacks.refresh-home(); NotebookCb.back-to-list(); }
             }
 
             if Home.address == "": Text {
@@ -345,11 +343,8 @@ export component AppWindow inherits Window {
                 text: "Sync";
                 clicked => { Ui.screen = 5; }
             }
-            SecondaryAction {
-                width: 100%;
-                text: "Settings";
-                clicked => { Ui.screen = 6; }
-            }
+            // No Settings here — it is wallet-level (network, chunk, wallet
+            // coins/sweep), reachable from the notebook list.
         }
 
         // ------------------------------------------- screen 1: notes list
@@ -367,12 +362,84 @@ export component AppWindow inherits Window {
                 back => { Callbacks.refresh-home(); Ui.screen = 0; }
             }
 
-            if Notes.rows.length == 0: Text {
+            if Notes.rows.length == 0 && Notes.hidden-label == "": Text {
                 text: "No notes yet.\nCompose one, or import a sync bundle.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
                 font-size: 17px;
                 horizontal-alignment: center;
+            }
+
+            // Sender filter: tap the row to expand a per-sender checklist;
+            // the warn pill flags a persisted exclusion so hidden notes are
+            // never a silent mystery.
+            if Notes.senders.length > 1: Rectangle {
+                height: 32px;
+                TouchArea { clicked => { Notes.filter-expanded = !Notes.filter-expanded; } }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: Notes.hidden-label == "" ? "All senders" : Notes.hidden-label;
+                        color: Notes.hidden-label == "" ? Theme.palette-muted : Theme.palette-primary;
+                        font-family: "Montserrat";
+                        font-size: 14px;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: "Senders " + (Notes.filter-expanded ? " ^" : " v");
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 14px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            if Notes.filter-expanded: Flickable {
+                height: min(Notes.senders.length * 44px, 176px);
+                viewport-height: Notes.senders.length * 44px;
+                VerticalLayout {
+                    spacing: 4px;
+                    for s in Notes.senders: Rectangle {
+                        height: 40px;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: Theme.palette-border;
+                        TouchArea { clicked => { Callbacks.toggle-sender(s.key, !s.excluded); } }
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 12px;
+                            spacing: 8px;
+                            Rectangle {
+                                width: 22px;
+                                Text {
+                                    text: s.excluded ? "[  ]" : "[x]";
+                                    color: s.excluded ? Theme.palette-muted : Theme.palette-primary;
+                                    font-family: "Montserrat";
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    x: 0; y: (parent.height - self.height) / 2;
+                                }
+                            }
+                            Text {
+                                text: s.label;
+                                color: s.excluded ? Theme.palette-muted : Theme.palette-foreground;
+                                font-family: "Montserrat";
+                                font-size: 14px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: s.sub;
+                                color: Theme.palette-muted;
+                                font-family: "Montserrat";
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
             }
 
             Flickable {
@@ -869,7 +936,7 @@ export component AppWindow inherits Window {
             spacing: 12px;
 
             ScreenHeader {
-                title: "Coins";
+                title: "Wallet coins";
                 back => { Ui.screen = 6; }
             }
 
@@ -883,15 +950,15 @@ export component AppWindow inherits Window {
 
             PrimaryAction {
                 width: 100%;
-                text: "Consolidate into one coin…";
+                text: "Consolidate wallet…";
                 disabled: !Coins.can-consolidate;
                 clicked => { Callbacks.consolidate-open(); }
             }
 
             if !Coins.can-consolidate: Text {
                 text: Coins.rows.length == 0
-                    ? "No spendable coins — fund the address and import a sync bundle."
-                    : "Nothing to consolidate — you already have a single coin.";
+                    ? "No spendable coins anywhere — fund a notebook's address and import a sync bundle."
+                    : "Nothing to consolidate — the wallet already holds a single coin.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
                 font-size: 13px;
@@ -1087,7 +1154,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "Settings";
-                back => { Callbacks.refresh-home(); Ui.screen = 0; }
+                back => { Ui.screen = 20; }
             }
 
             SecondaryAction {
@@ -1347,6 +1414,245 @@ export component AppWindow inherits Window {
         // Naming dialog — modal over the contacts screen. Anchored near
         // the TOP so the on-screen keyboard never covers it; nested inside
         // the root container (sibling-app gotcha).
+        // ------------------------------------ screen 20: notebooks (MAIN)
+        // A notebook = an indexed identity; tapping a row opens its home
+        // (screen 0). Boot lands here. Fresh install = empty list.
+        if Ui.screen == 20: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 24px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 14px;
+
+            Text {
+                text: "Chain Notes";
+                color: Theme.palette-foreground;
+                font-family: "Montserrat";
+                font-size: 26px;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+
+            PrimaryAction {
+                width: 100%;
+                text: "+  New notebook";
+                clicked => { NotebookCb.create(); }
+            }
+            SecondaryAction {
+                width: 100%;
+                text: "Settings";
+                clicked => { Callbacks.refresh-home(); Ui.screen = 6; }
+            }
+
+            if Ui.error != "": Text {
+                text: Ui.error;
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+            }
+
+            if NotebooksUi.empty-line != "": Text {
+                text: NotebooksUi.empty-line;
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 15px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+            }
+
+            Flickable {
+                vertical-stretch: 1;
+                viewport-height: NotebooksUi.rows.length * 92px
+                    + (NotebooksUi.archived-label != "" ? 44px : 0px)
+                    + (NotebooksUi.show-archived ? NotebooksUi.archived-rows.length * 72px : 0px);
+                VerticalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    for nb in NotebooksUi.rows: Rectangle {
+                        height: 84px;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: nb.active ? Theme.palette-primary : Theme.palette-border;
+                        TouchArea { clicked => { NotebookCb.open(nb.account); } }
+                        HorizontalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 4px;
+                                alignment: center;
+                                Text {
+                                    text: nb.name;
+                                    color: Theme.palette-foreground;
+                                    font-family: "Montserrat";
+                                    font-size: 18px;
+                                    font-weight: 700;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: nb.meta;
+                                    color: Theme.palette-muted;
+                                    font-family: "SourceCodePro";
+                                    font-size: 13px;
+                                    overflow: elide;
+                                }
+                            }
+                            // Rename
+                            Rectangle {
+                                width: 40px;
+                                TouchArea { clicked => { NotebookCb.rename(nb.account); } }
+                                Text {
+                                    text: "Aa";
+                                    color: Theme.palette-muted;
+                                    font-family: "Montserrat";
+                                    font-size: 15px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                            }
+                            // Archive
+                            Rectangle {
+                                width: 40px;
+                                TouchArea { clicked => { NotebookCb.archive(nb.account, true); } }
+                                Text {
+                                    text: "×";
+                                    color: Theme.palette-muted;
+                                    font-family: "Montserrat";
+                                    font-size: 22px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                            }
+                        }
+                    }
+                    if NotebooksUi.archived-label != "": Rectangle {
+                        height: 36px;
+                        TouchArea { clicked => { NotebooksUi.show-archived = !NotebooksUi.show-archived; } }
+                        Text {
+                            text: NotebooksUi.archived-label + (NotebooksUi.show-archived ? "  ^" : "  v");
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 14px;
+                            x: 4px;
+                            y: (parent.height - self.height) / 2;
+                        }
+                    }
+                    if NotebooksUi.show-archived: VerticalLayout {
+                        spacing: 8px;
+                        for nb in NotebooksUi.archived-rows: Rectangle {
+                            height: 64px;
+                            border-radius: 12px;
+                            border-width: 1px;
+                            border-color: Theme.palette-border;
+                            HorizontalLayout {
+                                padding: 12px;
+                                spacing: 8px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    Text {
+                                        text: nb.name;
+                                        color: Theme.palette-muted;
+                                        font-family: "Montserrat";
+                                        font-size: 15px;
+                                        overflow: elide;
+                                    }
+                                }
+                                SecondaryAction {
+                                    text: "Restore";
+                                    clicked => { NotebookCb.archive(nb.account, false); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- notebook name dialog (create + rename) ----
+        if NotebooksUi.name-account != -1: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #00000088;
+            TouchArea { }   // swallow taps outside the panel
+            Rectangle {
+                x: 24px;
+                y: 90px + UISize.control-center-status-bar-height;
+                width: parent.width - 48px;
+                height: 176px;
+                background: Theme.palette-surface;
+                border-radius: 16px;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+                    Text {
+                        height: 20px;
+                        text: NotebooksUi.name-account == -2 ? "Name your new notebook" : "Name this notebook";
+                        color: Theme.palette-foreground;
+                        font-family: "Montserrat";
+                        font-size: 16px;
+                        font-weight: 600;
+                    }
+                    Rectangle {
+                        height: 44px;
+                        background: Theme.palette-background;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: nb-name-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                        clip: true;
+                        nb-name-input := TextInput {
+                            x: 14px;
+                            width: parent.width - 28px;
+                            height: 24px;
+                            y: (parent.height - self.height) / 2;
+                            text <=> NotebooksUi.name-text;
+                            color: Theme.palette-foreground;
+                            font-family: "Montserrat";
+                            font-size: 16px;
+                            single-line: true;
+                            accepted => { self.clear-focus(); }
+                        }
+                        Text {
+                            x: 14px;
+                            height: parent.height;
+                            text: NotebooksUi.name-text == "" && nb-name-input.preedit-text == ""
+                                ? "Name (optional)" : "";
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 15px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    HorizontalLayout {
+                        height: 48px;
+                        spacing: 8px;
+                        SecondaryAction {
+                            horizontal-stretch: 1;
+                            text: "Cancel";
+                            clicked => {
+                                nb-name-input.clear-focus();
+                                NotebookCb.name-cancel();
+                            }
+                        }
+                        PrimaryAction {
+                            horizontal-stretch: 1;
+                            text: NotebooksUi.name-account == -2 ? "Create" : "Save";
+                            clicked => {
+                                nb-name-input.clear-focus();
+                                NotebookCb.name-save();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if Contacts.naming-address != "": Rectangle {
             width: parent.width;
             height: parent.height;

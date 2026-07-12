@@ -50,7 +50,12 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
   `identity/<attempt>`, `note-enc/v1`, `dm-enc/v1`, the PNTE envelope
   layout (flags bit0 private, bit1 directed), and the directed-note AAD
   `sender_x(32) || recipient_x(32) || note_id(4)`. Every confirmed note
-  depends on them. Directed-private key = HKDF(dm/v1,
+  depends on them. The **notebook** (indexed) derivations are FROZEN the
+  same way: `Identity::from_app_seed_indexed` — index 0 delegates to the
+  original rules byte-identically (pre-notebooks state IS notebook 0),
+  index ≥ 1 expands infos `identity/nb/<index_le32>/<attempt_le32>` and
+  `note-enc/nb/<index_le32>/v1` under the same salts (vectors pinned in
+  `tests/vectors.rs::notebook_derivation_vectors`). Directed-private key = HKDF(dm/v1,
   x(my_tweaked_seckey · lift_x(peer_output_x))) — symmetric both ways,
   frozen vector in `tests/vectors.rs`.
 - **Pure-Rust only on device** (no C under armv7a-unknown-xous-elf).
@@ -88,6 +93,87 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
 - getrandom patch: after bumping deps re-run
   `cargo update getrandom@<ver> --precise 0.2.10` or the TRNG override
   silently drops out (check for "Patch … was not used" warnings).
+
+## Notebooks (device port — phase 1)
+
+A **notebook = an indexed identity** (`Identity::from_app_seed_indexed`,
+account 0 = the original single-identity app, byte-identical). Boot lands
+on the **notebook LIST (screen 20 — the main screen)**; tapping a row opens
+that notebook's home (screen 0, now with a back-to-list header). The device
+has NO onboarding, so a fresh install starts with an empty list and the
+user creates the first notebook deliberately.
+
+- **Data model** (`src/notebooks.rs`, pure-serde, unit-tested): a
+  `NotebookIndex` (account → name/archived) in `/.chain-notes/notebooks.json`;
+  each notebook's notes/UTXO ledger in its own
+  `/.chain-notes/state-<account>.json`. `State` gained a `#[serde(skip)]
+  account` (path implies it) so `save_state` routes without threading it.
+- **Migration**: a pre-notebooks `state.json` (no index yet) becomes
+  notebook 0 "Main" on first boot (`boot_notebooks`); the identity is
+  byte-identical, so the address/balance/notes are preserved.
+- **Active notebook**: `state`/`identity` are `Rc<RefCell<…>>` that swap on
+  `switch_notebook(account)` — save the current, derive the target identity
+  from the kept app seed, load its state, refresh every per-notebook view,
+  show its home. `active: Rc<RefCell<Option<u32>>>` (None on the list).
+- **Create is NAME-ONLY** (Sal 2026-07-11 — the device has no network to
+  probe used/new, so no address picker): `+ New notebook` → name dialog →
+  next unused account, derived + persisted at Save. Nothing before Save.
+  A new notebook inherits the wallet's network (open notebook's, else the
+  first notebook's, else mainnet).
+- **Archive**: local flag; guarded (a notebook holding sats can't be
+  archived — empty it first); zero active notebooks is legitimate
+  ("Archived (N)" section, empty-state caption). Rename via the row's "Aa".
+- Log lines: `cb: notebooks list n=<n> archived=<n>` · `cb: open-notebook
+  account=<n>` · `cb: create-notebook account=<n>` · `cb: rename-notebook
+  account=<n>` · `cb: archive-notebook account=<n> archived=<b>`.
+- **Phase 2a (DONE)**: wallet-level consolidate + sweep and a wallet-wide
+  Coins viewer. Consolidate/Sweep gather EVERY active notebook's coins
+  (same network only — a tx can't mix chains) into ONE multi-key tx via
+  notes-core `build_sweep_tx_multi`: `wallet_sources` collects
+  (account, output_x, tweaked_seckey, coins) per notebook, the sign step
+  updates each source notebook's `state-<account>.json` (and the
+  destination's for a consolidate). Consolidate lands in the ACTIVE
+  notebook (its Coins screen); the confirm warns when >1 notebook
+  contributes (on-chain address linkage). The Coins screen (9) lists all
+  notebooks' coins tagged by name; summary "N coin(s) · X sats across M
+  notebook(s)". Verified live in the sim (Main's 3 coins → wallet coins
+  view + consolidate build via the multi-key path); multi-notebook
+  correctness is unit-covered by notes-core `sweep_multi_source_cross_check`.
+  Log: `cb: sweep kind=<k> to=<self|addr> inputs=<n> notebooks=<m> …`.
+- **Sender filters (DONE, phase 2b)**: the notes screen (1) gets a
+  collapsible per-sender checklist (`Notes.senders` / `filter-expanded` /
+  `hidden-label`); `State.excluded_senders` (per-notebook, in
+  `state-<account>.json`) persists the EXCLUSION set so a new sender shows
+  by default. `sender_key` = the counterparty for received notes, "self"
+  for own notes (label "Self"); a contact-named sender uses the name. The
+  filtered notes list + a "N sender(s) hidden" pill; `toggle-sender`
+  callback. ASCII markers ([x]/[ ], caret ^/v) — the device font tofus
+  fancy glyphs. Verified live in the sim (toggling Self hid the 3 own
+  notes, left the 1 received; `cb: toggle-sender excluded=<b> hidden=<n>`).
+- **Network + chunk are WALLET-LEVEL** (Sal 2026-07-11): a `DeviceConfig`
+  (`config.json`, `{network, chunk_override}`) holds the shared network;
+  state files are per-(network, notebook) — `state-<net>-<account>.json`
+  — so each notebook keeps a separate ledger on each chain. `boot_config`
+  migrates the pre-2b per-notebook `state-<account>.json` (each with its
+  own network) into the per-network layout, device network = notebook 0's.
+  Runtime cells `net` + `device_chunk`; `load_state(fs, net, account)`,
+  `save_state` routes by `state.network`; `switch_notebook`/`refresh_*`
+  load for the device net; `cycle_network` flushes the active notebook,
+  cycles the shared network, persists config, reloads the active ledger
+  for the new chain (identity is network-independent — only the address
+  ENCODING changes, no re-derivation). Verified live: switching testnet4
+  → signet emptied Main (no signet ledger), switching back restored its
+  85500 sats — per-network isolation with data preserved.
+- **Settings is LIST-only** (wallet-level): the Settings button moved from
+  the per-notebook home to the notebook list; Settings shows the device
+  network + chunk + wallet Coins/Sweep, and its Back returns to the list.
+- **NOT ported**: wallet-wide Activity — the device has no separate
+  activity feed (notes are per-notebook by design, which is correct), so
+  N/A.
+- **chain-notes.sh (sim e2e) is boot-to-list aware**: waits for
+  `cb: notebooks list`, then taps the migrated "Main" row to reach home
+  before its existing flow (the seeded legacy `state.json` migrates to
+  Main automatically). Full run needs bitcoind + ~3 sim cycles.
 
 ## State & sync contract
 
