@@ -62,8 +62,20 @@ export struct NoteRow {
     badge: string,    // "PRIVATE" | "PUBLIC"
 }
 
+export struct SenderRow {
+    key: string,      // raw sender key (address or "self") — the exclusion entry
+    label: string,    // display: contact-less short address, or "Self"
+    sub: string,      // "N note(s)"
+    excluded: bool,
+}
+
 export global Notes {
     in-out property <[NoteRow]> rows;
+    // Sender filter: exclusions persist per notebook; anything not listed
+    // shows (a new sender is visible by default).
+    in-out property <[SenderRow]> senders;
+    in-out property <bool> filter-expanded: false;
+    in-out property <string> hidden-label: "";   // "2 sender(s) hidden" | ""
 }
 
 export struct ContactRow {
@@ -202,6 +214,7 @@ export global Callbacks {
     callback oversize-bump();       // raise chunk size to Standard from the dialog
     callback confirm-sign();        // persist + export, then note view
     callback refresh-notes();
+    callback toggle-sender(string, bool);  // exclude/include a sender key
     callback open-note(string);     // note id (hex)
     callback import-bundle();
     callback scan-bundle();         // system QR scanner → bundle import

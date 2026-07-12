@@ -140,9 +140,25 @@ user creates the first notebook deliberately.
   view + consolidate build via the multi-key path); multi-notebook
   correctness is unit-covered by notes-core `sweep_multi_source_cross_check`.
   Log: `cb: sweep kind=<k> to=<self|addr> inputs=<n> notebooks=<m> …`.
-- **NOT yet ported (phase 2b)**: wallet-wide Activity, sender filters on
-  the notes screen, settings restructure (list-only / wallet-level), sim
-  e2e (chain-notes.sh) boot-to-list update.
+- **Sender filters (DONE, phase 2b)**: the notes screen (1) gets a
+  collapsible per-sender checklist (`Notes.senders` / `filter-expanded` /
+  `hidden-label`); `State.excluded_senders` (per-notebook, in
+  `state-<account>.json`) persists the EXCLUSION set so a new sender shows
+  by default. `sender_key` = the counterparty for received notes, "self"
+  for own notes (label "Self"); a contact-named sender uses the name. The
+  filtered notes list + a "N sender(s) hidden" pill; `toggle-sender`
+  callback. ASCII markers ([x]/[ ], caret ^/v) — the device font tofus
+  fancy glyphs. Verified live in the sim (toggling Self hid the 3 own
+  notes, left the 1 received; `cb: toggle-sender excluded=<b> hidden=<n>`).
+- **NOT yet ported (phase 2b remainder)**: wallet-wide Activity (device has
+  no separate activity feed — notes are per-notebook by design, which is
+  correct; likely N/A), settings restructure (list-only / wallet-level +
+  making network device-level — needs a per-network state-file decision,
+  see below).
+- **chain-notes.sh (sim e2e) is boot-to-list aware**: waits for
+  `cb: notebooks list`, then taps the migrated "Main" row to reach home
+  before its existing flow (the seeded legacy `state.json` migrates to
+  Main automatically). Full run needs bitcoind + ~3 sim cycles.
 
 ## State & sync contract
 

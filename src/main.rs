@@ -146,6 +146,11 @@ struct State {
     bundle_time: Option<u64>,
     /// User-picked chunk size; None = DEFAULT_CHUNK. Purely device-side.
     chunk_override: Option<usize>,
+    /// Sender filter: sender keys (addresses, or "self") hidden from this
+    /// notebook's notes list. The EXCLUSION set persists — anything not
+    /// listed shows, so a new sender is visible by default.
+    #[serde(default)]
+    excluded_senders: Vec<String>,
     fee_economy: f64,
     fee_normal: f64,
     fee_fast: f64,
@@ -163,6 +168,7 @@ impl Default for State {
             tip_height: None,
             bundle_time: None,
             chunk_override: None,
+            excluded_senders: Vec::new(),
             fee_economy: 1.0,
             fee_normal: 2.0,
             fee_fast: 5.0,
@@ -198,6 +204,42 @@ impl State {
         self.chunk_override
             .map(|c| c.clamp(MIN_CHUNK, DEFAULT_CHUNK))
             .unwrap_or(DEFAULT_CHUNK)
+    }
+
+    /// The sender-filter key of a note: the counterparty for received
+    /// notes, else "self" (own notes — self and directed-from-us).
+    fn sender_key(n: &NoteRec) -> String {
+        match &n.from {
+            Some(f) => f.clone(),
+            None => "self".to_string(),
+        }
+    }
+
+    /// Distinct sender keys with counts, newest activity first.
+    fn senders(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for n in self.notes.iter().rev() {
+            let k = Self::sender_key(n);
+            match out.iter_mut().find(|(x, _)| *x == k) {
+                Some((_, c)) => *c += 1,
+                None => out.push((k, 1)),
+            }
+        }
+        out
+    }
+
+    fn is_excluded(&self, key: &str) -> bool {
+        self.excluded_senders.iter().any(|s| s == key)
+    }
+
+    fn set_excluded(&mut self, key: &str, excluded: bool) {
+        if excluded {
+            if !self.is_excluded(key) {
+                self.excluded_senders.push(key.to_string());
+            }
+        } else {
+            self.excluded_senders.retain(|s| s != key);
+        }
     }
 
     fn fee_rate(&self, tier: i32) -> f64 {
@@ -594,7 +636,37 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
-            let mut recs: Vec<&NoteRec> = st.notes.iter().collect();
+            // Sender filter: build the checklist + filter the list. A note
+            // is hidden iff its sender key is in the persisted exclusion set.
+            let senders: Vec<SenderRow> = st
+                .senders()
+                .into_iter()
+                .map(|(key, count)| {
+                    let label = if key == "self" {
+                        "Self".to_string()
+                    } else {
+                        st.contacts
+                            .iter()
+                            .find(|c| c.address == key && !c.name.is_empty())
+                            .map(|c| c.name.clone())
+                            .unwrap_or_else(|| short_addr(&key))
+                    };
+                    SenderRow {
+                        excluded: st.is_excluded(&key),
+                        key: key.into(),
+                        label: label.into(),
+                        sub: format!("{count} note(s)").into(),
+                    }
+                })
+                .collect();
+            let hidden = senders.iter().filter(|s| s.excluded).count();
+            let notes_g = ui.global::<Notes>();
+            notes_g.set_senders(Rc::new(VecModel::from(senders)).into());
+            notes_g.set_hidden_label(
+                if hidden == 0 { "".to_string() } else { format!("{hidden} sender(s) hidden") }.into(),
+            );
+            let mut recs: Vec<&NoteRec> =
+                st.notes.iter().filter(|n| !st.is_excluded(&State::sender_key(n))).collect();
             // Pending first, then newest confirmed first.
             recs.sort_by_key(|n| match n.height {
                 None => (0u8, 0i64),
@@ -620,8 +692,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     badge: if n.private { "PRIVATE" } else { "PUBLIC" }.into(),
                 })
                 .collect();
-            log::info!("cb: refresh-notes n={}", rows.len());
-            ui.global::<Notes>().set_rows(Rc::new(VecModel::from(rows)).into());
+            log::info!("cb: refresh-notes n={} hidden={hidden}", rows.len());
+            notes_g.set_rows(Rc::new(VecModel::from(rows)).into());
         }
     };
 
@@ -2136,6 +2208,25 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let refresh_notes = refresh_notes.clone();
         ui.global::<Callbacks>().on_refresh_notes(move || refresh_notes());
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let fs = fs.clone();
+        let refresh_notes = refresh_notes.clone();
+        ui.global::<Callbacks>().on_toggle_sender(move |key, excluded| {
+            let Some(_ui) = ui_weak.upgrade() else { return };
+            {
+                let mut st = state.borrow_mut();
+                st.set_excluded(key.as_str(), excluded);
+                save_state(&fs, &st);
+                log::info!(
+                    "cb: toggle-sender excluded={excluded} hidden={}",
+                    st.excluded_senders.len()
+                );
+            }
+            refresh_notes();
+        });
     }
     {
         let refresh_contacts = refresh_contacts.clone();
