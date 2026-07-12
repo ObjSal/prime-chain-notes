@@ -5,7 +5,9 @@
 // 8 = signed external PSBT, 9 = coins (viewer-first UTXO list),
 // 10 = sweep/consolidate (compose-like, shared via Sweep.kind),
 // 20 = notebook list (the MAIN screen — boot lands here; a notebook =
-//      an indexed identity, tapping a row opens its home = screen 0).
+//      an indexed identity, tapping a row opens its home = screen 0),
+// 21 = recovery words (24 BIP-39 words / SeedQR for the active seed —
+//      re-derived on reveal, cleared on close, never persisted).
 
 export global Ui {
     in-out property <int> screen: 0;
@@ -175,6 +177,29 @@ export global Settings {
     in-out property <string> chunk-error: "";
 }
 
+// Recovery seeds (screen 21 + the Settings wallet-context section).
+// A seed index rotates the whole 24-word phrase (scoped compromise);
+// the account is the BIP-86 wallet context — together they pick which
+// bip86 notebooks are visible (legacy notebooks are context-free).
+export global Recovery {
+    // True when GetAppSeed returned (set once at boot) — gates the reveal
+    // independently of whether a notebook is open (the recovery flow is
+    // wallet-level: reached from the list-level Settings, no active
+    // notebook, so Home.address is empty and must NOT gate this).
+    in-out property <bool> seed-available: false;
+    // Settings fields (numeric, committed by the Switch action).
+    in-out property <string> seed-text: "0";
+    in-out property <string> account-text: "0";
+    // Validation error shown in the section label ("" = valid).
+    in-out property <string> context-error: "";
+    // Reveal screen content — set on reveal, CLEARED on close.
+    in-out property <string> title-line: "";
+    in-out property <string> words-col1: "";   // "1. word\n… 12. word"
+    in-out property <string> words-col2: "";   // "13. word\n… 24. word"
+    in-out property <image> qr;
+    in-out property <bool> show-qr: false;
+}
+
 export struct NotebookRow {
     account: int,
     name: string,
@@ -232,4 +257,7 @@ export global Callbacks {
     callback sweep-changed();       // tier pill / custom rate edited → reprice
     callback sweep-continue();      // build + sign, then the confirm dialog
     callback sweep-sign();          // persist ledger + export + QR → screen 8
+    callback reveal-seed();         // derive the active seed's words → screen 21
+    callback reveal-close();        // clear the words + QR, back to settings
+    callback set-context();         // commit Recovery.seed-text/account-text
 }
