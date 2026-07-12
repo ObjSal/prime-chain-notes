@@ -12,7 +12,9 @@ use notes_core::bundle::{
 };
 use notes_core::address::p2tr_script_pubkey;
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
-use notes_core::tx::{build_sweep_tx, estimate_sweep_vsize, NoteTx, Utxo};
+use notes_core::tx::{
+    build_sweep_tx, build_sweep_tx_multi, estimate_sweep_vsize, NoteTx, SweepSource, Utxo,
+};
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
 use slint_keyos_platform::app_ui;
@@ -227,9 +229,62 @@ struct SweepPlan {
     tx: NoteTx,
     kind: &'static str,      // "sweep" | "consolidate"
     dest: Option<String>,    // None = self (consolidate)
+    // Wallet-level: which outpoints (display txid, vout) each source
+    // notebook contributed, so signing can update every source's ledger;
+    // and the destination notebook a consolidate's new coin lands in.
+    spent_by_account: Vec<(u32, Vec<(String, u32)>)>,
+    dest_account: u32,
 }
 
 // ------------------------------------------------------------- helpers
+
+/// Derive a notebook's identity from the app seed (None if locked).
+fn derive_identity(app_seed: &Option<[u8; 32]>, account: u32) -> Option<Identity> {
+    app_seed
+        .as_ref()
+        .and_then(|s| Identity::from_app_seed_indexed(s, account).ok())
+}
+
+/// Every ACTIVE notebook with spendable coins, as
+/// (account, output_x, tweaked_seckey, coins) — the inputs to a
+/// wallet-level sweep/consolidate (`build_sweep_tx_multi`). Reads each
+/// notebook's state from disk, so flush the active notebook first.
+fn wallet_sources(
+    fs: &Fs,
+    ix: &notebooks::NotebookIndex,
+    app_seed: &Option<[u8; 32]>,
+    net: &str,
+) -> Vec<(u32, [u8; 32], [u8; 32], Vec<Utxo>)> {
+    ix.active()
+        .filter_map(|m| {
+            let st = load_state(fs, m.account);
+            if st.network != net {
+                return None; // a tx can't mix networks
+            }
+            let coins = st.core_utxos();
+            if coins.is_empty() {
+                return None;
+            }
+            let id = derive_identity(app_seed, m.account)?;
+            Some((m.account, id.output_x, id.tweaked_seckey, coins))
+        })
+        .collect()
+}
+
+/// Coin count + total across the wallet's notebooks ON `net`.
+fn wallet_balance(fs: &Fs, ix: &notebooks::NotebookIndex, net: &str) -> (usize, u64) {
+    let mut n = 0;
+    let mut total = 0;
+    for m in ix.active() {
+        let st = load_state(fs, m.account);
+        if st.network != net {
+            continue;
+        }
+        n += st.utxos.len();
+        total += st.balance();
+    }
+    (n, total)
+}
 
 /// Per-notebook state file path (`/.chain-notes/state-<account>.json`).
 fn state_path(account: u32) -> String {
@@ -481,12 +536,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let state = Rc::new(RefCell::new(State::default()));
     let identity: Rc<RefCell<Option<Identity>>> = Rc::new(RefCell::new(None));
 
-    /// Derive a notebook's identity from the app seed (None if locked).
-    fn derive_identity(app_seed: &Option<[u8; 32]>, account: u32) -> Option<Identity> {
-        app_seed
-            .as_ref()
-            .and_then(|s| Identity::from_app_seed_indexed(s, account).ok())
-    }
 
     let refresh_home = {
         let ui_weak = ui_weak.clone();
@@ -604,24 +653,55 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let refresh_coins = {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let app_seed = app_seed.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let st = state.borrow();
-            let mut recs: Vec<&UtxoRec> = st.utxos.iter().collect();
-            recs.sort_by_key(|u| std::cmp::Reverse(u.value));
-            let rows: Vec<CoinRow> = recs
+            // Wallet-wide: every ACTIVE notebook's coins, each tagged with
+            // its notebook. Flush the active notebook first so its file is
+            // current, then read all from disk.
+            save_state(&fs, &state.borrow());
+            let ix = notebooks.borrow();
+            let active_net = state.borrow().network.clone();
+            let btc_usd = state.borrow().btc_usd;
+            // (value, notebook name, txid, vout) across the wallet.
+            let mut all: Vec<(u64, String, String, u32)> = Vec::new();
+            let mut nb_with_coins = 0usize;
+            for m in ix.active() {
+                let st2 = load_state(&fs, m.account);
+                if st2.network != active_net || st2.utxos.is_empty() {
+                    continue;
+                }
+                nb_with_coins += 1;
+                let short = derive_identity(&app_seed, m.account)
+                    .map(|id| short_addr(&id.address(st2.network())))
+                    .unwrap_or_default();
+                let name = notebook_name(&ix, m.account, &short);
+                for u in &st2.utxos {
+                    all.push((u.value, name.clone(), u.txid.clone(), u.vout));
+                }
+            }
+            all.sort_by_key(|(v, ..)| std::cmp::Reverse(*v));
+            let total: u64 = all.iter().map(|(v, ..)| v).sum();
+            let rows: Vec<CoinRow> = all
                 .iter()
-                .map(|u| CoinRow {
-                    label: format!("{} sats", u.value).into(),
-                    meta: format!("txid {} · output {}", short_addr(&u.txid), u.vout).into(),
+                .map(|(v, name, txid, vout)| CoinRow {
+                    label: format!("{v} sats · {name}").into(),
+                    meta: format!("txid {} · output {}", short_addr(txid), vout).into(),
                 })
                 .collect();
             let coins = ui.global::<Coins>();
             coins.set_summary(
-                format!("{} coin(s) · {}", rows.len(), sats_line(st.balance(), st.btc_usd)).into(),
+                format!(
+                    "{} coin(s) · {} across {nb_with_coins} notebook(s)",
+                    rows.len(),
+                    sats_line(total, btc_usd)
+                )
+                .into(),
             );
             coins.set_can_consolidate(rows.len() >= 2);
-            log::info!("cb: refresh-coins n={} total={}", rows.len(), st.balance());
+            log::info!("cb: refresh-coins n={} total={total} notebooks={nb_with_coins}", rows.len());
             coins.set_rows(Rc::new(VecModel::from(rows)).into());
         }
     };
@@ -631,6 +711,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let update_sweep = {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let sweep = ui.global::<Sweep>();
@@ -639,9 +721,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             if tier != 3 {
                 sweep.set_rate_text(format!("{}", st.fee_rate(tier)).into());
             }
-            let n = st.utxos.len();
-            let total = st.balance();
-            sweep.set_inputs_line(format!("Inputs · {n} coin(s) · {total} sats (all)").into());
+            // Wallet-level: inputs are EVERY notebook's coins (flush the
+            // active one first so its file reflects the latest ledger).
+            save_state(&fs, &st);
+            let (n, total) = wallet_balance(&fs, &notebooks.borrow(), &st.network);
+            sweep.set_inputs_line(format!("Inputs · {n} coin(s) · {total} sats (all notebooks)").into());
             if n == 0 {
                 sweep.set_cost_line("Nothing to sweep — no spendable coins.".into());
                 sweep.set_can_continue(false);
@@ -984,6 +1068,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let identity = identity.clone();
         let sweep_plan = sweep_plan.clone();
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let app_seed = app_seed.clone();
+        let active = active.clone();
         ui.global::<Callbacks>().on_sweep_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
@@ -991,6 +1079,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let state = state.clone();
             let identity = identity.clone();
             let sweep_plan = sweep_plan.clone();
+            let fs = fs.clone();
+            let notebooks = notebooks.clone();
+            let app_seed = app_seed.clone();
+            let active = active.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
@@ -1001,47 +1093,79 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let tier = sweep.get_tier();
                 let rate_text = sweep.get_rate_text().to_string();
                 let st = state.borrow();
+                // Flush the active notebook, then gather EVERY notebook's
+                // coins — a wallet-level sweep/consolidate, one multi-key tx.
+                save_state(&fs, &st);
+                let sources_raw =
+                    wallet_sources(&fs, &notebooks.borrow(), &app_seed, &st.network);
+                let dest_account = active.borrow().unwrap_or(0);
                 let id_guard = identity.borrow();
                 let result = id_guard
                     .as_ref()
                     .ok_or_else(|| "identity unavailable".to_string())
                     .and_then(|id| {
                         let rate = resolve_rate(tier, &rate_text, &st)?;
+                        if sources_raw.is_empty() {
+                            return Err("No spendable coins in the wallet.".to_string());
+                        }
                         let dest_spk = if consolidate {
                             p2tr_script_pubkey(&id.output_x)
                         } else {
                             Recipient::parse(st.network(), &dest).map_err(|e| e.to_string())?.spk
                         };
-                        build_sweep_tx(
-                            &st.core_utxos(),
-                            &id.output_x,
-                            dest_spk,
-                            rate,
-                            &id.tweaked_seckey,
-                            || generate_aux_rand(),
-                        )
-                        .map_err(|e| e.to_string())
+                        let sources: Vec<SweepSource> = sources_raw
+                            .iter()
+                            .map(|(_, ox, sk, coins)| SweepSource {
+                                utxos: coins,
+                                output_x: *ox,
+                                tweaked_seckey: sk,
+                            })
+                            .collect();
+                        build_sweep_tx_multi(&sources, dest_spk, rate, generate_aux_rand)
+                            .map_err(|e| e.to_string())
                     });
                 ui.global::<Ui>().set_busy(false);
                 match result {
                     Ok(tx) => {
-                        let total: u64 = st.balance();
+                        let total: u64 = sources_raw.iter().flat_map(|(_, _, _, c)| c).map(|u| u.value).sum();
                         let recv = tx.tx.outputs[0].value;
+                        let n_notebooks = sources_raw.len();
+                        // Spent outpoints per source notebook (display txid).
+                        let spent_by_account: Vec<(u32, Vec<(String, u32)>)> = sources_raw
+                            .iter()
+                            .map(|(acct, _, _, coins)| {
+                                let outs = coins
+                                    .iter()
+                                    .map(|u| {
+                                        let mut t = u.txid;
+                                        t.reverse();
+                                        (hex::encode(t), u.vout)
+                                    })
+                                    .collect();
+                                (*acct, outs)
+                            })
+                            .collect();
                         log::info!(
-                            "cb: sweep kind={kind} to={} inputs={} amount={recv} fee={} vsize={} txid={} ok",
+                            "cb: sweep kind={kind} to={} inputs={} notebooks={n_notebooks} amount={recv} fee={} vsize={} txid={} ok",
                             if consolidate { "self" } else { dest.as_str() },
                             tx.tx.inputs.len(),
                             tx.fee,
                             tx.vsize,
                             tx.txid_hex
                         );
+                        // On-chain linkage warning when >1 notebook contributes.
+                        let link = if n_notebooks > 1 {
+                            "\n\nHeads up: this spends coins from several notebooks in one tx, publicly linking their addresses on-chain."
+                        } else {
+                            ""
+                        };
                         sweep.set_confirm_summary(
                             format!(
-                                "{}\n\ninputs: {} coin(s) · {total} sats\nfee: {}\n{}: {recv} sats\n\ntxid:\n{}",
+                                "{}\n\ninputs: {} coin(s) from {n_notebooks} notebook(s) · {total} sats\nfee: {}\n{}: {recv} sats{link}\n\ntxid:\n{}",
                                 if consolidate {
-                                    "Consolidates every coin into one — back to your own address."
+                                    "Consolidates the WHOLE wallet into one coin at this notebook's address."
                                 } else {
-                                    "Sweeps EVERYTHING to the destination — this empties the notes address."
+                                    "Sweeps the WHOLE wallet to the destination — this empties every notebook."
                                 },
                                 tx.tx.inputs.len(),
                                 sats_line(tx.fee, st.btc_usd),
@@ -1054,6 +1178,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             tx,
                             kind: if consolidate { "consolidate" } else { "sweep" },
                             dest: (!consolidate).then(|| dest.clone()),
+                            spent_by_account,
+                            dest_account,
                         });
                         sweep.set_show_confirm(true);
                     }
@@ -1074,6 +1200,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let sweep_plan = sweep_plan.clone();
         let fs = fs.clone();
+        let active = active.clone();
         let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_sweep_sign(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -1082,28 +1209,37 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let ui_weak = ui_weak.clone();
             let state = state.clone();
             let fs = fs.clone();
+            let active = active.clone();
             let refresh_home = refresh_home.clone();
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
                 let mut st = state.borrow_mut();
+                let active_acct = active.borrow().unwrap_or(p.dest_account);
 
-                // Ledger: every input is spent; a consolidate's single
-                // output comes straight back as our own (unconfirmed) coin.
-                let spent: Vec<(String, u32)> = p
-                    .tx
-                    .spent_outpoints
-                    .iter()
-                    .map(|(txid, vout)| {
-                        let mut t = *txid;
-                        t.reverse();
-                        (hex::encode(t), *vout)
-                    })
-                    .collect();
-                let inputs = spent.len();
-                st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                // Wallet-level ledger: remove each notebook's spent inputs
+                // from its own state file (the active one via the live
+                // `st`); a consolidate's single output lands in the
+                // destination notebook as its new (unconfirmed) coin.
+                let inputs: usize = p.spent_by_account.iter().map(|(_, o)| o.len()).sum();
                 let recv = p.tx.tx.outputs[0].value;
+                for (acct, spent) in &p.spent_by_account {
+                    if *acct == active_acct {
+                        st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                    } else {
+                        let mut other = load_state(&fs, *acct);
+                        other.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                        save_state(&fs, &other);
+                    }
+                }
                 if p.kind == "consolidate" {
-                    st.utxos.push(UtxoRec { txid: p.tx.txid_hex.clone(), vout: 0, value: recv });
+                    let coin = UtxoRec { txid: p.tx.txid_hex.clone(), vout: 0, value: recv };
+                    if p.dest_account == active_acct {
+                        st.utxos.push(coin);
+                    } else {
+                        let mut dest = load_state(&fs, p.dest_account);
+                        dest.utxos.push(coin);
+                        save_state(&fs, &dest);
+                    }
                 }
 
                 let file = format!("{OUTBOX_DIR}/{}.hex", p.tx.txid_hex);
