@@ -80,8 +80,9 @@ fn fit_check(
 }
 
 const STATE_DIR: &str = "/.chain-notes";
-const STATE_PATH: &str = "/.chain-notes/state.json"; // legacy (pre-notebooks) — migrated to state-0.json
+const STATE_PATH: &str = "/.chain-notes/state.json"; // legacy (pre-notebooks)
 const NOTEBOOKS_PATH: &str = "/.chain-notes/notebooks.json";
+const CONFIG_PATH: &str = "/.chain-notes/config.json"; // device-level {network, chunk}
 const INBOX_DIR: &str = "/chain-notes/inbox";
 const OUTBOX_DIR: &str = "/chain-notes/outbox";
 
@@ -299,10 +300,7 @@ fn wallet_sources(
 ) -> Vec<(u32, [u8; 32], [u8; 32], Vec<Utxo>)> {
     ix.active()
         .filter_map(|m| {
-            let st = load_state(fs, m.account);
-            if st.network != net {
-                return None; // a tx can't mix networks
-            }
+            let st = load_state(fs, net, m.account);
             let coins = st.core_utxos();
             if coins.is_empty() {
                 return None;
@@ -318,36 +316,73 @@ fn wallet_balance(fs: &Fs, ix: &notebooks::NotebookIndex, net: &str) -> (usize, 
     let mut n = 0;
     let mut total = 0;
     for m in ix.active() {
-        let st = load_state(fs, m.account);
-        if st.network != net {
-            continue;
-        }
+        let st = load_state(fs, net, m.account);
         n += st.utxos.len();
         total += st.balance();
     }
     (n, total)
 }
 
-/// Per-notebook state file path (`/.chain-notes/state-<account>.json`).
-fn state_path(account: u32) -> String {
+/// Device-level settings shared by every notebook (Sal 2026-07-11:
+/// network is wallet-wide). Persisted at CONFIG_PATH.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct DeviceConfig {
+    network: String,
+    chunk_override: Option<usize>,
+}
+impl Default for DeviceConfig {
+    fn default() -> Self {
+        DeviceConfig { network: "mainnet".into(), chunk_override: None }
+    }
+}
+impl DeviceConfig {
+    fn network(&self) -> Network {
+        Network::from_str_opt(&self.network).unwrap_or(Network::Mainnet)
+    }
+}
+
+fn load_config(fs: &Fs) -> Option<DeviceConfig> {
+    read_text(fs, CONFIG_PATH, Location::User)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+}
+
+fn save_config(fs: &Fs, cfg: &DeviceConfig) {
+    if let Ok(json) = serde_json::to_string(cfg) {
+        let _ = ensure_dir(fs, STATE_DIR, Location::User)
+            .and_then(|_| write_file(fs, CONFIG_PATH, Location::User, json.as_bytes()));
+    }
+}
+
+/// Pre-2b per-notebook state path (had its own network field).
+fn state_path_v1(account: u32) -> String {
     format!("/.chain-notes/state-{account}.json")
 }
 
-/// Load a notebook's state, stamping its account so `save_state` can route
-/// back without the caller threading it through.
-fn load_state(fs: &Fs, account: u32) -> State {
-    let mut st: State = read_text(fs, &state_path(account), Location::User)
+/// Per-(network, notebook) state file: each notebook has a separate ledger
+/// on each network (network is device-level now).
+fn state_path(net: &str, account: u32) -> String {
+    format!("/.chain-notes/state-{net}-{account}.json")
+}
+
+/// Load a notebook's state for `net`, stamping network + account so
+/// `save_state` routes back to the same file.
+fn load_state(fs: &Fs, net: &str, account: u32) -> State {
+    let mut st: State = read_text(fs, &state_path(net, account), Location::User)
         .ok()
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
     st.account = account;
+    st.network = net.to_string();
     st
 }
 
 fn save_state(fs: &Fs, state: &State) {
     let json = serde_json::to_string(state).expect("state serializes");
+    let path = state_path(&state.network, state.account);
     if let Err(e) = ensure_dir(fs, STATE_DIR, Location::User)
-        .and_then(|_| write_file(fs, &state_path(state.account), Location::User, json.as_bytes()))
+        .and_then(|_| write_file(fs, &path, Location::User, json.as_bytes()))
     {
         log::warn!("state save failed: {e}");
     }
@@ -380,15 +415,46 @@ fn boot_notebooks(fs: &Fs) -> notebooks::NotebookIndex {
     }
     let mut ix = notebooks::NotebookIndex::default();
     if let Ok(json) = read_text(fs, STATE_PATH, Location::User) {
-        // Legacy single-identity install → notebook 0 "Main".
+        // Legacy single-identity install → notebook 0 "Main" (v1 file;
+        // boot_config then moves it to the per-network layout).
         let _ = ensure_dir(fs, STATE_DIR, Location::User)
-            .and_then(|_| write_file(fs, &state_path(0), Location::User, json.as_bytes()));
+            .and_then(|_| write_file(fs, &state_path_v1(0), Location::User, json.as_bytes()));
         ix.ensure(0);
         ix.rename(0, notebooks::FIRST_NOTEBOOK_NAME);
         log::info!("cb: notebooks migrated legacy state -> Main");
     }
     save_notebooks(fs, &ix);
     ix
+}
+
+/// Device config, migrating pre-2b per-notebook state files
+/// (`state-<account>.json`, each with its own network) into the
+/// per-network layout (`state-<net>-<account>.json`) on first boot. The
+/// device network becomes notebook 0's (else the lowest notebook's, else
+/// mainnet); each notebook's ledger is preserved under its own network, so
+/// switching the device network later reveals each notebook's chain data.
+fn boot_config(fs: &Fs, ix: &notebooks::NotebookIndex) -> DeviceConfig {
+    if let Some(cfg) = load_config(fs) {
+        return cfg;
+    }
+    let mut dev: Option<(String, Option<usize>)> = None;
+    for m in &ix.notebooks {
+        let Ok(json) = read_text(fs, &state_path_v1(m.account), Location::User) else { continue };
+        let st: State = serde_json::from_str(&json).unwrap_or_default();
+        let net = st.network.clone();
+        // Re-route to the per-network file.
+        let _ = ensure_dir(fs, STATE_DIR, Location::User).and_then(|_| {
+            write_file(fs, &state_path(&net, m.account), Location::User, json.as_bytes())
+        });
+        if m.account == 0 || dev.is_none() {
+            dev = Some((net, st.chunk_override));
+        }
+    }
+    let (network, chunk_override) = dev.unwrap_or_else(|| ("mainnet".into(), None));
+    let cfg = DeviceConfig { network, chunk_override };
+    save_config(fs, &cfg);
+    log::info!("cb: config migrated network={} (per-network state files)", cfg.network);
+    cfg
 }
 
 fn read_text(fs: &Fs, path: &str, loc: Location) -> Result<String, String> {
@@ -572,6 +638,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     // install — the device has no onboarding).
     let notebooks: Rc<RefCell<notebooks::NotebookIndex>> =
         Rc::new(RefCell::new(boot_notebooks(&fs)));
+    // Device-level network (wallet-wide): one setting shared by every
+    // notebook; each notebook's ledger is per-network on disk.
+    let device_cfg = boot_config(&fs, &notebooks.borrow());
+    let net: Rc<RefCell<String>> = Rc::new(RefCell::new(device_cfg.network.clone()));
+    let device_chunk: Rc<RefCell<Option<usize>>> =
+        Rc::new(RefCell::new(device_cfg.chunk_override));
     let active: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
     // The ACTIVE notebook's state + identity (both swap on notebook switch);
     // an empty placeholder until a notebook is opened.
@@ -583,11 +655,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let identity = identity.clone();
+        let net = net.clone();
+        let device_chunk = device_chunk.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
             let home = ui.global::<Home>();
-            home.set_network(st.network.clone().into());
+            home.set_network(net.borrow().clone().into()); // device-level network
             if let Some(id) = identity.borrow().as_ref() {
                 let addr = id.address(st.network());
                 home.set_qr(qr_image(&addr.to_uppercase()));
@@ -615,12 +689,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 .into(),
             );
             let settings = ui.global::<Settings>();
-            settings.set_chunk_mode(match st.chunk_override {
+            let dchunk = *device_chunk.borrow();
+            settings.set_chunk_mode(match dchunk {
                 None => 0,
                 Some(80) => 1,
                 Some(_) => 2,
             });
-            settings.set_chunk_text(format!("{}", st.effective_chunk()).into());
+            let eff = dchunk.map(|c| c.clamp(MIN_CHUNK, DEFAULT_CHUNK)).unwrap_or(DEFAULT_CHUNK);
+            settings.set_chunk_text(format!("{eff}").into());
             log::info!(
                 "cb: home balance={} utxos={} tip={}",
                 st.balance(),
@@ -728,6 +804,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         let notebooks = notebooks.clone();
         let app_seed = app_seed.clone();
+        let net = net.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             // Wallet-wide: every ACTIVE notebook's coins, each tagged with
@@ -735,14 +812,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // current, then read all from disk.
             save_state(&fs, &state.borrow());
             let ix = notebooks.borrow();
-            let active_net = state.borrow().network.clone();
+            let active_net = net.borrow().clone();
             let btc_usd = state.borrow().btc_usd;
             // (value, notebook name, txid, vout) across the wallet.
             let mut all: Vec<(u64, String, String, u32)> = Vec::new();
             let mut nb_with_coins = 0usize;
             for m in ix.active() {
-                let st2 = load_state(&fs, m.account);
-                if st2.network != active_net || st2.utxos.is_empty() {
+                let st2 = load_state(&fs, &active_net, m.account);
+                if st2.utxos.is_empty() {
                     continue;
                 }
                 nb_with_coins += 1;
@@ -872,14 +949,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let notebooks = notebooks.clone();
         let active = active.clone();
         let app_seed = app_seed.clone();
+        let net = net.clone();
         Rc::new(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let ix = notebooks.borrow();
             let active_acct = *active.borrow();
+            let dev_net = net.borrow().clone();
             let build = |m: &notebooks::NotebookMeta| -> NotebookRow {
-                let st = load_state(&fs, m.account);
+                let st = load_state(&fs, &dev_net, m.account);
                 let addr = derive_identity(&app_seed, m.account)
-                    .map(|id| id.address(st.network()))
+                    .map(|id| id.address(Network::from_str_opt(&dev_net).unwrap_or(Network::Mainnet)))
                     .unwrap_or_default();
                 let short = short_addr(&addr);
                 let n = st.notes.len();
@@ -929,6 +1008,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let active = active.clone();
         let notebooks = notebooks.clone();
         let app_seed = app_seed.clone();
+        let net = net.clone();
+        let device_chunk = device_chunk.clone();
         let refresh_home = refresh_home.clone();
         let refresh_notes = refresh_notes.clone();
         let refresh_coins = refresh_coins.clone();
@@ -940,7 +1021,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             }
             *active.borrow_mut() = Some(account);
             *identity.borrow_mut() = derive_identity(&app_seed, account);
-            *state.borrow_mut() = load_state(&fs, account);
+            let mut loaded = load_state(&fs, &net.borrow(), account);
+            loaded.chunk_override = *device_chunk.borrow(); // chunk is device-level
+            *state.borrow_mut() = loaded;
             let short = identity
                 .borrow()
                 .as_ref()
@@ -1273,6 +1356,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let sweep_plan = sweep_plan.clone();
         let fs = fs.clone();
         let active = active.clone();
+        let net = net.clone();
         let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_sweep_sign(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -1282,6 +1366,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let state = state.clone();
             let fs = fs.clone();
             let active = active.clone();
+            let net = net.clone();
             let refresh_home = refresh_home.clone();
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
@@ -1298,7 +1383,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     if *acct == active_acct {
                         st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
                     } else {
-                        let mut other = load_state(&fs, *acct);
+                        let mut other = load_state(&fs, &net.borrow(), *acct);
                         other.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
                         save_state(&fs, &other);
                     }
@@ -1308,7 +1393,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     if p.dest_account == active_acct {
                         st.utxos.push(coin);
                     } else {
-                        let mut dest = load_state(&fs, p.dest_account);
+                        let mut dest = load_state(&fs, &net.borrow(), p.dest_account);
                         dest.utxos.push(coin);
                         save_state(&fs, &dest);
                     }
@@ -2117,21 +2202,48 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
 
     {
+        let ui_weak = ui_weak.clone();
         let state = state.clone();
+        let identity = identity.clone();
         let fs = fs.clone();
+        let net = net.clone();
+        let active = active.clone();
+        let device_chunk = device_chunk.clone();
         let refresh_home = refresh_home.clone();
+        let refresh_notes = refresh_notes.clone();
+        let refresh_coins = refresh_coins.clone();
+        let refresh_notebooks = refresh_notebooks.clone();
         ui.global::<Callbacks>().on_cycle_network(move || {
-            let mut st = state.borrow_mut();
-            st.network = match st.network.as_str() {
-                "mainnet" => "testnet4".into(),
-                "testnet4" => "signet".into(),
-                "signet" => "regtest".into(),
-                _ => "mainnet".into(),
-            };
-            log::info!("cb: set-network {}", st.network);
-            save_state(&fs, &st);
-            drop(st);
+            // Network is device-level (wallet-wide): flush the active
+            // notebook, cycle the shared network, persist it in config, and
+            // reload the active notebook's ledger for the new chain (each
+            // notebook keeps a per-network ledger in state-<net>-<account>).
+            if active.borrow().is_some() {
+                save_state(&fs, &state.borrow());
+            }
+            let next = match net.borrow().as_str() {
+                "mainnet" => "testnet4",
+                "testnet4" => "signet",
+                "signet" => "regtest",
+                _ => "mainnet",
+            }
+            .to_string();
+            *net.borrow_mut() = next.clone();
+            save_config(&fs, &DeviceConfig { network: next.clone(), chunk_override: *device_chunk.borrow() });
+            log::info!("cb: set-network {next}");
+            if let Some(account) = *active.borrow() {
+                let mut fresh = load_state(&fs, &next, account);
+                fresh.chunk_override = *device_chunk.borrow();
+                *state.borrow_mut() = fresh;
+            }
+            // Identity is network-independent (same key) — only the address
+            // ENCODING changes, so no re-derivation; refresh the views that
+            // show addresses/ledgers.
+            let _ = (&ui_weak, &identity);
             refresh_home();
+            refresh_notes();
+            refresh_coins();
+            refresh_notebooks();
         });
     }
 
@@ -2139,6 +2251,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let fs = fs.clone();
+        let net = net.clone();
+        let device_chunk = device_chunk.clone();
         let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_chunk_changed(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2170,6 +2284,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             );
             settings.set_chunk_error("".into());
             save_state(&fs, &st);
+            // Chunk is device-level (wallet-wide): persist it in config too.
+            *device_chunk.borrow_mut() = st.chunk_override;
+            save_config(&fs, &DeviceConfig { network: net.borrow().clone(), chunk_override: st.chunk_override });
             drop(st);
             // Reflect the effective size back into the field (auto/compat),
             // without touching a valid custom value.
@@ -2278,7 +2395,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
-        let state = state.clone();
         let notebooks = notebooks.clone();
         let active = active.clone();
         let app_seed = app_seed.clone();
@@ -2310,20 +2426,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     }
                     save_notebooks(&fs, &ix);
                 }
-                // Inherit the wallet's network so a new notebook lands on
-                // the same chain: the open notebook's if one is active, else
-                // the first existing notebook's (creating from the list),
-                // else mainnet.
-                let net = match *active.borrow() {
-                    Some(_) => state.borrow().network.clone(),
-                    None => notebooks
-                        .borrow()
-                        .active()
-                        .find(|m| m.account != account)
-                        .map(|m| load_state(&fs, m.account).network)
-                        .unwrap_or_else(|| "mainnet".into()),
-                };
-                save_state(&fs, &State { account, network: net, ..State::default() });
                 log::info!("cb: create-notebook account={account}");
                 refresh_notebooks();
                 switch_notebook(account);
@@ -2354,6 +2456,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let notebooks = notebooks.clone();
+        let net = net.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         ui.global::<NotebookCb>().on_archive(move |account, archived| {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2361,7 +2464,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             if archived {
                 // Guard: a notebook with coins must be emptied first
                 // (sweep/consolidate). Zero active notebooks is allowed.
-                let bal = load_state(&fs, account).balance();
+                let bal = load_state(&fs, &net.borrow(), account).balance();
                 if bal > 0 {
                     ui.global::<Ui>()
                         .set_error(format!("This notebook holds {bal} sats — empty it first.").into());
