@@ -56,6 +56,37 @@ impl Identity {
         })
     }
 
+    /// Identity from a BIP-86 leaf secret — the bip86 notebook scheme
+    /// (PLAN-chain-notes-seed-rotation.md) and chain-notes-app's shipped
+    /// derivation: BIP-341 tweak for the keys, the FROZEN
+    /// `chain-notes-app/enc/v1` rule for the enc key. Byte-identical to
+    /// what chain-notes-app derives after a plain BIP-39 import.
+    pub fn from_leaf_secret(leaf_secret: &[u8; 32]) -> Result<Self, Error> {
+        let (internal_x, _) = xonly_pubkey(leaf_secret)?;
+        let (output_x, _) = taproot_tweak_pubkey(&internal_x, None)?;
+        let tweaked_seckey = taproot_tweak_seckey(leaf_secret, None)?;
+        Ok(Identity {
+            internal_x,
+            output_x,
+            tweaked_seckey,
+            enc_key: crate::keys::enc_key_from_leaf(leaf_secret),
+        })
+    }
+
+    /// [`Self::from_leaf_secret`] for notebook `index` of `account` under
+    /// rotation seed `seed_index` — the full recovery-seeds pipeline from
+    /// the app seed (see `seeds.rs`).
+    pub fn from_bip86(
+        app_seed: &[u8; 32],
+        seed_index: u32,
+        network: Network,
+        account: u32,
+        index: u32,
+    ) -> Result<Self, Error> {
+        let leaf = crate::seeds::derive_leaf(app_seed, seed_index, network, account, index)?;
+        Self::from_leaf_secret(&leaf)
+    }
+
     pub fn address(&self, network: Network) -> String {
         taproot_address(network, &self.output_x)
     }

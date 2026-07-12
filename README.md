@@ -2,7 +2,7 @@
 
 **Bitcoin · Notes** — personal notes on the bitcoin blockchain, written from a device that has no network on purpose.
 
-Compose a note on your Passport Prime, seal it with a key only your device seed can re-derive — or leave it deliberately public — and the app builds and signs a real bitcoin transaction carrying the note. An online companion page broadcasts it and scans the chain; the device and the companion exchange nothing but files and QR codes. Your address history *is* the notebook: wipe the device, restore your seed, rescan the chain — every note comes back, private ones decrypted, with nothing stored anywhere else.
+Compose a note on your Passport Prime, seal it with a key only your seed can re-derive — or leave it deliberately public — and the app builds and signs a real bitcoin transaction carrying the note. An online companion page broadcasts it and scans the chain; the device and the companion exchange nothing but files and QR codes. Your address history *is* the notebook: wipe the device, restore your seed, rescan the chain — every note comes back, private ones decrypted, with nothing stored anywhere else.
 
 Keep as many **notebooks** as you like — each is its own address, derived from the same device seed, with its own notes, balance, and name. Sort a life's worth of notes: one for gifts, one for a project, one you'll archive when it's done.
 
@@ -17,6 +17,7 @@ Keep as many **notebooks** as you like — each is its own address, derived from
 ## Features
 
 - **Notebooks** — keep separate notebooks, each a distinct address derived from your one device seed, each with its own notes, balance, and name; create or archive them as your life needs, and filter a notebook's notes by who sent them.
+- **A backup you can read** — your notebooks derive from a 24-word recovery phrase the device shows on demand, as words or a SeedQR. Write it down once and your funds restore in *any* bitcoin wallet and your notes in this app — no Passport required. Keep separate **accounts** for separate lives, and if a phrase is ever exposed, switch to a fresh one.
 - **Public or private** — private notes are sealed with modern authenticated encryption before they ever leave the device; public notes are plain text for the world to read.
 - **Notes to other people** — composing starts at a **contacts picker**: yourself, recent addresses (nameable), a QR scan, or manual entry. Directed notes reach any taproot address like unstoppable, uncensorable mail; private directed notes can be read by exactly two devices — yours and theirs — and both can recover them from bare chain data after a wipe.
 - **A gift inside** — directed notes can carry a chosen amount of sats to the recipient, from the minimum dust up to whatever you like.
@@ -29,6 +30,8 @@ Keep as many **notebooks** as you like — each is its own address, derived from
   <img src="screenshots/contacts.png" alt="Send to — contacts picker with recents and QR scan" width="270">
   &nbsp;
   <img src="screenshots/note.png" alt="A private note, decrypted on-device" width="270">
+  &nbsp;
+  <img src="screenshots/recovery.png" alt="Recovery words — a 24-word backup the device shows on demand, as words or a SeedQR" width="270">
 </p>
 
 ## The companion

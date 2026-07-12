@@ -40,6 +40,24 @@ fn main() {
             let network = Network::from_str_opt(&args[2]).expect("network");
             println!("{}", identity.address(network));
         }
+        // Recovery seeds (PLAN-chain-notes-seed-rotation.md): mirror what
+        // the device derives so the e2e can cross-check the sim UI and
+        // feed the words to the chain-notes-app import.
+        Some("seed-words") => {
+            // seed-words <seed_index>
+            let index: u32 = args[2].parse().expect("seed index");
+            let words = notes_core::seeds::seed_mnemonic(&app_seed(), index).unwrap();
+            println!("{}", &*words);
+        }
+        Some("seed-address") => {
+            // seed-address <network> <seed_index> <account> <index>
+            let network = Network::from_str_opt(&args[2]).expect("network");
+            let seed: u32 = args[3].parse().expect("seed index");
+            let account: u32 = args[4].parse().expect("account");
+            let index: u32 = args[5].parse().expect("receive index");
+            let id = Identity::from_bip86(&app_seed(), seed, network, account, index).unwrap();
+            println!("{}", id.address(network));
+        }
         Some("compose") => {
             // compose <bundle.json|-> <public|private> <fee_rate> <max_or> <text>
             let bundle = read_bundle(&args[2]);
