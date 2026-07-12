@@ -1,8 +1,8 @@
 import { Theme, UISize, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize } from "@ui/theme.slint";
-import { Callbacks, Ui, Home, Compose, Confirm, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow } from "callbacks.slint";
+import { Callbacks, Ui, Home, Compose, Confirm, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery } from "callbacks.slint";
 import { Button } from "@ui/button.slint";
 
-export { Callbacks, Ui, Home, Compose, Confirm, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
+export { Callbacks, Ui, Home, Compose, Confirm, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
 
 component PrimaryAction inherits Button {
     background: Theme.palette-primary;
@@ -1252,6 +1252,155 @@ export component AppWindow inherits Window {
 
             Text {
                 text: "Chunk size caps each OP_RETURN output. Standard (100000) matches Bitcoin Core v30 relay defaults, verified on mempool.space; pick 80 if your broadcast endpoint rejects a note, then recompose it.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+
+            // Recovery seeds + BIP-86 accounts — its own screen (21): the
+            // wallet-context switcher and the 24-word reveal.
+            SecondaryAction {
+                width: 100%;
+                text: "Recovery & accounts…";
+                clicked => { Ui.screen = 21; }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        // ------------------------------- screen 21: recovery & accounts
+        // Wallet context (rotation seed index + BIP-86 account) on top —
+        // keyboard-safe — then the words reveal. Words/QR are re-derived
+        // on reveal and CLEARED on any exit (reveal-close).
+        if Ui.screen == 21: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 12px;
+
+            ScreenHeader {
+                title: "Recovery";
+                back => {
+                    Callbacks.reveal-close();
+                    Ui.screen = 6;
+                }
+            }
+
+            Text {
+                text: Recovery.context-error == "" ? "Seed index · account" : Recovery.context-error;
+                color: Recovery.context-error == "" ? Theme.palette-muted : Theme.palette-danger;
+                font-family: "Montserrat";
+                font-size: 14px;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle {
+                    height: 44px;
+                    horizontal-stretch: 1;
+                    background: Theme.palette-surface;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: seed-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                    clip: true;
+                    seed-input := TextInput {
+                        x: 14px;
+                        width: parent.width - 28px;
+                        height: 24px;
+                        y: (parent.height - self.height) / 2;
+                        text <=> Recovery.seed-text;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 18px;
+                        single-line: true;
+                        accepted => { self.clear-focus(); }
+                    }
+                }
+                Rectangle {
+                    height: 44px;
+                    horizontal-stretch: 1;
+                    background: Theme.palette-surface;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: account-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                    clip: true;
+                    account-input := TextInput {
+                        x: 14px;
+                        width: parent.width - 28px;
+                        height: 24px;
+                        y: (parent.height - self.height) / 2;
+                        text <=> Recovery.account-text;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 18px;
+                        single-line: true;
+                        accepted => { self.clear-focus(); }
+                    }
+                }
+                SecondaryAction {
+                    text: "Switch";
+                    clicked => { Callbacks.set-context(); }
+                }
+            }
+
+            SecondaryAction {
+                width: 100%;
+                text: Recovery.words-col1 == "" ? "Show recovery words…" : "Hide recovery words";
+                disabled: Home.address == "";
+                clicked => {
+                    if (Recovery.words-col1 == "") {
+                        Callbacks.reveal-seed();
+                    } else {
+                        Callbacks.reveal-close(); // clears only — stays here
+                    }
+                }
+            }
+
+            if Recovery.words-col1 != "": VerticalLayout {
+                spacing: 10px;
+                Text {
+                    text: Recovery.title-line;
+                    color: Theme.palette-foreground;
+                    font-family: "Montserrat";
+                    font-size: 16px;
+                    font-weight: 600;
+                }
+                if !Recovery.show-qr: HorizontalLayout {
+                    spacing: 16px;
+                    Text {
+                        text: Recovery.words-col1;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 15px;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Recovery.words-col2;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 15px;
+                        horizontal-stretch: 1;
+                    }
+                }
+                if Recovery.show-qr: Image {
+                    source: Recovery.qr;
+                    width: 190px;
+                    height: 190px;
+                    image-rendering: pixelated;
+                    x: (parent.width - self.width) / 2;
+                }
+                SecondaryAction {
+                    width: 100%;
+                    text: Recovery.show-qr ? "Show words" : "Show as SeedQR";
+                    clicked => { Recovery.show-qr = !Recovery.show-qr; }
+                }
+            }
+
+            if Recovery.words-col1 == "": Text {
+                text: "These 24 words are the complete backup of THIS seed's notebooks — funds and private notes. Anyone who sees them has everything on this seed, forever. Switching the seed index makes an entirely new phrase; old words keep old keys, so sweep funds before abandoning a seed.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
                 font-size: 13px;
