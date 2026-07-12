@@ -94,6 +94,45 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
   `cargo update getrandom@<ver> --precise 0.2.10` or the TRNG override
   silently drops out (check for "Patch … was not used" warnings).
 
+## Notebooks (device port — phase 1)
+
+A **notebook = an indexed identity** (`Identity::from_app_seed_indexed`,
+account 0 = the original single-identity app, byte-identical). Boot lands
+on the **notebook LIST (screen 20 — the main screen)**; tapping a row opens
+that notebook's home (screen 0, now with a back-to-list header). The device
+has NO onboarding, so a fresh install starts with an empty list and the
+user creates the first notebook deliberately.
+
+- **Data model** (`src/notebooks.rs`, pure-serde, unit-tested): a
+  `NotebookIndex` (account → name/archived) in `/.chain-notes/notebooks.json`;
+  each notebook's notes/UTXO ledger in its own
+  `/.chain-notes/state-<account>.json`. `State` gained a `#[serde(skip)]
+  account` (path implies it) so `save_state` routes without threading it.
+- **Migration**: a pre-notebooks `state.json` (no index yet) becomes
+  notebook 0 "Main" on first boot (`boot_notebooks`); the identity is
+  byte-identical, so the address/balance/notes are preserved.
+- **Active notebook**: `state`/`identity` are `Rc<RefCell<…>>` that swap on
+  `switch_notebook(account)` — save the current, derive the target identity
+  from the kept app seed, load its state, refresh every per-notebook view,
+  show its home. `active: Rc<RefCell<Option<u32>>>` (None on the list).
+- **Create is NAME-ONLY** (Sal 2026-07-11 — the device has no network to
+  probe used/new, so no address picker): `+ New notebook` → name dialog →
+  next unused account, derived + persisted at Save. Nothing before Save.
+  A new notebook inherits the wallet's network (open notebook's, else the
+  first notebook's, else mainnet).
+- **Archive**: local flag; guarded (a notebook holding sats can't be
+  archived — empty it first); zero active notebooks is legitimate
+  ("Archived (N)" section, empty-state caption). Rename via the row's "Aa".
+- Log lines: `cb: notebooks list n=<n> archived=<n>` · `cb: open-notebook
+  account=<n>` · `cb: create-notebook account=<n>` · `cb: rename-notebook
+  account=<n>` · `cb: archive-notebook account=<n> archived=<b>`.
+- **NOT yet ported (phase 2)**: wallet-level consolidate/sweep across all
+  notebooks (device consolidate/sweep are still per-active-notebook),
+  wallet-wide coins/activity, sender filters, settings restructure.
+  Verified in the hosted sim: migration, list, open, create (distinct
+  indexed address per account), network inheritance, persistence across
+  restart, archive.
+
 ## State & sync contract
 
 - Compose recipient: set ONLY by the contacts picker (`to-address` empty
