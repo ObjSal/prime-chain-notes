@@ -17,6 +17,14 @@ use crate::Error;
 
 const KEY_SALT: &[u8] = b"prime-chain-notes/key/v1";
 const ENC_SALT: &[u8] = b"prime-chain-notes/enc/v1";
+/// Recovery-seed entropy salt (PLAN-chain-notes-seed-rotation.md). FROZEN.
+const SEED_SALT: &[u8] = b"prime-chain-notes/seed/v1";
+/// The chain-notes-app FROZEN enc rule, relocated here so both apps share
+/// one code path (app-core delegates). NEVER change — every private note
+/// composed by chain-notes-app (and by bip86-scheme device notebooks)
+/// depends on these exact strings.
+const ENC_APP_SALT: &[u8] = b"chain-notes-app/enc/v1";
+const ENC_APP_INFO: &[u8] = b"note-enc/v1";
 
 /// Parse 32 bytes as a scalar, rejecting 0 and values >= the curve order.
 pub(crate) fn scalar_from_bytes(bytes: &[u8; 32]) -> Option<Scalar> {
@@ -119,6 +127,32 @@ pub fn derive_encryption_key_indexed(app_seed: &[u8; 32], index: u32) -> [u8; 32
     info.extend_from_slice(b"/v1");
     let mut okm = [0u8; 32];
     hk.expand(&info, &mut okm).expect("32 bytes is a valid HKDF length");
+    okm
+}
+
+/// Recovery-seed entropy for rotation `index` — the ★ step of the
+/// recovery-seeds pipeline, the ONLY place the rotation index enters:
+/// HKDF-SHA256(SEED_SALT, app_seed, "seed/" || index_le32). Everything
+/// downstream (BIP-39 words → BIP-86 tree) is the standard pipeline.
+/// One-way by construction: no words ever encode the app seed itself.
+/// FROZEN — see module docs.
+pub fn derive_seed_entropy(app_seed: &[u8; 32], index: u32) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(SEED_SALT), app_seed);
+    let mut info = Vec::with_capacity(5 + 4);
+    info.extend_from_slice(b"seed/");
+    info.extend_from_slice(&index.to_le_bytes());
+    let mut okm = [0u8; 32];
+    hk.expand(&info, &mut okm).expect("32 bytes is a valid HKDF length");
+    okm
+}
+
+/// Note-encryption key for a BIP-86 leaf secret — chain-notes-app's
+/// FROZEN rule, identical for all its import formats, relocated here so
+/// device bip86 notebooks and the app derive byte-identically. FROZEN.
+pub fn enc_key_from_leaf(leaf_secret: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(ENC_APP_SALT), leaf_secret);
+    let mut okm = [0u8; 32];
+    hk.expand(ENC_APP_INFO, &mut okm).expect("32 bytes is a valid HKDF length");
     okm
 }
 
