@@ -14,6 +14,10 @@ k256 = { version = "0.13", default-features = false, features = ["arithmetic", "
 sha2 = "0.10"
 hkdf = "0.12"
 hmac = { version = "0.12", default-features = false }
+# Recovery seeds (BIP-39 words + BIP-86 leaves from GetAppSeed) — same
+# pure-Rust crates bip85-core hardware-builds with.
+pbkdf2 = "0.12"
+ripemd = "0.1"
 chacha20poly1305 = "0.10"
 bech32 = "0.11"
 getrandom = "0.2"
@@ -29,6 +33,9 @@ hex = "0.4"
 # are verified against rust-bitcoin on the host. Never a device dependency —
 # secp256k1-sys is C and unproven under the SDK toolchain.
 bitcoin = { version = "0.32", features = ["rand-std"] }
+# Cross-check ONLY: our ported BIP-39 is verified against the rust-bitcoin
+# ecosystem's independent implementation (spec-vector-tested upstream).
+bip39 = "2"
 # The EXACT UR decoder the KeyOS system QR scanner runs (see
 # apps/gui-app-qr-scanner) — used to verify the companion's JS UR encoder
 # emits parts the device will actually reassemble.

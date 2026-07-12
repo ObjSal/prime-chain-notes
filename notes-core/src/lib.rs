@@ -9,12 +9,15 @@
 //! Host-testable: `cargo test -p notes-core`. Pure Rust throughout.
 
 pub mod address;
+pub mod bip32;
+pub mod bip39;
 pub mod bundle;
 pub mod crypt;
 pub mod dm;
 pub mod envelope;
 pub mod keys;
 pub mod psbt;
+pub mod seeds;
 pub mod sighash;
 pub mod sign;
 pub mod taproot;
@@ -33,6 +36,7 @@ pub enum Error {
     PayloadTooLarge,
     RecipientNotTaproot,
     Psbt(&'static str),
+    Derivation(&'static str),
 }
 
 impl core::fmt::Display for Error {
@@ -51,6 +55,7 @@ impl core::fmt::Display for Error {
                 write!(f, "private directed notes need a taproot (bc1p…) recipient")
             }
             Error::Psbt(m) => write!(f, "psbt: {m}"),
+            Error::Derivation(m) => write!(f, "derivation: {m}"),
         }
     }
 }
