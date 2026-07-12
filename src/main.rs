@@ -282,10 +282,22 @@ struct SweepPlan {
 // ------------------------------------------------------------- helpers
 
 /// Derive a notebook's identity from the app seed (None if locked).
-fn derive_identity(app_seed: &Option<[u8; 32]>, account: u32) -> Option<Identity> {
-    app_seed
-        .as_ref()
-        .and_then(|s| Identity::from_app_seed_indexed(s, account).ok())
+/// Legacy notebooks are the FROZEN HKDF-indexed scheme (network-
+/// independent); bip86 notebooks derive per-network BIP-86 leaves under
+/// their rotation seed (PLAN-chain-notes-seed-rotation.md).
+fn derive_identity(
+    app_seed: &Option<[u8; 32]>,
+    meta: &notebooks::NotebookMeta,
+    net: &str,
+) -> Option<Identity> {
+    let seed = app_seed.as_ref()?;
+    match meta.scheme {
+        notebooks::Scheme::Legacy => Identity::from_app_seed_indexed(seed, meta.account).ok(),
+        notebooks::Scheme::Bip86 => {
+            let network = Network::from_str_opt(net).unwrap_or(Network::Mainnet);
+            Identity::from_bip86(seed, meta.seed, network, meta.bip_account, meta.index).ok()
+        }
+    }
 }
 
 /// Every ACTIVE notebook with spendable coins, as
@@ -297,25 +309,31 @@ fn wallet_sources(
     ix: &notebooks::NotebookIndex,
     app_seed: &Option<[u8; 32]>,
     net: &str,
+    ctx: (u32, u32),
 ) -> Vec<(u32, [u8; 32], [u8; 32], Vec<Utxo>)> {
-    ix.active()
+    ix.visible(ctx.0, ctx.1)
         .filter_map(|m| {
             let st = load_state(fs, net, m.account);
             let coins = st.core_utxos();
             if coins.is_empty() {
                 return None;
             }
-            let id = derive_identity(app_seed, m.account)?;
+            let id = derive_identity(app_seed, m, net)?;
             Some((m.account, id.output_x, id.tweaked_seckey, coins))
         })
         .collect()
 }
 
-/// Coin count + total across the wallet's notebooks ON `net`.
-fn wallet_balance(fs: &Fs, ix: &notebooks::NotebookIndex, net: &str) -> (usize, u64) {
+/// Coin count + total across the wallet's visible notebooks ON `net`.
+fn wallet_balance(
+    fs: &Fs,
+    ix: &notebooks::NotebookIndex,
+    net: &str,
+    ctx: (u32, u32),
+) -> (usize, u64) {
     let mut n = 0;
     let mut total = 0;
-    for m in ix.active() {
+    for m in ix.visible(ctx.0, ctx.1) {
         let st = load_state(fs, net, m.account);
         n += st.utxos.len();
         total += st.balance();
@@ -330,18 +348,22 @@ fn wallet_balance(fs: &Fs, ix: &notebooks::NotebookIndex, net: &str) -> (usize, 
 struct DeviceConfig {
     network: String,
     chunk_override: Option<usize>,
+    /// Active rotation seed index (recovery-seeds; new bip86 notebooks
+    /// derive under it).
+    seed_index: u32,
+    /// Active BIP-86 account — the wallet context (rev-3 parity).
+    account: u32,
 }
 impl Default for DeviceConfig {
     fn default() -> Self {
-        DeviceConfig { network: "mainnet".into(), chunk_override: None }
+        DeviceConfig {
+            network: "mainnet".into(),
+            chunk_override: None,
+            seed_index: 0,
+            account: 0,
+        }
     }
 }
-impl DeviceConfig {
-    fn network(&self) -> Network {
-        Network::from_str_opt(&self.network).unwrap_or(Network::Mainnet)
-    }
-}
-
 fn load_config(fs: &Fs) -> Option<DeviceConfig> {
     read_text(fs, CONFIG_PATH, Location::User)
         .ok()
@@ -451,7 +473,7 @@ fn boot_config(fs: &Fs, ix: &notebooks::NotebookIndex) -> DeviceConfig {
         }
     }
     let (network, chunk_override) = dev.unwrap_or_else(|| ("mainnet".into(), None));
-    let cfg = DeviceConfig { network, chunk_override };
+    let cfg = DeviceConfig { network, chunk_override, ..Default::default() };
     save_config(fs, &cfg);
     log::info!("cb: config migrated network={} (per-network state files)", cfg.network);
     cfg
@@ -644,7 +666,33 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let net: Rc<RefCell<String>> = Rc::new(RefCell::new(device_cfg.network.clone()));
     let device_chunk: Rc<RefCell<Option<usize>>> =
         Rc::new(RefCell::new(device_cfg.chunk_override));
+    // Active wallet context (recovery-seeds): rotation seed index + BIP-86
+    // account. New notebooks derive under it; the list + wallet features
+    // scope to it (legacy notebooks are context-free).
+    let seed_idx: Rc<RefCell<u32>> = Rc::new(RefCell::new(device_cfg.seed_index));
+    let bip_account: Rc<RefCell<u32>> = Rc::new(RefCell::new(device_cfg.account));
     let active: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+
+    // Persist the device config from the current cells (single source of
+    // truth — inline DeviceConfig constructions drift as fields grow).
+    let persist_config = {
+        let fs = fs.clone();
+        let net = net.clone();
+        let device_chunk = device_chunk.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        Rc::new(move || {
+            save_config(
+                &fs,
+                &DeviceConfig {
+                    network: net.borrow().clone(),
+                    chunk_override: *device_chunk.borrow(),
+                    seed_index: *seed_idx.borrow(),
+                    account: *bip_account.borrow(),
+                },
+            );
+        })
+    };
     // The ACTIVE notebook's state + identity (both swap on notebook switch);
     // an empty placeholder until a notebook is opened.
     let state = Rc::new(RefCell::new(State::default()));
@@ -805,6 +853,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let notebooks = notebooks.clone();
         let app_seed = app_seed.clone();
         let net = net.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             // Wallet-wide: every ACTIVE notebook's coins, each tagged with
@@ -813,17 +863,18 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             save_state(&fs, &state.borrow());
             let ix = notebooks.borrow();
             let active_net = net.borrow().clone();
+            let ctx = (*seed_idx.borrow(), *bip_account.borrow());
             let btc_usd = state.borrow().btc_usd;
             // (value, notebook name, txid, vout) across the wallet.
             let mut all: Vec<(u64, String, String, u32)> = Vec::new();
             let mut nb_with_coins = 0usize;
-            for m in ix.active() {
+            for m in ix.visible(ctx.0, ctx.1) {
                 let st2 = load_state(&fs, &active_net, m.account);
                 if st2.utxos.is_empty() {
                     continue;
                 }
                 nb_with_coins += 1;
-                let short = derive_identity(&app_seed, m.account)
+                let short = derive_identity(&app_seed, m, &active_net)
                     .map(|id| short_addr(&id.address(st2.network())))
                     .unwrap_or_default();
                 let name = notebook_name(&ix, m.account, &short);
@@ -862,6 +913,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let fs = fs.clone();
         let notebooks = notebooks.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let sweep = ui.global::<Sweep>();
@@ -873,7 +926,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // Wallet-level: inputs are EVERY notebook's coins (flush the
             // active one first so its file reflects the latest ledger).
             save_state(&fs, &st);
-            let (n, total) = wallet_balance(&fs, &notebooks.borrow(), &st.network);
+            let (n, total) = wallet_balance(
+                &fs,
+                &notebooks.borrow(),
+                &st.network,
+                (*seed_idx.borrow(), *bip_account.borrow()),
+            );
             sweep.set_inputs_line(format!("Inputs · {n} coin(s) · {total} sats (all notebooks)").into());
             if n == 0 {
                 sweep.set_cost_line("Nothing to sweep — no spendable coins.".into());
@@ -950,32 +1008,43 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let active = active.clone();
         let app_seed = app_seed.clone();
         let net = net.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
         Rc::new(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let ix = notebooks.borrow();
             let active_acct = *active.borrow();
             let dev_net = net.borrow().clone();
+            let ctx = (*seed_idx.borrow(), *bip_account.borrow());
             let build = |m: &notebooks::NotebookMeta| -> NotebookRow {
                 let st = load_state(&fs, &dev_net, m.account);
-                let addr = derive_identity(&app_seed, m.account)
+                let addr = derive_identity(&app_seed, m, &dev_net)
                     .map(|id| id.address(Network::from_str_opt(&dev_net).unwrap_or(Network::Mainnet)))
                     .unwrap_or_default();
                 let short = short_addr(&addr);
                 let n = st.notes.len();
+                let legacy_tag = match m.scheme {
+                    notebooks::Scheme::Legacy => " · legacy",
+                    notebooks::Scheme::Bip86 => "",
+                };
                 NotebookRow {
                     account: m.account as i32,
                     name: notebook_name(&ix, m.account, &short).into(),
-                    meta: format!("{short} · {n} note{}", if n == 1 { "" } else { "s" }).into(),
+                    meta: format!(
+                        "{short} · {n} note{}{legacy_tag}",
+                        if n == 1 { "" } else { "s" }
+                    )
+                    .into(),
                     active: active_acct == Some(m.account),
                 }
             };
-            let rows: Vec<NotebookRow> = ix.active().map(build).collect();
+            let rows: Vec<NotebookRow> = ix.visible(ctx.0, ctx.1).map(build).collect();
             let archived: Vec<NotebookRow> =
-                ix.notebooks.iter().filter(|m| m.archived).map(build).collect();
+                ix.archived_in_context(ctx.0, ctx.1).map(build).collect();
             let nb = ui.global::<NotebooksUi>();
             nb.set_empty_line(
                 if rows.is_empty() {
-                    if ix.archived_count() > 0 {
+                    if !archived.is_empty() {
                         "All notebooks are archived.".into()
                     } else {
                         "No notebooks yet — create one to start writing.".into()
@@ -1020,7 +1089,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 save_state(&fs, &state.borrow());
             }
             *active.borrow_mut() = Some(account);
-            *identity.borrow_mut() = derive_identity(&app_seed, account);
+            *identity.borrow_mut() = notebooks
+                .borrow()
+                .get(account)
+                .and_then(|m| derive_identity(&app_seed, m, &net.borrow()));
             let mut loaded = load_state(&fs, &net.borrow(), account);
             loaded.chunk_override = *device_chunk.borrow(); // chunk is device-level
             *state.borrow_mut() = loaded;
@@ -1227,6 +1299,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let notebooks = notebooks.clone();
         let app_seed = app_seed.clone();
         let active = active.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
         ui.global::<Callbacks>().on_sweep_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
@@ -1238,6 +1312,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let notebooks = notebooks.clone();
             let app_seed = app_seed.clone();
             let active = active.clone();
+            let seed_idx = seed_idx.clone();
+            let bip_account = bip_account.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
@@ -1251,8 +1327,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // Flush the active notebook, then gather EVERY notebook's
                 // coins — a wallet-level sweep/consolidate, one multi-key tx.
                 save_state(&fs, &st);
-                let sources_raw =
-                    wallet_sources(&fs, &notebooks.borrow(), &app_seed, &st.network);
+                let sources_raw = wallet_sources(
+                    &fs,
+                    &notebooks.borrow(),
+                    &app_seed,
+                    &st.network,
+                    (*seed_idx.borrow(), *bip_account.borrow()),
+                );
                 let dest_account = active.borrow().unwrap_or(0);
                 let id_guard = identity.borrow();
                 let result = id_guard
@@ -2209,6 +2290,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let net = net.clone();
         let active = active.clone();
         let device_chunk = device_chunk.clone();
+        let notebooks = notebooks.clone();
+        let app_seed = app_seed.clone();
+        let persist_config = persist_config.clone();
         let refresh_home = refresh_home.clone();
         let refresh_notes = refresh_notes.clone();
         let refresh_coins = refresh_coins.clone();
@@ -2229,17 +2313,21 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             }
             .to_string();
             *net.borrow_mut() = next.clone();
-            save_config(&fs, &DeviceConfig { network: next.clone(), chunk_override: *device_chunk.borrow() });
+            persist_config();
             log::info!("cb: set-network {next}");
             if let Some(account) = *active.borrow() {
                 let mut fresh = load_state(&fs, &next, account);
                 fresh.chunk_override = *device_chunk.borrow();
                 *state.borrow_mut() = fresh;
+                // Legacy identities are network-independent (only the
+                // address ENCODING changes), but bip86 notebooks use the
+                // BIP-44 coin type — their keys differ per network, so
+                // always re-derive from the meta.
+                if let Some(m) = notebooks.borrow().get(account) {
+                    *identity.borrow_mut() = derive_identity(&app_seed, m, &next);
+                }
             }
-            // Identity is network-independent (same key) — only the address
-            // ENCODING changes, so no re-derivation; refresh the views that
-            // show addresses/ledgers.
-            let _ = (&ui_weak, &identity);
+            let _ = &ui_weak;
             refresh_home();
             refresh_notes();
             refresh_coins();
@@ -2251,8 +2339,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let fs = fs.clone();
-        let net = net.clone();
         let device_chunk = device_chunk.clone();
+        let persist_config = persist_config.clone();
         let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_chunk_changed(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2286,7 +2374,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             save_state(&fs, &st);
             // Chunk is device-level (wallet-wide): persist it in config too.
             *device_chunk.borrow_mut() = st.chunk_override;
-            save_config(&fs, &DeviceConfig { network: net.borrow().clone(), chunk_override: st.chunk_override });
+            persist_config();
             drop(st);
             // Reflect the effective size back into the field (auto/compat),
             // without touching a valid custom value.
@@ -2398,6 +2486,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let notebooks = notebooks.clone();
         let active = active.clone();
         let app_seed = app_seed.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
         let refresh_notebooks = refresh_notebooks.clone();
         let switch_notebook = switch_notebook.clone();
         ui.global::<NotebookCb>().on_name_save(move || {
@@ -2411,22 +2501,25 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             nb.set_name_account(-1);
             nb.set_name_text("".into());
             if sel == -2 {
-                // CREATE: derive the next unused account, add + name it,
-                // persist the index, and open it.
+                // CREATE: a bip86 notebook at the next unused receive
+                // index of the active (seed, account) context — the
+                // recovery-seeds scheme, words-recoverable anywhere.
+                // (Legacy notebooks are never created anymore.)
                 if app_seed.is_none() {
                     ui.global::<Ui>().set_error("Device locked — can't create a notebook.".into());
                     return;
                 }
-                let account = notebooks.borrow().next_account();
-                {
+                let (seed, bacct) = (*seed_idx.borrow(), *bip_account.borrow());
+                let account = {
                     let mut ix = notebooks.borrow_mut();
-                    ix.ensure(account);
-                    if !name.is_empty() {
-                        ix.rename(account, &name);
-                    }
+                    let account = ix.create_bip86(seed, bacct, &name);
                     save_notebooks(&fs, &ix);
-                }
-                log::info!("cb: create-notebook account={account}");
+                    account
+                };
+                let index = notebooks.borrow().get(account).map(|m| m.index).unwrap_or(0);
+                log::info!(
+                    "cb: create-notebook account={account} scheme=bip86 seed={seed} bip-account={bacct} index={index}"
+                );
                 refresh_notebooks();
                 switch_notebook(account);
             } else {
@@ -2496,8 +2589,121 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
+    // ---- recovery seeds (screen 21 + wallet context) ----
+    {
+        // Reveal the ACTIVE seed's 24 words + SeedQR. Everything is
+        // re-derived on demand and lives only in UI properties until
+        // reveal-close wipes them; nothing is persisted or logged.
+        let ui_weak = ui_weak.clone();
+        let app_seed = app_seed.clone();
+        let seed_idx = seed_idx.clone();
+        ui.global::<Callbacks>().on_reveal_seed(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let recovery = ui.global::<Recovery>();
+            let index = *seed_idx.borrow();
+            let Some(seed) = app_seed.as_ref() else {
+                ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
+                log::warn!("cb: reveal-seed index={index} err=locked");
+                return;
+            };
+            let entropy = notes_core::keys::derive_seed_entropy(seed, index);
+            let words = match notes_core::bip39::entropy_to_mnemonic(&entropy) {
+                Ok(w) => w,
+                Err(e) => {
+                    ui.global::<Ui>().set_error(format!("Derivation failed: {e}").into());
+                    log::warn!("cb: reveal-seed index={index} err={e}");
+                    return;
+                }
+            };
+            let list: Vec<&str> = words.split_whitespace().collect();
+            let col = |range: std::ops::Range<usize>| -> String {
+                range
+                    .map(|i| format!("{:2}. {}", i + 1, list[i]))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            recovery.set_words_col1(col(0..12).into());
+            recovery.set_words_col2(col(12..24).into());
+            // Standard SeedQR: the 4-digit wordlist indices, concatenated.
+            let digits: String = notes_core::bip39::entropy_to_indices(&entropy)
+                .unwrap_or_default()
+                .iter()
+                .map(|i| format!("{i:04}"))
+                .collect();
+            recovery.set_qr(qr_image(&digits));
+            recovery.set_show_qr(false);
+            recovery.set_title_line(format!("Seed {index} · 24 words").into());
+            log::info!("cb: reveal-seed index={index} ok");
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_reveal_close(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let recovery = ui.global::<Recovery>();
+            recovery.set_words_col1("".into());
+            recovery.set_words_col2("".into());
+            recovery.set_title_line("".into());
+            recovery.set_qr(Image::default());
+            recovery.set_show_qr(false);
+            log::info!("cb: reveal-seed cancelled");
+        });
+    }
+    {
+        // Commit the wallet context (seed index + BIP-86 account) from the
+        // Recovery fields: persist, flush the open notebook, and land on
+        // the notebook list — the context picks which bip86 notebooks are
+        // visible, exactly like the account switcher in the desktop app.
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let state = state.clone();
+        let active = active.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let persist_config = persist_config.clone();
+        let refresh_notebooks = refresh_notebooks.clone();
+        ui.global::<Callbacks>().on_set_context(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let recovery = ui.global::<Recovery>();
+            let parse = |s: &str| -> Option<u32> {
+                s.trim().parse::<u32>().ok().filter(|n| *n <= 9999)
+            };
+            let (Some(new_seed), Some(new_acct)) = (
+                parse(recovery.get_seed_text().as_str()),
+                parse(recovery.get_account_text().as_str()),
+            ) else {
+                recovery.set_context_error("Seed and account must be 0–9999.".into());
+                return;
+            };
+            recovery.set_context_error("".into());
+            let seed_changed = *seed_idx.borrow() != new_seed;
+            let acct_changed = *bip_account.borrow() != new_acct;
+            if !seed_changed && !acct_changed {
+                return;
+            }
+            if active.borrow().is_some() {
+                save_state(&fs, &state.borrow());
+                *active.borrow_mut() = None;
+            }
+            *seed_idx.borrow_mut() = new_seed;
+            *bip_account.borrow_mut() = new_acct;
+            persist_config();
+            if seed_changed {
+                log::info!("cb: set-seed-index {new_seed}");
+            }
+            if acct_changed {
+                log::info!("cb: set-account {new_acct}");
+            }
+            refresh_notebooks();
+            ui.global::<Ui>().set_screen(20);
+        });
+    }
+
     // Boot: the notebook list is the main screen. Migrate/seed the index,
-    // then land on the list (a fresh install starts empty).
+    // then land on the list (a fresh install starts empty). Seed/account
+    // fields mirror the persisted wallet context.
+    ui.global::<Recovery>().set_seed_text(format!("{}", *seed_idx.borrow()).into());
+    ui.global::<Recovery>().set_account_text(format!("{}", *bip_account.borrow()).into());
     refresh_notebooks();
     ui.global::<Ui>().set_screen(20);
 
