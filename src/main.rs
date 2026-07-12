@@ -1,3 +1,4 @@
+mod notebooks;
 mod theme;
 
 use std::cell::RefCell;
@@ -77,7 +78,8 @@ fn fit_check(
 }
 
 const STATE_DIR: &str = "/.chain-notes";
-const STATE_PATH: &str = "/.chain-notes/state.json";
+const STATE_PATH: &str = "/.chain-notes/state.json"; // legacy (pre-notebooks) — migrated to state-0.json
+const NOTEBOOKS_PATH: &str = "/.chain-notes/notebooks.json";
 const INBOX_DIR: &str = "/chain-notes/inbox";
 const OUTBOX_DIR: &str = "/chain-notes/outbox";
 
@@ -128,6 +130,12 @@ const MAX_CONTACTS: usize = 20;
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 struct State {
+    /// Which notebook (indexed identity) this state belongs to. NOT
+    /// persisted — the file path (`state-<account>.json`) implies it; set
+    /// on load. Lets `save_state` route without threading the account
+    /// through every call site.
+    #[serde(skip)]
+    account: u32,
     network: String,
     notes: Vec<NoteRec>,
     utxos: Vec<UtxoRec>,
@@ -145,6 +153,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         State {
+            account: 0,
             network: "mainnet".into(),
             notes: Vec::new(),
             utxos: Vec::new(),
@@ -222,20 +231,67 @@ struct SweepPlan {
 
 // ------------------------------------------------------------- helpers
 
-fn load_state(fs: &Fs) -> State {
-    read_text(fs, STATE_PATH, Location::User)
+/// Per-notebook state file path (`/.chain-notes/state-<account>.json`).
+fn state_path(account: u32) -> String {
+    format!("/.chain-notes/state-{account}.json")
+}
+
+/// Load a notebook's state, stamping its account so `save_state` can route
+/// back without the caller threading it through.
+fn load_state(fs: &Fs, account: u32) -> State {
+    let mut st: State = read_text(fs, &state_path(account), Location::User)
         .ok()
         .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    st.account = account;
+    st
 }
 
 fn save_state(fs: &Fs, state: &State) {
     let json = serde_json::to_string(state).expect("state serializes");
     if let Err(e) = ensure_dir(fs, STATE_DIR, Location::User)
-        .and_then(|_| write_file(fs, STATE_PATH, Location::User, json.as_bytes()))
+        .and_then(|_| write_file(fs, &state_path(state.account), Location::User, json.as_bytes()))
     {
         log::warn!("state save failed: {e}");
     }
+}
+
+fn load_notebooks(fs: &Fs) -> notebooks::NotebookIndex {
+    read_text(fs, NOTEBOOKS_PATH, Location::User)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+fn save_notebooks(fs: &Fs, ix: &notebooks::NotebookIndex) {
+    let json = serde_json::to_string(ix).expect("index serializes");
+    if let Err(e) = ensure_dir(fs, STATE_DIR, Location::User)
+        .and_then(|_| write_file(fs, NOTEBOOKS_PATH, Location::User, json.as_bytes()))
+    {
+        log::warn!("notebook index save failed: {e}");
+    }
+}
+
+/// One-time migration for a pre-notebooks install: an existing
+/// `state.json` (with no notebook index yet) becomes notebook 0 "Main".
+/// Returns the index to use. A fresh install returns an empty index — the
+/// device has no onboarding, so first boot shows an empty notebook list
+/// and the user creates their first notebook deliberately.
+fn boot_notebooks(fs: &Fs) -> notebooks::NotebookIndex {
+    if read_text(fs, NOTEBOOKS_PATH, Location::User).is_ok() {
+        return load_notebooks(fs);
+    }
+    let mut ix = notebooks::NotebookIndex::default();
+    if let Ok(json) = read_text(fs, STATE_PATH, Location::User) {
+        // Legacy single-identity install → notebook 0 "Main".
+        let _ = ensure_dir(fs, STATE_DIR, Location::User)
+            .and_then(|_| write_file(fs, &state_path(0), Location::User, json.as_bytes()));
+        ix.ensure(0);
+        ix.rename(0, notebooks::FIRST_NOTEBOOK_NAME);
+        log::info!("cb: notebooks migrated legacy state -> Main");
+    }
+    save_notebooks(fs, &ix);
+    ix
 }
 
 fn read_text(fs: &Fs, path: &str, loc: Location) -> Result<String, String> {
@@ -396,26 +452,41 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let fs = cx.fs.clone();
     let ui_weak = ui.as_weak();
 
-    let state = Rc::new(RefCell::new(load_state(&fs)));
     let plan: Rc<RefCell<Option<Plan>>> = Rc::new(RefCell::new(None));
     let sweep_plan: Rc<RefCell<Option<SweepPlan>>> = Rc::new(RefCell::new(None));
 
-    // Identity from GetAppSeed — PIN-gated on hardware. Everything (address,
-    // signing key, encryption key) re-derives from the device seed backup.
-    let identity: Rc<Option<Identity>> = Rc::new(
-        match Security::default()
-            .app_seed()
-            .map_err(|_| "Device locked or seed unavailable".to_string())
-            .and_then(|app_seed| Identity::from_app_seed(&app_seed).map_err(|e| e.to_string()))
-        {
-            Ok(id) => Some(id),
-            Err(e) => {
-                log::warn!("identity unavailable: {e}");
-                ui.global::<Ui>().set_error(e.into());
+    // The app seed (GetAppSeed, PIN-gated on hardware) — kept so each
+    // notebook's identity can be derived on demand
+    // (`Identity::from_app_seed_indexed`, index = notebook account).
+    let app_seed: Rc<Option<[u8; 32]>> = Rc::new(
+        match Security::default().app_seed() {
+            Ok(seed) => Some(seed),
+            Err(_) => {
+                log::warn!("identity unavailable: device locked or seed unavailable");
+                ui.global::<Ui>().set_error("Device locked or seed unavailable".into());
                 None
             }
         },
     );
+
+    // Notebooks: the index (account -> name/archived) + the ACTIVE notebook.
+    // A notebook = an indexed identity; boot lands on the notebook LIST and
+    // the active notebook is set when the user taps a row (empty on a fresh
+    // install — the device has no onboarding).
+    let notebooks: Rc<RefCell<notebooks::NotebookIndex>> =
+        Rc::new(RefCell::new(boot_notebooks(&fs)));
+    let active: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+    // The ACTIVE notebook's state + identity (both swap on notebook switch);
+    // an empty placeholder until a notebook is opened.
+    let state = Rc::new(RefCell::new(State::default()));
+    let identity: Rc<RefCell<Option<Identity>>> = Rc::new(RefCell::new(None));
+
+    /// Derive a notebook's identity from the app seed (None if locked).
+    fn derive_identity(app_seed: &Option<[u8; 32]>, account: u32) -> Option<Identity> {
+        app_seed
+            .as_ref()
+            .and_then(|s| Identity::from_app_seed_indexed(s, account).ok())
+    }
 
     let refresh_home = {
         let ui_weak = ui_weak.clone();
@@ -426,7 +497,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let st = state.borrow();
             let home = ui.global::<Home>();
             home.set_network(st.network.clone().into());
-            if let Some(id) = identity.as_ref() {
+            if let Some(id) = identity.borrow().as_ref() {
                 let addr = id.address(st.network());
                 home.set_qr(qr_image(&addr.to_uppercase()));
                 home.set_address(addr.into());
@@ -625,6 +696,109 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             );
             sweep.set_can_continue(true);
         }
+    };
+
+    // A notebook's display name: its local name, else its address short
+    // form (never empty — rows and the home title read this).
+    fn notebook_name(ix: &notebooks::NotebookIndex, account: u32, addr_short: &str) -> String {
+        match ix.get(account).map(|m| m.name.clone()) {
+            Some(n) if !n.trim().is_empty() => n,
+            _ => addr_short.to_string(),
+        }
+    }
+
+    // Rebuild the notebook list (screen 20) from the index + each
+    // notebook's state file. Device has no live balance — the row meta is
+    // address-short · note count.
+    let refresh_notebooks = {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let active = active.clone();
+        let app_seed = app_seed.clone();
+        Rc::new(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let ix = notebooks.borrow();
+            let active_acct = *active.borrow();
+            let build = |m: &notebooks::NotebookMeta| -> NotebookRow {
+                let st = load_state(&fs, m.account);
+                let addr = derive_identity(&app_seed, m.account)
+                    .map(|id| id.address(st.network()))
+                    .unwrap_or_default();
+                let short = short_addr(&addr);
+                let n = st.notes.len();
+                NotebookRow {
+                    account: m.account as i32,
+                    name: notebook_name(&ix, m.account, &short).into(),
+                    meta: format!("{short} · {n} note{}", if n == 1 { "" } else { "s" }).into(),
+                    active: active_acct == Some(m.account),
+                }
+            };
+            let rows: Vec<NotebookRow> = ix.active().map(build).collect();
+            let archived: Vec<NotebookRow> =
+                ix.notebooks.iter().filter(|m| m.archived).map(build).collect();
+            let nb = ui.global::<NotebooksUi>();
+            nb.set_empty_line(
+                if rows.is_empty() {
+                    if ix.archived_count() > 0 {
+                        "All notebooks are archived.".into()
+                    } else {
+                        "No notebooks yet — create one to start writing.".into()
+                    }
+                } else {
+                    "".into()
+                },
+            );
+            nb.set_archived_label(
+                if archived.is_empty() {
+                    "".to_string()
+                } else {
+                    format!("Archived ({})", archived.len())
+                }
+                .into(),
+            );
+            log::info!("cb: notebooks list n={} archived={}", rows.len(), archived.len());
+            nb.set_rows(Rc::new(VecModel::from(rows)).into());
+            nb.set_archived_rows(Rc::new(VecModel::from(archived)).into());
+        })
+    };
+
+    // Open a notebook: save the current one, swap identity + state to the
+    // target account, refresh every per-notebook view, and show its home.
+    let switch_notebook = {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let state = state.clone();
+        let identity = identity.clone();
+        let active = active.clone();
+        let notebooks = notebooks.clone();
+        let app_seed = app_seed.clone();
+        let refresh_home = refresh_home.clone();
+        let refresh_notes = refresh_notes.clone();
+        let refresh_coins = refresh_coins.clone();
+        let refresh_contacts = refresh_contacts.clone();
+        Rc::new(move |account: u32| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if active.borrow().is_some() {
+                save_state(&fs, &state.borrow());
+            }
+            *active.borrow_mut() = Some(account);
+            *identity.borrow_mut() = derive_identity(&app_seed, account);
+            *state.borrow_mut() = load_state(&fs, account);
+            let short = identity
+                .borrow()
+                .as_ref()
+                .map(|id| short_addr(&id.address(state.borrow().network())))
+                .unwrap_or_default();
+            let title = notebook_name(&notebooks.borrow(), account, &short);
+            ui.global::<NotebooksUi>().set_title(title.into());
+            log::info!("cb: open-notebook account={account}");
+            refresh_home();
+            refresh_notes();
+            refresh_coins();
+            refresh_contacts();
+            ui.global::<Ui>().set_screen(0);
+        })
     };
 
     // The single pick funnel (self row / recent row / manual entry / scan):
@@ -827,8 +1001,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let tier = sweep.get_tier();
                 let rate_text = sweep.get_rate_text().to_string();
                 let st = state.borrow();
-                let result = identity
-                    .as_ref()
+                let id_guard = identity.borrow();
+                let result = id_guard
                     .as_ref()
                     .ok_or_else(|| "identity unavailable".to_string())
                     .and_then(|id| {
@@ -1168,8 +1342,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let rate_text = compose.get_rate_text().to_string();
                 let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
                 let st = state.borrow();
-                let result = identity
-                    .as_ref()
+                let id_guard = identity.borrow();
+                let result = id_guard
                     .as_ref()
                     .ok_or_else(|| "identity unavailable".to_string())
                     .and_then(|id| {
@@ -1437,7 +1611,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let identity = identity.clone();
         let fs = fs.clone();
         Rc::new(move |json: &str, src: &str| -> Result<String, String> {
-            let id = identity.as_ref().as_ref().ok_or("identity unavailable")?;
+            let id_guard = identity.borrow();
+            let id = id_guard.as_ref().ok_or("identity unavailable")?;
             {
                 let bundle =
                     SyncBundle::from_json(json).map_err(|e| format!("bad bundle: {e}"))?;
@@ -1666,7 +1841,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let fs = fs.clone();
         ui.global::<Callbacks>().on_sign_psbt(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let Some(id) = identity.as_ref() else {
+            let id_guard = identity.borrow();
+            let Some(id) = id_guard.as_ref() else {
                 ui.global::<Sync>().set_result("Device locked — no signing key.".into());
                 return;
             };
@@ -1830,9 +2006,170 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         ui.global::<Callbacks>().on_refresh_contacts(move || refresh_contacts());
     }
 
-    refresh_home();
-    refresh_notes();
-    refresh_contacts();
+    // ---- notebook callbacks (screen 20 list) ----
+    {
+        let switch_notebook = switch_notebook.clone();
+        ui.global::<NotebookCb>().on_open(move |account| switch_notebook(account.max(0) as u32));
+    }
+    {
+        // Create: open the name dialog in create mode (-2). Nothing is
+        // derived/persisted until Save — the device create is name-only
+        // (no address picker: no network on-device to probe used/new).
+        let ui_weak = ui_weak.clone();
+        ui.global::<NotebookCb>().on_create(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let nb = ui.global::<NotebooksUi>();
+            nb.set_name_text("".into());
+            nb.set_name_account(-2);
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let notebooks = notebooks.clone();
+        ui.global::<NotebookCb>().on_rename(move |account| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let nb = ui.global::<NotebooksUi>();
+            // Prefill the RAW local name (the display name may be an addr
+            // short form, which must not become a name by accident).
+            let raw = notebooks
+                .borrow()
+                .get(account.max(0) as u32)
+                .map(|m| m.name.clone())
+                .unwrap_or_default();
+            nb.set_name_text(raw.into());
+            nb.set_name_account(account);
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        ui.global::<NotebookCb>().on_name_cancel(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.global::<NotebooksUi>().set_name_account(-1);
+            }
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let state = state.clone();
+        let notebooks = notebooks.clone();
+        let active = active.clone();
+        let app_seed = app_seed.clone();
+        let refresh_notebooks = refresh_notebooks.clone();
+        let switch_notebook = switch_notebook.clone();
+        ui.global::<NotebookCb>().on_name_save(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let nb = ui.global::<NotebooksUi>();
+            let sel = nb.get_name_account();
+            if sel == -1 {
+                return;
+            }
+            let name = nb.get_name_text().trim().to_string();
+            nb.set_name_account(-1);
+            nb.set_name_text("".into());
+            if sel == -2 {
+                // CREATE: derive the next unused account, add + name it,
+                // persist the index, and open it.
+                if app_seed.is_none() {
+                    ui.global::<Ui>().set_error("Device locked — can't create a notebook.".into());
+                    return;
+                }
+                let account = notebooks.borrow().next_account();
+                {
+                    let mut ix = notebooks.borrow_mut();
+                    ix.ensure(account);
+                    if !name.is_empty() {
+                        ix.rename(account, &name);
+                    }
+                    save_notebooks(&fs, &ix);
+                }
+                // Inherit the wallet's network so a new notebook lands on
+                // the same chain: the open notebook's if one is active, else
+                // the first existing notebook's (creating from the list),
+                // else mainnet.
+                let net = match *active.borrow() {
+                    Some(_) => state.borrow().network.clone(),
+                    None => notebooks
+                        .borrow()
+                        .active()
+                        .find(|m| m.account != account)
+                        .map(|m| load_state(&fs, m.account).network)
+                        .unwrap_or_else(|| "mainnet".into()),
+                };
+                save_state(&fs, &State { account, network: net, ..State::default() });
+                log::info!("cb: create-notebook account={account}");
+                refresh_notebooks();
+                switch_notebook(account);
+            } else {
+                let account = sel as u32;
+                {
+                    let mut ix = notebooks.borrow_mut();
+                    ix.rename(account, &name);
+                    save_notebooks(&fs, &ix);
+                }
+                log::info!("cb: rename-notebook account={account}");
+                refresh_notebooks();
+                // If it's the open notebook, update its home title.
+                if *active.borrow() == Some(account) {
+                    let title = notebooks
+                        .borrow()
+                        .get(account)
+                        .map(|m| m.name.clone())
+                        .filter(|n| !n.trim().is_empty());
+                    if let Some(t) = title {
+                        nb.set_title(t.into());
+                    }
+                }
+            }
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let refresh_notebooks = refresh_notebooks.clone();
+        ui.global::<NotebookCb>().on_archive(move |account, archived| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let account = account.max(0) as u32;
+            if archived {
+                // Guard: a notebook with coins must be emptied first
+                // (sweep/consolidate). Zero active notebooks is allowed.
+                let bal = load_state(&fs, account).balance();
+                if bal > 0 {
+                    ui.global::<Ui>()
+                        .set_error(format!("This notebook holds {bal} sats — empty it first.").into());
+                    return;
+                }
+            }
+            {
+                let mut ix = notebooks.borrow_mut();
+                ix.set_archived(account, archived);
+                save_notebooks(&fs, &ix);
+            }
+            log::info!("cb: archive-notebook account={account} archived={archived}");
+            refresh_notebooks();
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let state = state.clone();
+        let active = active.clone();
+        let refresh_notebooks = refresh_notebooks.clone();
+        ui.global::<NotebookCb>().on_back_to_list(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if active.borrow().is_some() {
+                save_state(&fs, &state.borrow());
+            }
+            refresh_notebooks();
+            ui.global::<Ui>().set_screen(20);
+        });
+    }
+
+    // Boot: the notebook list is the main screen. Migrate/seed the index,
+    // then land on the list (a fresh install starts empty).
+    refresh_notebooks();
+    ui.global::<Ui>().set_screen(20);
 
     ui.run().expect("UI running");
 }

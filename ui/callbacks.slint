@@ -3,7 +3,9 @@
 // 5 = sync (actions: import/export), 6 = settings (network, chunk size),
 // 7 = contacts (send-to picker: self / recents / scan / manual entry),
 // 8 = signed external PSBT, 9 = coins (viewer-first UTXO list),
-// 10 = sweep/consolidate (compose-like, shared via Sweep.kind).
+// 10 = sweep/consolidate (compose-like, shared via Sweep.kind),
+// 20 = notebook list (the MAIN screen — boot lands here; a notebook =
+//      an indexed identity, tapping a row opens its home = screen 0).
 
 export global Ui {
     in-out property <int> screen: 0;
@@ -159,6 +161,38 @@ export global Settings {
     // Inline validation error for the chunk field ("" = valid) — shown in
     // the section label so the on-screen keyboard can't hide it.
     in-out property <string> chunk-error: "";
+}
+
+export struct NotebookRow {
+    account: int,
+    name: string,
+    meta: string,     // "addr-short · N notes" (device has no live balance)
+    active: bool,
+}
+
+// Screen 20 — the notebook list (main screen). A notebook = an indexed
+// identity; tapping a row opens its home (screen 0).
+export global NotebooksUi {
+    in-out property <[NotebookRow]> rows;
+    in-out property <[NotebookRow]> archived-rows;
+    in-out property <string> archived-label: "";   // "Archived (2)" | ""
+    in-out property <bool> show-archived: false;
+    in-out property <string> empty-line: "";        // shown when no active notebooks
+    // Per-notebook home (screen 0) header title = the open notebook's name.
+    in-out property <string> title: "Chain Notes";
+    // Name dialog: -1 closed · -2 create (next account) · >=0 rename that account.
+    in-out property <int> name-account: -1;
+    in-out property <string> name-text: "";
+}
+
+export global NotebookCb {
+    callback open(int);          // open a notebook (account) → its home (screen 0)
+    callback create();           // open the name dialog in create mode
+    callback name-save();        // create/rename commit
+    callback name-cancel();
+    callback rename(int);        // open the name dialog for an existing account
+    callback archive(int, bool); // archive / restore
+    callback back-to-list();     // per-notebook home → the list
 }
 
 export global Callbacks {
