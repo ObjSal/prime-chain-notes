@@ -2701,7 +2701,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     // Boot: the notebook list is the main screen. Migrate/seed the index,
     // then land on the list (a fresh install starts empty). Seed/account
-    // fields mirror the persisted wallet context.
+    // fields mirror the persisted wallet context; the reveal is enabled
+    // whenever the app seed is present (wallet-level — no open notebook).
+    ui.global::<Recovery>().set_seed_available(app_seed.is_some());
     ui.global::<Recovery>().set_seed_text(format!("{}", *seed_idx.borrow()).into());
     ui.global::<Recovery>().set_account_text(format!("{}", *bip_account.borrow()).into());
     refresh_notebooks();

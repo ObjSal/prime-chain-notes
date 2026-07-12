@@ -182,6 +182,11 @@ export global Settings {
 // the account is the BIP-86 wallet context — together they pick which
 // bip86 notebooks are visible (legacy notebooks are context-free).
 export global Recovery {
+    // True when GetAppSeed returned (set once at boot) — gates the reveal
+    // independently of whether a notebook is open (the recovery flow is
+    // wallet-level: reached from the list-level Settings, no active
+    // notebook, so Home.address is empty and must NOT gate this).
+    in-out property <bool> seed-available: false;
     // Settings fields (numeric, committed by the Switch action).
     in-out property <string> seed-text: "0";
     in-out property <string> account-text: "0";
