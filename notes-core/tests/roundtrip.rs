@@ -941,3 +941,98 @@ fn exact_inputs_spends_all_given_coins() {
     let tiny = vec![Utxo { txid: [3u8; 32], vout: 0, value: 10 }];
     assert!(compose_note_exact(&a, &tiny, "hi", false, [1, 2, 3, 4], None, 80, 1.0, || Ok([0u8; 32])).is_err());
 }
+
+/// Multi-source sweep (wallet-level consolidate): coins from TWO
+/// identities in one tx, each input signed with its own key —
+/// rust-bitcoin recomputes both sighashes and verifies each signature
+/// against the matching owner's output key. Also pins the delegation:
+/// build_sweep_tx must stay byte-identical to a one-source multi call.
+#[test]
+fn sweep_multi_source_cross_check() {
+    use bitcoin::consensus::encode::deserialize;
+    use bitcoin::hashes::Hash;
+    use bitcoin::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
+    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+    use bitcoin::{Amount, ScriptBuf, TxOut};
+    use notes_core::tx::SweepSource;
+
+    let a = identity();
+    let b = Identity::from_app_seed(&[11u8; 32]).unwrap();
+    let a_coins = utxos();
+    let b_coins =
+        vec![Utxo { txid: [4u8; 32], vout: 2, value: 40_000 }, Utxo { txid: [5u8; 32], vout: 0, value: 7_000 }];
+    let dest = notes_core::address::address_to_script_pubkey(
+        notes_core::Network::Regtest,
+        &Identity::from_app_seed(&[9u8; 32]).unwrap().address(notes_core::Network::Regtest),
+    )
+    .unwrap();
+
+    let sweep = notes_core::tx::build_sweep_tx_multi(
+        &[
+            SweepSource { utxos: &a_coins, output_x: a.output_x, tweaked_seckey: &a.tweaked_seckey },
+            SweepSource { utxos: &b_coins, output_x: b.output_x, tweaked_seckey: &b.tweaked_seckey },
+        ],
+        dest.clone(),
+        2.0,
+        || Ok(AUX),
+    )
+    .unwrap();
+    assert_eq!(sweep.tx.inputs.len(), 5, "every source coin rides");
+    assert_eq!(sweep.tx.outputs.len(), 1);
+    assert_eq!(sweep.tx.outputs[0].value, 133_000 - sweep.fee);
+    // The estimator stays byte-exact in the multi case.
+    assert_eq!(sweep.vsize, notes_core::tx::estimate_sweep_vsize(5, dest.len()));
+
+    let raw = hex::decode(&sweep.raw_hex).unwrap();
+    let btx: bitcoin::Transaction = deserialize(&raw).unwrap();
+    assert_eq!(btx.compute_txid().to_string(), sweep.txid_hex);
+    assert_eq!(btx.vsize(), sweep.vsize);
+
+    // Per-input owner: first 3 inputs are a's, last 2 are b's.
+    let spk_a = ScriptBuf::from_bytes(notes_core::address::p2tr_script_pubkey(&a.output_x));
+    let spk_b = ScriptBuf::from_bytes(notes_core::address::p2tr_script_pubkey(&b.output_x));
+    let prevouts: Vec<TxOut> = sweep
+        .tx
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(i, u)| TxOut {
+            value: Amount::from_sat(u.value),
+            script_pubkey: if i < 3 { spk_a.clone() } else { spk_b.clone() },
+        })
+        .collect();
+    let secp = Secp256k1::verification_only();
+    let key_a = XOnlyPublicKey::from_slice(&a.output_x).unwrap();
+    let key_b = XOnlyPublicKey::from_slice(&b.output_x).unwrap();
+    let mut cache = SighashCache::new(&btx);
+    for (index, witness) in (0..btx.input.len()).zip(&sweep.tx.witnesses) {
+        let sighash = cache
+            .taproot_key_spend_signature_hash(index, &Prevouts::All(&prevouts), TapSighashType::Default)
+            .unwrap();
+        secp.verify_schnorr(
+            &Signature::from_slice(&witness[0]).unwrap(),
+            &Message::from_digest(sighash.to_byte_array()),
+            if index < 3 { &key_a } else { &key_b },
+        )
+        .expect("each input verifies against its own source's key");
+    }
+
+    // Delegation pin: the single-source paths agree byte-for-byte.
+    let single = notes_core::tx::build_sweep_tx(
+        &a_coins,
+        &a.output_x,
+        dest.clone(),
+        2.0,
+        &a.tweaked_seckey,
+        || Ok(AUX),
+    )
+    .unwrap();
+    let single_multi = notes_core::tx::build_sweep_tx_multi(
+        &[SweepSource { utxos: &a_coins, output_x: a.output_x, tweaked_seckey: &a.tweaked_seckey }],
+        dest,
+        2.0,
+        || Ok(AUX),
+    )
+    .unwrap();
+    assert_eq!(single.raw_hex, single_multi.raw_hex);
+}

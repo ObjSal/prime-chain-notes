@@ -125,3 +125,36 @@ fn dm_derivation_vector() {
         "fc5ed80cb6f3b317797d5a11cbedda484d631291da3f2d15c377e9e6e06b2121"
     );
 }
+
+/// Notebook (indexed) identity derivation — values computed at
+/// implementation time (2026-07-11) and frozen forever: notebook 0 must
+/// stay byte-identical to the original single-identity rules, and each
+/// higher index must keep deriving the same independent identity, or
+/// wipe recovery loses every notebook beyond the first.
+#[test]
+fn notebook_derivation_vectors() {
+    use notes_core::bundle::Identity;
+    let seed = [7u8; 32];
+    let nb0 = Identity::from_app_seed_indexed(&seed, 0).unwrap();
+    let orig = Identity::from_app_seed(&seed).unwrap();
+    assert_eq!(nb0.output_x, orig.output_x);
+    assert_eq!(nb0.enc_key, orig.enc_key);
+    assert_eq!(nb0.tweaked_seckey, orig.tweaked_seckey);
+    let nb1 = Identity::from_app_seed_indexed(&seed, 1).unwrap();
+    let nb2 = Identity::from_app_seed_indexed(&seed, 2).unwrap();
+    assert_ne!(nb1.output_x, nb0.output_x);
+    assert_ne!(nb2.output_x, nb1.output_x);
+    assert_ne!(nb1.enc_key, nb0.enc_key);
+    assert_eq!(
+        hex::encode(nb1.output_x),
+        "85f6032bd732bbb8682ef1d4836c447f80165ebb691e7ce56c56bda341fd9354"
+    );
+    assert_eq!(
+        hex::encode(nb1.enc_key),
+        "034887c8d2816909421b26767d06a2f2b326162dcb48e8dd0b7e8048c1fb3040"
+    );
+    assert_eq!(
+        hex::encode(nb2.output_x),
+        "44026016624465c0dc7dfb751d8e193b77e90975643970bffe547d9b4f01a81e"
+    );
+}

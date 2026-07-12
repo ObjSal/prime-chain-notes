@@ -252,13 +252,51 @@ pub fn build_sweep_tx(
     dest_spk: Vec<u8>,
     fee_rate: f64,
     tweaked_seckey: &[u8; 32],
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    build_sweep_tx_multi(
+        &[SweepSource { utxos: available, output_x: *our_output_x, tweaked_seckey }],
+        dest_spk,
+        fee_rate,
+        aux,
+    )
+}
+
+/// One address's contribution to a multi-source sweep: its coins plus the
+/// key that owns them (the notebooks feature's wallet-level consolidate).
+pub struct SweepSource<'a> {
+    pub utxos: &'a [Utxo],
+    pub output_x: [u8; 32],
+    pub tweaked_seckey: &'a [u8; 32],
+}
+
+/// [`build_sweep_tx`] across MANY addresses: every source's coins ride in
+/// one transaction — each input signed with its own source's key — into a
+/// single output at `dest_spk`. Input order is source order, flattened.
+/// ADDITIVE: `build_sweep_tx` delegates here with one source and stays
+/// byte-identical to its previous behavior (same estimator — all inputs
+/// are P2TR key-path, so input count is all that matters — same ordering,
+/// same aux sequence).
+pub fn build_sweep_tx_multi(
+    sources: &[SweepSource],
+    dest_spk: Vec<u8>,
+    fee_rate: f64,
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
-    if available.is_empty() {
+    // Flatten inputs, remembering each input's owning source for signing.
+    let mut inputs: Vec<Utxo> = Vec::new();
+    let mut owner: Vec<usize> = Vec::new();
+    for (si, src) in sources.iter().enumerate() {
+        for u in src.utxos {
+            inputs.push(u.clone());
+            owner.push(si);
+        }
+    }
+    if inputs.is_empty() {
         return Err(Error::InsufficientFunds);
     }
-    let in_value: u64 = available.iter().map(|u| u.value).sum();
-    let vsize = estimate_sweep_vsize(available.len(), dest_spk.len());
+    let in_value: u64 = inputs.iter().map(|u| u.value).sum();
+    let vsize = estimate_sweep_vsize(inputs.len(), dest_spk.len());
     let fee = (vsize as f64 * fee_rate).ceil() as u64;
     if in_value <= fee || in_value - fee < DUST_LIMIT {
         return Err(Error::InsufficientFunds);
@@ -267,15 +305,15 @@ pub fn build_sweep_tx(
     let mut tx = Transaction {
         version: 2,
         lock_time: 0,
-        inputs: available.to_vec(),
+        inputs,
         outputs: vec![TxOut { value: in_value - fee, script_pubkey: dest_spk }],
         witnesses: Vec::new(),
     };
-    let our_spk = p2tr_script_pubkey(our_output_x);
-    let prevout_spks: Vec<Vec<u8>> = tx.inputs.iter().map(|_| our_spk.clone()).collect();
+    let spks: Vec<Vec<u8>> = sources.iter().map(|s| p2tr_script_pubkey(&s.output_x)).collect();
+    let prevout_spks: Vec<Vec<u8>> = owner.iter().map(|si| spks[*si].clone()).collect();
     for index in 0..tx.inputs.len() {
         let sighash = taproot_key_spend_sighash(&tx, &prevout_spks, index);
-        let sig = schnorr_sign(tweaked_seckey, &sighash, &aux()?)?;
+        let sig = schnorr_sign(sources[owner[index]].tweaked_seckey, &sighash, &aux()?)?;
         tx.witnesses.push(vec![sig.to_vec()]);
     }
     Ok(NoteTx {
