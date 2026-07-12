@@ -867,7 +867,7 @@ export component AppWindow inherits Window {
             spacing: 12px;
 
             ScreenHeader {
-                title: "Coins";
+                title: "Wallet coins";
                 back => { Ui.screen = 6; }
             }
 
@@ -881,15 +881,15 @@ export component AppWindow inherits Window {
 
             PrimaryAction {
                 width: 100%;
-                text: "Consolidate into one coin…";
+                text: "Consolidate wallet…";
                 disabled: !Coins.can-consolidate;
                 clicked => { Callbacks.consolidate-open(); }
             }
 
             if !Coins.can-consolidate: Text {
                 text: Coins.rows.length == 0
-                    ? "No spendable coins — fund the address and import a sync bundle."
-                    : "Nothing to consolidate — you already have a single coin.";
+                    ? "No spendable coins anywhere — fund a notebook's address and import a sync bundle."
+                    : "Nothing to consolidate — the wallet already holds a single coin.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
                 font-size: 13px;

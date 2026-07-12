@@ -126,12 +126,23 @@ user creates the first notebook deliberately.
 - Log lines: `cb: notebooks list n=<n> archived=<n>` · `cb: open-notebook
   account=<n>` · `cb: create-notebook account=<n>` · `cb: rename-notebook
   account=<n>` · `cb: archive-notebook account=<n> archived=<b>`.
-- **NOT yet ported (phase 2)**: wallet-level consolidate/sweep across all
-  notebooks (device consolidate/sweep are still per-active-notebook),
-  wallet-wide coins/activity, sender filters, settings restructure.
-  Verified in the hosted sim: migration, list, open, create (distinct
-  indexed address per account), network inheritance, persistence across
-  restart, archive.
+- **Phase 2a (DONE)**: wallet-level consolidate + sweep and a wallet-wide
+  Coins viewer. Consolidate/Sweep gather EVERY active notebook's coins
+  (same network only — a tx can't mix chains) into ONE multi-key tx via
+  notes-core `build_sweep_tx_multi`: `wallet_sources` collects
+  (account, output_x, tweaked_seckey, coins) per notebook, the sign step
+  updates each source notebook's `state-<account>.json` (and the
+  destination's for a consolidate). Consolidate lands in the ACTIVE
+  notebook (its Coins screen); the confirm warns when >1 notebook
+  contributes (on-chain address linkage). The Coins screen (9) lists all
+  notebooks' coins tagged by name; summary "N coin(s) · X sats across M
+  notebook(s)". Verified live in the sim (Main's 3 coins → wallet coins
+  view + consolidate build via the multi-key path); multi-notebook
+  correctness is unit-covered by notes-core `sweep_multi_source_cross_check`.
+  Log: `cb: sweep kind=<k> to=<self|addr> inputs=<n> notebooks=<m> …`.
+- **NOT yet ported (phase 2b)**: wallet-wide Activity, sender filters on
+  the notes screen, settings restructure (list-only / wallet-level), sim
+  e2e (chain-notes.sh) boot-to-list update.
 
 ## State & sync contract
 
