@@ -29,8 +29,13 @@ notes-core/            # UI-free, host-testable: cargo test -p notes-core
   src/crypt.rs         # seal/open, SEAL_OVERHEAD=40 (cost estimator depends on it)
   src/dm.rs            # directed notes: static-static x-only ECDH + HKDF (FROZEN)
   src/bundle.rs        # SyncBundle JSON, extract_notes (+_watch, key-less), compose_note, Identity
+  src/bip39.rs         # BIP-39 words (ported from bip85-core, host-tested)
+  src/bip32.rs         # BIP-32 CKDpriv (hardened + normal — BIP-86 leaves)
+  src/seeds.rs         # app_seed → 24 words → BIP-86 leaf (recovery seeds)
   examples/notes_cli.rs  # host CLI (device role) for the e2e scripts
+                       #   (+ seed-words / seed-address for the recovery leg)
 src/main.rs            # app: screens, callbacks, state.json persistence
+src/notebooks.rs       # scheme-versioned index (legacy | bip86 notebooks)
 ui/{app.slint, callbacks.slint}
 scripts/regtest-e2e.sh          # host-only e2e vs bitcoind -regtest
 scripts/regtest-companion.sh    # companion-role helper (setup/bundle/broadcast/mine)
@@ -57,7 +62,30 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
   `note-enc/nb/<index_le32>/v1` under the same salts (vectors pinned in
   `tests/vectors.rs::notebook_derivation_vectors`). Directed-private key = HKDF(dm/v1,
   x(my_tweaked_seckey · lift_x(peer_output_x))) — symmetric both ways,
-  frozen vector in `tests/vectors.rs`.
+  frozen vector in `tests/vectors.rs`. **Recovery-seeds strings** are
+  FROZEN too (`../PLAN-chain-notes-seed-rotation.md`): the seed-entropy
+  salt `prime-chain-notes/seed/v1` + info `seed/<index_le32>`
+  (`keys::derive_seed_entropy` — the ONE place the rotation index
+  enters), and the relocated chain-notes-app enc rule (salt
+  `chain-notes-app/enc/v1`, info `note-enc/v1`) that bip86 leaves seal
+  with (`keys::enc_key_from_leaf`). Vectors + BIP-39/32/86 spec and
+  rust-bitcoin cross-checks in `tests/seed_vectors.rs`.
+- **Two notebook derivation schemes coexist** (recovery seeds): a
+  notebook's `scheme` in `notebooks.json` is `legacy` (default — shipped
+  v1 files load byte-identically; HKDF-indexed, network-independent) or
+  `bip86` (`Identity::from_bip86(app_seed, seed, net, account, index)` —
+  a receive index of a BIP-86 account under rotation seed `seed`;
+  per-network coin type 0'/1'; recoverable from the seed's 24 words
+  alone in ANY taproot wallet, and fully in chain-notes-app via plain
+  BIP-39 import — byte-identical by the shared notes-core leaf rule).
+  New notebooks are always `bip86` under the active (seed, account)
+  wallet context; legacy notebooks stay derivable/spendable forever but
+  are never created anymore. **The app seed itself is NEVER exported in
+  any form** — every rotation index (including 0) goes through the
+  one-way seed-entropy HKDF, so no phrase can unlock the app seed or a
+  different index. Rotation is scoped; old words keep old keys (and old
+  private-note plaintext) forever, so the reveal copy pairs a new seed
+  with sweep + re-share.
 - **Pure-Rust only on device** (no C under armv7a-unknown-xous-elf).
   `rust-bitcoin` is a **dev-dependency only** — host tests cross-check our
   serialization/sighash/signatures against libsecp256k1.
@@ -203,8 +231,18 @@ user creates the first notebook deliberately.
   disabled under 2 coins) · 10 sweep/consolidate (compose-like, shared
   via `Sweep.kind`: destination line, fee-tier pills with the
   collapse-on-Custom rate field, read-only "Inputs · N coins · T sats
-  (all)" summary, live cost line, Continue → confirm dialog → sign) —
-  actions and preferences deliberately split.
+  (all)" summary, live cost line, Continue → confirm dialog → sign) ·
+  **21 recovery & accounts** (Settings → "Recovery & accounts…"): the
+  wallet-context switcher — `Recovery.seed-text` (rotation seed index)
+  + `Recovery.account-text` (BIP-86 account), both 0–9999, "Switch"
+  commits + lands on the notebook list — and the 24-word reveal
+  (`reveal-seed` derives `keys::derive_seed_entropy` → words + the
+  standard SeedQR digit stream into `Recovery.words-col1/2` + `.qr`;
+  `reveal-close` wipes them; nothing persisted or logged, words never
+  in a `cb:` line). New notebooks derive under the active (seed,
+  account); wallet-level features scope to `visible(seed, account)`
+  (legacy notebooks are context-free — funds never hide). — actions and
+  preferences deliberately split.
 - Sweep/consolidate (mirrors the chain-notes-app UX, minus anything
   external-wallet — a Prime holds its own keys, so NO "pay fee from
   another wallet" option exists here by design): sweep is reached from
@@ -271,6 +309,12 @@ user creates the first notebook deliberately.
 `cb: import-bundle file=<f> loc=<l> notes=<n> new=<k> received=<r> utxos=<m> tip=<h> ok | err=<e>` ·
 `cb: export-pending n=<n> airlock=<ok|err>` ·
 `cb: set-network <net>` ·
+`cb: set-seed-index <i>` · `cb: set-account <a>` (recovery-seeds wallet
+context; both land on the notebook list) ·
+`cb: reveal-seed index=<i> ok | cancelled` (never carries words — the
+24 words + SeedQR live only in UI props, wiped on close) ·
+`cb: create-notebook account=<key> scheme=bip86 seed=<s> bip-account=<a>
+index=<i>` (new notebooks are always bip86) ·
 `cb: set-chunk-size <n|auto> ok | err=<msg>` ·
 `cb: scan-bundle kind=<qr|ur> bytes=<n>` then `cb: import-bundle
 src=scan-<kind> … ok` · `cb: scan-bundle cancelled | err=<e>` ·
