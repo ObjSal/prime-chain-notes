@@ -1433,61 +1433,92 @@ export component AppWindow inherits Window {
                 wrap: word-wrap;
             }
 
+            // The reveal is its own focused screen (22) — the words + QR
+            // don't fit under the switcher, and a sensitive backup deserves
+            // a dedicated screen anyway (Sal 2026-07-12).
             SecondaryAction {
                 width: 100%;
-                text: Recovery.words-col1 == "" ? "Show recovery words…" : "Hide recovery words";
+                text: "Show recovery words…";
                 disabled: !Recovery.seed-available;
                 clicked => {
-                    if (Recovery.words-col1 == "") {
-                        Callbacks.reveal-seed();
-                    } else {
-                        Callbacks.reveal-close(); // clears only — stays here
-                    }
+                    Callbacks.reveal-seed();
+                    Ui.screen = 22;
                 }
             }
 
-            if Recovery.words-col1 != "": VerticalLayout {
-                spacing: 10px;
-                Text {
-                    text: Recovery.title-line;
-                    color: Theme.palette-foreground;
-                    font-family: "Montserrat";
-                    font-size: 16px;
-                    font-weight: 600;
-                }
-                if !Recovery.show-qr: HorizontalLayout {
-                    spacing: 16px;
-                    Text {
-                        text: Recovery.words-col1;
-                        color: Theme.palette-foreground;
-                        font-family: "SourceCodePro";
-                        font-size: 15px;
-                        horizontal-stretch: 1;
-                    }
-                    Text {
-                        text: Recovery.words-col2;
-                        color: Theme.palette-foreground;
-                        font-family: "SourceCodePro";
-                        font-size: 15px;
-                        horizontal-stretch: 1;
-                    }
-                }
-                if Recovery.show-qr: Image {
-                    source: Recovery.qr;
-                    width: 190px;
-                    height: 190px;
-                    image-rendering: pixelated;
-                    x: (parent.width - self.width) / 2;
-                }
-                SecondaryAction {
-                    width: 100%;
-                    text: Recovery.show-qr ? "Show words" : "Show as SeedQR";
-                    clicked => { Recovery.show-qr = !Recovery.show-qr; }
-                }
-            }
-
-            if Recovery.words-col1 == "": Text {
+            Text {
                 text: "These 24 words are the complete backup of THIS seed's notebooks — funds and private notes. Anyone who sees them has everything on this seed, forever. Switching the seed index makes an entirely new phrase; old words keep old keys, so sweep funds before abandoning a seed.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        // ---------------------------------- screen 22: recovery words
+        // Dedicated reveal (from screen 21). Words/SeedQR for the active
+        // seed; Back clears them (reveal-close). Fits comfortably on its
+        // own, no scrolling needed.
+        if Ui.screen == 22: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 14px;
+
+            ScreenHeader {
+                title: "Recovery words";
+                back => {
+                    Callbacks.reveal-close();
+                    Ui.screen = 21;
+                }
+            }
+
+            Text {
+                text: Recovery.title-line;
+                color: Theme.palette-foreground;
+                font-family: "Montserrat";
+                font-size: 16px;
+                font-weight: 600;
+            }
+
+            if !Recovery.show-qr: HorizontalLayout {
+                spacing: 16px;
+                Text {
+                    text: Recovery.words-col1;
+                    color: Theme.palette-foreground;
+                    font-family: "SourceCodePro";
+                    font-size: 16px;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: Recovery.words-col2;
+                    color: Theme.palette-foreground;
+                    font-family: "SourceCodePro";
+                    font-size: 16px;
+                    horizontal-stretch: 1;
+                }
+            }
+            if Recovery.show-qr: Image {
+                source: Recovery.qr;
+                width: 220px;
+                height: 220px;
+                image-rendering: pixelated;
+                x: (parent.width - self.width) / 2;
+            }
+
+            SecondaryAction {
+                width: 100%;
+                text: Recovery.show-qr ? "Show words" : "Show as SeedQR";
+                clicked => { Recovery.show-qr = !Recovery.show-qr; }
+            }
+
+            Text {
+                text: "Write these down and keep them offline. Anyone who has them controls this seed's funds and can read its private notes.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
                 font-size: 13px;
