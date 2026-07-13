@@ -80,7 +80,6 @@ fn fit_check(
 }
 
 const STATE_DIR: &str = "/.chain-notes";
-const STATE_PATH: &str = "/.chain-notes/state.json"; // legacy (pre-notebooks)
 const NOTEBOOKS_PATH: &str = "/.chain-notes/notebooks.json";
 const CONFIG_PATH: &str = "/.chain-notes/config.json"; // device-level {network, chunk}
 const INBOX_DIR: &str = "/chain-notes/inbox";
@@ -282,21 +281,40 @@ struct SweepPlan {
 // ------------------------------------------------------------- helpers
 
 /// Derive a notebook's identity from the app seed (None if locked).
-/// Legacy notebooks are the FROZEN HKDF-indexed scheme (network-
-/// independent); bip86 notebooks derive per-network BIP-86 leaves under
-/// their rotation seed (PLAN-chain-notes-seed-rotation.md).
+/// Every notebook is a per-network BIP-86 leaf under its rotation seed
+/// (PLAN-chain-notes-seed-rotation.md).
 fn derive_identity(
     app_seed: &Option<[u8; 32]>,
     meta: &notebooks::NotebookMeta,
     net: &str,
 ) -> Option<Identity> {
     let seed = app_seed.as_ref()?;
-    match meta.scheme {
-        notebooks::Scheme::Legacy => Identity::from_app_seed_indexed(seed, meta.account).ok(),
-        notebooks::Scheme::Bip86 => {
-            let network = Network::from_str_opt(net).unwrap_or(Network::Mainnet);
-            Identity::from_bip86(seed, meta.seed, network, meta.bip_account, meta.index).ok()
-        }
+    let network = Network::from_str_opt(net).unwrap_or(Network::Mainnet);
+    Identity::from_bip86(seed, meta.seed, network, meta.bip_account, meta.index).ok()
+}
+
+/// The active notebook's leaf key rendered as (raw hex, WIF) for the
+/// Export-keys reveal — a single-address private-key export.
+fn export_leaf_formats(
+    seed: &[u8; 32],
+    seed_index: u32,
+    network: Network,
+    account: u32,
+    index: u32,
+) -> Result<(String, String), notes_core::Error> {
+    Ok((
+        notes_core::export::leaf_hex(seed, seed_index, network, account, index)?.as_str().to_string(),
+        notes_core::export::leaf_wif(seed, seed_index, network, account, index)?.as_str().to_string(),
+    ))
+}
+
+/// The reveal-screen title: master fingerprint · seed index · account.
+/// The fingerprint (BIP-32 xfp, not a secret) identifies which seed/wallet
+/// the exported keys belong to.
+fn export_title(seed: &[u8; 32], seed_index: u32, account: u32) -> String {
+    match notes_core::seeds::seed_fingerprint_hex(seed, seed_index) {
+        Ok(fp) => format!("{fp} · Seed {seed_index} · account {account}"),
+        Err(_) => format!("Seed {seed_index} · account {account}"),
     }
 }
 
@@ -426,25 +444,14 @@ fn save_notebooks(fs: &Fs, ix: &notebooks::NotebookIndex) {
     }
 }
 
-/// One-time migration for a pre-notebooks install: an existing
-/// `state.json` (with no notebook index yet) becomes notebook 0 "Main".
-/// Returns the index to use. A fresh install returns an empty index — the
+/// Load the notebook index, or an empty one on a fresh install — the
 /// device has no onboarding, so first boot shows an empty notebook list
-/// and the user creates their first notebook deliberately.
+/// and the user creates their first (always bip86) notebook deliberately.
 fn boot_notebooks(fs: &Fs) -> notebooks::NotebookIndex {
     if read_text(fs, NOTEBOOKS_PATH, Location::User).is_ok() {
         return load_notebooks(fs);
     }
-    let mut ix = notebooks::NotebookIndex::default();
-    if let Ok(json) = read_text(fs, STATE_PATH, Location::User) {
-        // Legacy single-identity install → notebook 0 "Main" (v1 file;
-        // boot_config then moves it to the per-network layout).
-        let _ = ensure_dir(fs, STATE_DIR, Location::User)
-            .and_then(|_| write_file(fs, &state_path_v1(0), Location::User, json.as_bytes()));
-        ix.ensure(0);
-        ix.rename(0, notebooks::FIRST_NOTEBOOK_NAME);
-        log::info!("cb: notebooks migrated legacy state -> Main");
-    }
+    let ix = notebooks::NotebookIndex::default();
     save_notebooks(fs, &ix);
     ix
 }
@@ -669,8 +676,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     let sweep_plan: Rc<RefCell<Option<SweepPlan>>> = Rc::new(RefCell::new(None));
 
     // The app seed (GetAppSeed, PIN-gated on hardware) — kept so each
-    // notebook's identity can be derived on demand
-    // (`Identity::from_app_seed_indexed`, index = notebook account).
+    // notebook's identity can be derived on demand (`Identity::from_bip86`
+    // over the notebook's rotation seed + BIP-86 account/index).
     let app_seed: Rc<Option<[u8; 32]>> = Rc::new(
         match Security::default().app_seed() {
             Ok(seed) => Some(seed),
@@ -1051,15 +1058,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     .unwrap_or_default();
                 let short = short_addr(&addr);
                 let n = st.notes.len();
-                let legacy_tag = match m.scheme {
-                    notebooks::Scheme::Legacy => " · legacy",
-                    notebooks::Scheme::Bip86 => "",
-                };
                 NotebookRow {
                     account: m.account as i32,
                     name: notebook_name(&ix, m.account, &short).into(),
                     meta: format!(
-                        "{short} · {n} note{}{legacy_tag}",
+                        "{short} · {n} note{}",
                         if n == 1 { "" } else { "s" }
                     )
                     .into(),
@@ -2762,6 +2765,225 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             recovery.set_qr(Image::default());
             recovery.set_show_qr(false);
             log::info!("cb: reveal-seed cancelled");
+        });
+    }
+    // ---- export keys (screen 23) ----
+    // Reveal the active (seed, account) context's importable formats:
+    // account xpub + tr() descriptor cover the WHOLE account (all
+    // addresses); hex + WIF are one notebook's leaf, picked from the
+    // notebook list. No private xprv on the device (the 24 words recover
+    // the whole seed). Values live in UI props only, wiped on close;
+    // never logged.
+    let apply_export: Rc<dyn Fn(i32)> = {
+        let ui_weak = ui_weak.clone();
+        Rc::new(move |which: i32| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let r = ui.global::<Recovery>();
+            let nb = r.get_export_nb_name();
+            let (label, value): (String, _) = match which {
+                0 => {
+                    ("Account xpub · all addresses · watch-only".to_string(), r.get_export_xpub())
+                }
+                1 => (
+                    "Descriptor (tr) · all addresses · watch-only".to_string(),
+                    r.get_export_descriptor(),
+                ),
+                2 => (format!("Notebook \"{nb}\" · hex"), r.get_export_hex()),
+                _ => (format!("Notebook \"{nb}\" · WIF"), r.get_export_wif()),
+            };
+            r.set_export_which(which);
+            r.set_export_label(label.into());
+            r.set_export_value(value.clone());
+            r.set_export_qr(qr_image(value.as_str()));
+        })
+    };
+    // The active account's notebooks as picker rows (index/name/short addr)
+    // plus the default selection (first notebook, else a synthetic index 0).
+    let export_rows: Rc<dyn Fn(u32, u32, &str, Network) -> (Vec<ExportNbRow>, i32, String)> = {
+        let app_seed = app_seed.clone();
+        let notebooks = notebooks.clone();
+        Rc::new(move |si: u32, acct: u32, net_s: &str, network: Network| {
+            let mut rows: Vec<ExportNbRow> = Vec::new();
+            let ixb = notebooks.borrow();
+            for m in ixb.visible(si, acct) {
+                let addr = derive_identity(&app_seed, m, net_s)
+                    .map(|id| id.address(network))
+                    .unwrap_or_default();
+                let short = short_addr(&addr);
+                let name = if m.name.trim().is_empty() { short.clone() } else { m.name.clone() };
+                rows.push(ExportNbRow {
+                    index: m.index as i32,
+                    name: name.into(),
+                    addr: short.into(),
+                });
+            }
+            let (sel, sel_name) = rows
+                .first()
+                .map(|r0| (r0.index, r0.name.to_string()))
+                .unwrap_or((0, "index 0".to_string()));
+            if rows.is_empty() {
+                rows.push(ExportNbRow { index: 0, name: "index 0".into(), addr: "".into() });
+            }
+            (rows, sel, sel_name)
+        })
+    };
+    {
+        let ui_weak = ui_weak.clone();
+        let app_seed = app_seed.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let net = net.clone();
+        let apply_export = apply_export.clone();
+        let export_rows = export_rows.clone();
+        ui.global::<Callbacks>().on_reveal_public(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let r = ui.global::<Recovery>();
+            let si = *seed_idx.borrow();
+            let acct = *bip_account.borrow();
+            let Some(seed) = app_seed.as_ref() else {
+                ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
+                log::warn!("cb: reveal-public seed={si} account={acct} err=locked");
+                return;
+            };
+            let network = Network::from_str_opt(&net.borrow()).unwrap_or(Network::Mainnet);
+            let derived = (|| -> Result<(), notes_core::Error> {
+                r.set_export_xpub(notes_core::export::account_xpub(seed, si, network, acct)?.into());
+                r.set_export_descriptor(
+                    notes_core::export::account_descriptor(seed, si, network, acct)?.into(),
+                );
+                Ok(())
+            })();
+            if let Err(e) = derived {
+                ui.global::<Ui>().set_error(format!("Export failed: {e}").into());
+                log::warn!("cb: reveal-public seed={si} account={acct} err={e}");
+                return;
+            }
+            r.set_export_seed_view(false);
+            r.set_export_title(export_title(seed, si, acct).into());
+            apply_export(0);
+            log::info!("cb: reveal-public seed={si} account={acct} ok");
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let app_seed = app_seed.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let net = net.clone();
+        let apply_export = apply_export.clone();
+        let export_rows = export_rows.clone();
+        let reveal_words = reveal_words.clone();
+        ui.global::<Callbacks>().on_reveal_private(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let r = ui.global::<Recovery>();
+            let si = *seed_idx.borrow();
+            let acct = *bip_account.borrow();
+            let Some(seed) = app_seed.as_ref() else {
+                ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
+                log::warn!("cb: reveal-private seed={si} account={acct} err=locked");
+                return;
+            };
+            let net_s = net.borrow().clone();
+            let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
+            let (rows, sel, sel_name) = export_rows(si, acct, &net_s, network);
+            let derived = (|| -> Result<(), notes_core::Error> {
+                let (hex, wif) = export_leaf_formats(seed, si, network, acct, sel as u32)?;
+                r.set_export_hex(hex.into());
+                r.set_export_wif(wif.into());
+                Ok(())
+            })();
+            if let Err(e) = derived {
+                ui.global::<Ui>().set_error(format!("Export failed: {e}").into());
+                log::warn!("cb: reveal-private seed={si} account={acct} err={e}");
+                return;
+            }
+            r.set_export_notebooks(Rc::new(VecModel::from(rows)).into());
+            r.set_export_nb_index(sel);
+            r.set_export_nb_name(sel_name.into());
+            // The 24 words (whole seed) into words-col1/2 + SeedQR.
+            reveal_words();
+            r.set_export_title(export_title(seed, si, acct).into());
+            r.set_export_seed_view(true); // default to the seed-words view
+            apply_export(2); // pre-load the hex value/QR for a quick pill switch
+            log::info!("cb: reveal-private seed={si} account={acct} ok");
+        });
+    }
+    {
+        let apply_export = apply_export.clone();
+        ui.global::<Callbacks>().on_export_select(move |which| apply_export(which));
+    }
+    {
+        // Pick which notebook's private key hex/WIF export (hex/WIF only).
+        let ui_weak = ui_weak.clone();
+        let app_seed = app_seed.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let net = net.clone();
+        let notebooks = notebooks.clone();
+        let apply_export = apply_export.clone();
+        ui.global::<Callbacks>().on_export_pick_notebook(move |index| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let r = ui.global::<Recovery>();
+            let si = *seed_idx.borrow();
+            let acct = *bip_account.borrow();
+            let Some(seed) = app_seed.as_ref() else { return };
+            let net_s = net.borrow().clone();
+            let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
+            let name = {
+                let ixb = notebooks.borrow();
+                let n = ixb
+                    .visible(si, acct)
+                    .find(|m| m.index as i32 == index)
+                    .map(|m| {
+                        if m.name.trim().is_empty() {
+                            let addr = derive_identity(&app_seed, m, &net_s)
+                                .map(|id| id.address(network))
+                                .unwrap_or_default();
+                            short_addr(&addr)
+                        } else {
+                            m.name.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| format!("index {index}"));
+                n
+            };
+            r.set_export_nb_index(index);
+            r.set_export_nb_name(name.into());
+            if let Ok((hex, wif)) = export_leaf_formats(seed, si, network, acct, index as u32) {
+                r.set_export_hex(hex.into());
+                r.set_export_wif(wif.into());
+            }
+            let which = r.get_export_which();
+            if which >= 2 {
+                apply_export(which);
+            }
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_export_close(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let r = ui.global::<Recovery>();
+            r.set_export_xpub("".into());
+            r.set_export_descriptor("".into());
+            r.set_export_hex("".into());
+            r.set_export_wif("".into());
+            r.set_export_value("".into());
+            r.set_export_label("".into());
+            r.set_export_title("".into());
+            r.set_export_qr(Image::default());
+            r.set_export_which(0);
+            r.set_export_notebooks(Rc::new(VecModel::from(Vec::<ExportNbRow>::new())).into());
+            r.set_export_nb_index(0);
+            r.set_export_nb_name("".into());
+            // Also wipe the seed-words view (shared with reveal-seed props).
+            r.set_export_seed_view(false);
+            r.set_words_col1("".into());
+            r.set_words_col2("".into());
+            r.set_title_line("".into());
+            r.set_qr(Image::default());
+            r.set_show_qr(false);
+            log::info!("cb: reveal-export cancelled");
         });
     }
     {

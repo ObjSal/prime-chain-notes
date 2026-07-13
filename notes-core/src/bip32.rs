@@ -4,8 +4,11 @@
 //! path `m/86'/{coin}'/{account}'/0/{index}` ends in two normal steps,
 //! which need the parent's compressed public key in the HMAC input.
 //!
-//! No xprv/tprv serialization on purpose: the device never exports
-//! extended keys, only 24-word phrases (see `seeds.rs`).
+//! Extended-key serialization (xprv/xpub) is provided for the reveal /
+//! key-export surfaces (`export.rs`) — the device UI still only shows the
+//! subset chosen in PLAN-chain-notes-seed-rotation.md (never a private
+//! xprv), but the serialization lives here so both apps render identical
+//! strings from one pure-Rust path.
 
 use hmac::{Hmac, Mac};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -15,14 +18,17 @@ use ripemd::Ripemd160;
 use sha2::{Digest, Sha256, Sha512};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::Error;
+use crate::{Error, Network};
 
 pub const HARDENED: u32 = 0x8000_0000;
 
-/// A private extended key — just the derivation state, no serialization.
+/// A private extended key — the derivation state plus the parent
+/// fingerprint + child number needed to serialize an xprv/xpub.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Xprv {
     pub depth: u8,
+    pub parent_fingerprint: [u8; 4],
+    pub child_number: u32,
     pub chain_code: [u8; 32],
     pub key: [u8; 32],
 }
@@ -40,7 +46,13 @@ impl Xprv {
         let (il, ir) = i.split_at(32);
         let key: [u8; 32] = il.try_into().unwrap();
         nonzero_scalar(&key)?;
-        Ok(Xprv { depth: 0, chain_code: ir.try_into().unwrap(), key })
+        Ok(Xprv {
+            depth: 0,
+            parent_fingerprint: [0; 4],
+            child_number: 0,
+            chain_code: ir.try_into().unwrap(),
+            key,
+        })
     }
 
     /// Compressed SEC1 public key of this node (33 bytes).
@@ -85,6 +97,8 @@ impl Xprv {
         }
         Ok(Xprv {
             depth: self.depth + 1,
+            parent_fingerprint: self.fingerprint()?,
+            child_number: index,
             chain_code: ir.try_into().unwrap(),
             key: child.to_repr().into(),
         })
@@ -110,6 +124,48 @@ impl Xprv {
             node = node.derive(index)?;
         }
         Ok(node)
+    }
+
+    /// Serialize as an extended PRIVATE key string (`xprv` on mainnet,
+    /// `tprv` on the test chains). Carries secret material — used only by
+    /// chain-notes-app's reveal; the device deliberately never shows it.
+    pub fn to_xprv(&self, network: Network) -> String {
+        let version: u32 = match network {
+            Network::Mainnet => 0x0488_ADE4,
+            _ => 0x0435_8394,
+        };
+        let mut key_data = Vec::with_capacity(33);
+        key_data.push(0x00);
+        key_data.extend_from_slice(&self.key);
+        let s = self.serialize_ext(version, &key_data);
+        key_data.zeroize();
+        s
+    }
+
+    /// Serialize as an extended PUBLIC key string (`xpub`/`tpub`). Public
+    /// — safe for watch-only export.
+    pub fn to_xpub(&self, network: Network) -> Result<String, Error> {
+        let version: u32 = match network {
+            Network::Mainnet => 0x0488_B21E,
+            _ => 0x0435_87CF,
+        };
+        Ok(self.serialize_ext(version, &self.pubkey()?))
+    }
+
+    /// BIP-32 extended-key body (version‖depth‖parent_fp‖child‖chaincode‖
+    /// key_data), base58check-encoded. `key_data` is `0x00‖privkey` for an
+    /// xprv or the 33-byte compressed pubkey for an xpub.
+    fn serialize_ext(&self, version: u32, key_data: &[u8]) -> String {
+        let mut data = Vec::with_capacity(78);
+        data.extend_from_slice(&version.to_be_bytes());
+        data.push(self.depth);
+        data.extend_from_slice(&self.parent_fingerprint);
+        data.extend_from_slice(&self.child_number.to_be_bytes());
+        data.extend_from_slice(&self.chain_code);
+        data.extend_from_slice(key_data);
+        let s = bs58::encode(&data).with_check().into_string();
+        data.zeroize();
+        s
     }
 }
 

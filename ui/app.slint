@@ -1,5 +1,5 @@
 import { Theme, UISize, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize } from "@ui/theme.slint";
-import { Callbacks, Ui, Home, Compose, Confirm, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery } from "callbacks.slint";
+import { Callbacks, Ui, Home, Compose, Confirm, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow } from "callbacks.slint";
 import { Button } from "@ui/button.slint";
 
 export { Callbacks, Ui, Home, Compose, Confirm, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
@@ -1196,7 +1196,7 @@ export component AppWindow inherits Window {
             padding-left: 24px;
             padding-right: 24px;
             padding-top: 16px + UISize.control-center-status-bar-height;
-            padding-bottom: 24px;
+            padding-bottom: 0;
             spacing: 14px;
 
             ScreenHeader {
@@ -1204,11 +1204,21 @@ export component AppWindow inherits Window {
                 back => { Ui.screen = 20; }
             }
 
-            SecondaryAction {
-                width: 100%;
-                text: "Network: " + Home.network;
-                clicked => { Callbacks.cycle-network(); }
-            }
+            // Settings has grown (Coins/Sweep, chunk, Accounts, the whole
+            // Dangerous area) — scroll the body, keep the header fixed.
+            Flickable {
+                vertical-stretch: 1;
+                viewport-width: self.width;
+                viewport-height: s6-content.preferred-height;
+                s6-content := VerticalLayout {
+                    spacing: 14px;
+                    padding-bottom: 24px;
+
+                    SecondaryAction {
+                        width: 100%;
+                        text: "Network: " + Home.network;
+                        clicked => { Callbacks.cycle-network(); }
+                    }
 
             // Funds — viewer-first Coins (consolidate lives there) and the
             // sweep flow (destination picked first, compose-like screen).
@@ -1305,25 +1315,70 @@ export component AppWindow inherits Window {
                 wrap: word-wrap;
             }
 
-            // Two separate entries (Sal 2026-07-12 — the switcher and the
-            // backup reveal are different tasks): the wallet-context
-            // switcher (screen 21) and the recovery-words reveal (22).
+            // The wallet-context switcher (accounts) is a normal setting.
             SecondaryAction {
                 width: 100%;
                 text: "Accounts…";
                 clicked => { Ui.screen = 21; }
             }
+
+            // ---- Dangerous area: reveal keys, grouped by risk ----
+            // Recovery words + exports are all REVEALS; split by what a
+            // captured value costs you — public (watch-only) vs private
+            // (spends + decrypts). (Sal 2026-07-13.)
+            Rectangle {
+                height: 1px;
+                background: Theme.palette-danger;
+            }
+            Text {
+                text: "Dangerous area";
+                color: Theme.palette-danger;
+                font-family: "Montserrat";
+                font-size: 13px;
+                font-weight: 700;
+            }
+            Text {
+                text: "These show secrets on screen. Reveal only somewhere private — no cameras, no one watching over your shoulder.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
             SecondaryAction {
                 width: 100%;
-                text: "Recovery words…";
+                text: "Public keys…";
                 disabled: !Recovery.seed-available;
                 clicked => {
-                    Callbacks.reveal-seed();
-                    Ui.screen = 22;
+                    Callbacks.reveal-public();
+                    Ui.screen = 23;
                 }
             }
+            Text {
+                text: "Account xpub + descriptor. Watch-only — safe to share so someone can see this account's balance; can't spend or read private notes.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            SecondaryAction {
+                width: 100%;
+                text: "Private keys…";
+                disabled: !Recovery.seed-available;
+                clicked => {
+                    Callbacks.reveal-private();
+                    Ui.screen = 24;
+                }
+            }
+            Text {
+                text: "Recovery words + a notebook's raw key (hex/WIF). Anyone who sees these controls the coins and can read every private note. Keep them off cameras and out of sight.";
+                color: Theme.palette-danger;
+                font-family: "Montserrat";
+                font-size: 12px;
+                wrap: word-wrap;
+            }
 
-            Rectangle { vertical-stretch: 1; }
+                }
+            }
         }
 
         // ----------------------------------------- screen 21: accounts
@@ -1444,7 +1499,7 @@ export component AppWindow inherits Window {
             // reached from a SEPARATE Settings entry — a pointer here so
             // the two tasks are clearly distinct.
             Text {
-                text: "To back up or rotate a seed, use \"Recovery words…\" in Settings — it shows the 24-word phrase for the selected seed index.";
+                text: "To back up or rotate a seed, use \"Private keys…\" in Settings — its Seed words show the 24-word phrase for the selected seed index.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
                 font-size: 13px;
@@ -1500,12 +1555,14 @@ export component AppWindow inherits Window {
                     horizontal-stretch: 1;
                 }
             }
-            if Recovery.show-qr: Image {
-                source: Recovery.qr;
-                width: 220px;
-                height: 220px;
-                image-rendering: pixelated;
-                x: (parent.width - self.width) / 2;
+            if Recovery.show-qr: HorizontalLayout {
+                alignment: center;
+                Image {
+                    source: Recovery.qr;
+                    width: 220px;
+                    height: 220px;
+                    image-rendering: pixelated;
+                }
             }
 
             SecondaryAction {
@@ -1520,6 +1577,291 @@ export component AppWindow inherits Window {
                 font-family: "Montserrat";
                 font-size: 13px;
                 wrap: word-wrap;
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        // ------------------------------------- screen 23: PUBLIC keys
+        // Watch-only exports for the active account: xpub + tr() descriptor
+        // (whole account, all addresses). Safe to share.
+        if Ui.screen == 23: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 12px;
+
+            ScreenHeader {
+                title: "Public keys";
+                back => {
+                    Callbacks.export-close();
+                    Ui.screen = 6;
+                }
+            }
+
+            Text {
+                text: Recovery.export-title;
+                color: Theme.palette-foreground;
+                font-family: "Montserrat";
+                font-size: 16px;
+                font-weight: 600;
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                PillOption {
+                    label: "xpub";
+                    selected: Recovery.export-which == 0;
+                    horizontal-stretch: 1;
+                    tapped => { Callbacks.export-select(0); }
+                }
+                PillOption {
+                    label: "descriptor";
+                    selected: Recovery.export-which == 1;
+                    horizontal-stretch: 1;
+                    tapped => { Callbacks.export-select(1); }
+                }
+            }
+
+            Text {
+                text: Recovery.export-label;
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                font-weight: 600;
+            }
+            Rectangle {
+                background: Theme.palette-surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                VerticalLayout {
+                    padding: 12px;
+                    Text {
+                        text: Recovery.export-value;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 13px;
+                        wrap: char-wrap;
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                Image {
+                    source: Recovery.export-qr;
+                    width: 176px;
+                    height: 176px;
+                    image-rendering: pixelated;
+                }
+            }
+            Text {
+                text: "Import into any wallet to WATCH this account — see its balance and public notes across all addresses. It cannot spend or read private notes. The descriptor also tells the wallet the script type + key origin.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        // ------------------------------------- screen 24: PRIVATE keys
+        // The dangerous exports: recovery words (whole seed) and a single
+        // notebook's raw key (hex/WIF). Camera warning up top.
+        if Ui.screen == 24: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 10px;
+
+            ScreenHeader {
+                title: "Private keys";
+                back => {
+                    Callbacks.export-close();
+                    Ui.screen = 6;
+                }
+            }
+
+            Text {
+                text: Recovery.export-title;
+                color: Theme.palette-foreground;
+                font-family: "Montserrat";
+                font-size: 16px;
+                font-weight: 600;
+            }
+            Text {
+                text: "Make sure no cameras or onlookers — anyone who captures these controls the coins and can read every private note.";
+                color: Theme.palette-danger;
+                font-family: "Montserrat";
+                font-size: 12px;
+                font-weight: 600;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                PillOption {
+                    label: "Seed words";
+                    selected: Recovery.export-seed-view;
+                    horizontal-stretch: 1;
+                    tapped => {
+                        Recovery.export-seed-view = true;
+                        Recovery.show-qr = false;
+                    }
+                }
+                PillOption {
+                    label: "hex";
+                    selected: !Recovery.export-seed-view && Recovery.export-which == 2;
+                    horizontal-stretch: 1;
+                    tapped => {
+                        Recovery.export-seed-view = false;
+                        Callbacks.export-select(2);
+                    }
+                }
+                PillOption {
+                    label: "WIF";
+                    selected: !Recovery.export-seed-view && Recovery.export-which == 3;
+                    horizontal-stretch: 1;
+                    tapped => {
+                        Recovery.export-seed-view = false;
+                        Callbacks.export-select(3);
+                    }
+                }
+            }
+
+            // --- Seed-words view (whole seed) ---
+            if Recovery.export-seed-view: VerticalLayout {
+                spacing: 10px;
+                Text {
+                    text: "24 words · backs up the whole seed";
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 13px;
+                }
+                if !Recovery.show-qr: HorizontalLayout {
+                    spacing: 16px;
+                    Text {
+                        text: Recovery.words-col1;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 15px;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Recovery.words-col2;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 15px;
+                        horizontal-stretch: 1;
+                    }
+                }
+                if Recovery.show-qr: HorizontalLayout {
+                    alignment: center;
+                    Image {
+                        source: Recovery.qr;
+                        width: 200px;
+                        height: 200px;
+                        image-rendering: pixelated;
+                    }
+                }
+                SecondaryAction {
+                    width: 100%;
+                    text: Recovery.show-qr ? "Show words" : "Show as SeedQR";
+                    clicked => { Recovery.show-qr = !Recovery.show-qr; }
+                }
+                Text {
+                    text: "These 24 words back up the WHOLE seed — every account and notebook. Import them into any taproot wallet, or write them down offline.";
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+
+            // --- Single-key view (one notebook: hex/WIF) ---
+            if !Recovery.export-seed-view: VerticalLayout {
+                spacing: 10px;
+                Text {
+                    text: "Notebook (whose private key):";
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 13px;
+                }
+                for nb in Recovery.export-notebooks: Rectangle {
+                    height: 40px;
+                    background: nb.index == Recovery.export-nb-index ? Theme.palette-primary : Theme.palette-surface;
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: nb.index == Recovery.export-nb-index ? Theme.palette-primary : Theme.palette-border;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 8px;
+                        Text {
+                            text: nb.name;
+                            color: nb.index == Recovery.export-nb-index ? #ffffff : Theme.palette-foreground;
+                            font-family: "Montserrat";
+                            font-size: 14px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: nb.addr;
+                            color: nb.index == Recovery.export-nb-index ? #ffffff : Theme.palette-muted;
+                            font-family: "SourceCodePro";
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    TouchArea { clicked => { Callbacks.export-pick-notebook(nb.index); } }
+                }
+                Text {
+                    text: Recovery.export-label;
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 13px;
+                    font-weight: 600;
+                }
+                Rectangle {
+                    background: Theme.palette-surface;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Theme.palette-danger;
+                    VerticalLayout {
+                        padding: 12px;
+                        Text {
+                            text: Recovery.export-value;
+                            color: Theme.palette-foreground;
+                            font-family: "SourceCodePro";
+                            font-size: 13px;
+                            wrap: char-wrap;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: center;
+                    Image {
+                        source: Recovery.export-qr;
+                        width: 176px;
+                        height: 176px;
+                        image-rendering: pixelated;
+                    }
+                }
+                Text {
+                    text: "Just this one address's private key — import into chain-notes-app or any wallet to spend it. The whole account recovers from the Seed words instead.";
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
             }
 
             Rectangle { vertical-stretch: 1; }

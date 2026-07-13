@@ -15,6 +15,7 @@ pub mod bundle;
 pub mod crypt;
 pub mod dm;
 pub mod envelope;
+pub mod export;
 pub mod keys;
 pub mod psbt;
 pub mod seeds;
