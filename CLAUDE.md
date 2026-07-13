@@ -232,21 +232,21 @@ user creates the first notebook deliberately.
   via `Sweep.kind`: destination line, fee-tier pills with the
   collapse-on-Custom rate field, read-only "Inputs · N coins · T sats
   (all)" summary, live cost line, Continue → confirm dialog → sign) ·
-  **21 recovery & accounts** (Settings → "Recovery & accounts…"): the
-  wallet-context switcher — `Recovery.seed-text` (rotation seed index)
-  and `Recovery.account-text` (BIP-86 account), **each in its own labeled
-  row with an explanation** (Sal 2026-07-12 — the shared row was
-  confusing), both 0–9999. **"Switch" STAYS on the screen** (Sal
-  2026-07-12 — it used to jump to the list): it persists the context,
-  rebuilds the now-background notebook list, re-derives the revealed
-  words/SeedQR to the new seed (shared `reveal_words` helper), and shows
-  an inline `Recovery.saved-msg` "Saved · seed N · account M" (cleared on
-  field edit) — the user navigates back themselves. "Show recovery
-  words…" opens **screen 22 (recovery words)**, a DEDICATED reveal (Sal
-  2026-07-12 — the words + QR overflowed screen 21): `reveal-seed` →
-  `keys::derive_seed_entropy` → words (2 cols) + the standard SeedQR
+  **21 accounts + 22 recovery words** — TWO separate Settings entries
+  (Sal 2026-07-12 — the switcher and the backup reveal are different
+  tasks, don't share a screen). **Settings → "Accounts…" → screen 21**:
+  the wallet-context switcher only — `Recovery.seed-text` (rotation seed
+  index) and `Recovery.account-text` (BIP-86 account), each in its own
+  labeled row with an explanation, both 0–9999. **"Switch" STAYS on the
+  screen** (used to jump to the list): persists the context, rebuilds
+  the background notebook list, and shows an inline `Recovery.saved-msg`
+  "Saved · seed N · account M" (cleared on field edit) — the user
+  navigates back themselves. Back → Settings. **Settings → "Recovery
+  words…" → screen 22**: a dedicated reveal (words + QR overflowed the
+  switcher, and a backup deserves its own focused screen). `reveal-seed`
+  → `keys::derive_seed_entropy` → words (2 cols) + the standard SeedQR
   digit stream into `Recovery.words-col1/2` + `.qr`, with a words⇄SeedQR
-  toggle; its Back = `reveal-close` (wipes them, back to 21). Nothing
+  toggle; Back = `reveal-close` → Settings (wipes them). Nothing
   persisted or logged, words never in a `cb:` line.
   New notebooks derive under the active (seed, account); wallet-level
   features scope to `visible(seed, account)` (legacy notebooks are

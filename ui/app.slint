@@ -1305,21 +1305,31 @@ export component AppWindow inherits Window {
                 wrap: word-wrap;
             }
 
-            // Recovery seeds + BIP-86 accounts — its own screen (21): the
-            // wallet-context switcher and the 24-word reveal.
+            // Two separate entries (Sal 2026-07-12 — the switcher and the
+            // backup reveal are different tasks): the wallet-context
+            // switcher (screen 21) and the recovery-words reveal (22).
             SecondaryAction {
                 width: 100%;
-                text: "Recovery & accounts…";
+                text: "Accounts…";
                 clicked => { Ui.screen = 21; }
+            }
+            SecondaryAction {
+                width: 100%;
+                text: "Recovery words…";
+                disabled: !Recovery.seed-available;
+                clicked => {
+                    Callbacks.reveal-seed();
+                    Ui.screen = 22;
+                }
             }
 
             Rectangle { vertical-stretch: 1; }
         }
 
-        // ------------------------------- screen 21: recovery & accounts
-        // Wallet context (rotation seed index + BIP-86 account) on top —
-        // keyboard-safe — then the words reveal. Words/QR are re-derived
-        // on reveal and CLEARED on any exit (reveal-close).
+        // ----------------------------------------- screen 21: accounts
+        // Wallet-context switcher only (rotation seed index + BIP-86
+        // account). The words reveal lives on its own screen (22), reached
+        // from a separate Settings entry.
         if Ui.screen == 21: VerticalLayout {
             width: parent.width;
             height: parent.height;
@@ -1330,11 +1340,8 @@ export component AppWindow inherits Window {
             spacing: 12px;
 
             ScreenHeader {
-                title: "Recovery";
-                back => {
-                    Callbacks.reveal-close();
-                    Ui.screen = 6;
-                }
+                title: "Accounts";
+                back => { Ui.screen = 6; }
             }
 
             // Recovery seed — its own row with an explanation.
@@ -1433,21 +1440,11 @@ export component AppWindow inherits Window {
                 wrap: word-wrap;
             }
 
-            // The reveal is its own focused screen (22) — the words + QR
-            // don't fit under the switcher, and a sensitive backup deserves
-            // a dedicated screen anyway (Sal 2026-07-12).
-            SecondaryAction {
-                width: 100%;
-                text: "Show recovery words…";
-                disabled: !Recovery.seed-available;
-                clicked => {
-                    Callbacks.reveal-seed();
-                    Ui.screen = 22;
-                }
-            }
-
+            // The recovery-phrase backup lives on its own screen (22),
+            // reached from a SEPARATE Settings entry — a pointer here so
+            // the two tasks are clearly distinct.
             Text {
-                text: "These 24 words are the complete backup of THIS seed's notebooks — funds and private notes. Anyone who sees them has everything on this seed, forever. Switching the seed index makes an entirely new phrase; old words keep old keys, so sweep funds before abandoning a seed.";
+                text: "To back up or rotate a seed, use \"Recovery words…\" in Settings — it shows the 24-word phrase for the selected seed index.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
                 font-size: 13px;
@@ -1458,9 +1455,9 @@ export component AppWindow inherits Window {
         }
 
         // ---------------------------------- screen 22: recovery words
-        // Dedicated reveal (from screen 21). Words/SeedQR for the active
-        // seed; Back clears them (reveal-close). Fits comfortably on its
-        // own, no scrolling needed.
+        // Dedicated reveal, reached straight from Settings. Words/SeedQR
+        // for the active seed; Back → Settings, clearing them
+        // (reveal-close). Fits comfortably on its own, no scrolling.
         if Ui.screen == 22: VerticalLayout {
             width: parent.width;
             height: parent.height;
@@ -1474,7 +1471,7 @@ export component AppWindow inherits Window {
                 title: "Recovery words";
                 back => {
                     Callbacks.reveal-close();
-                    Ui.screen = 21;
+                    Ui.screen = 6;
                 }
             }
 
