@@ -350,3 +350,20 @@ create them. SDK `IconButton` drops taps (use TouchArea), overlays must
 nest inside the root container, SDK TextArea can't scroll (compose uses the
 text-editor's Flickable+TextInput pattern), keyboard-aware layout keeps all
 compose controls in the top ~400px.
+
+**Keyboard Done on the note editor**: the system keyboard's Done key has
+no distinct signal — it sends a plain `'\n'` (gui-app-keyboard maps
+`KeyAction::Return` → `Key::Char('\n')`). A note is composed as one
+paragraph on-device, so `compose-changed` treats ANY newline as "done
+typing": strips it, bumps `Compose.dismiss-nonce`, and the editor's
+`changed dn` handler clears focus (focus loss → IMR Disable → keyboard
+hides). Log: `cb: compose keyboard-done`. Consequence: newlines can't be
+TYPED into a device note (received multi-line notes still render fine).
+
+**Hosted-sim quirk (not an app bug)**: the sim drops the Mac PHYSICAL
+spacebar (winit delivers Space as a named key, and the sim's key
+forwarding only passes character keys) — typing on the Mac keyboard
+loses spaces. The on-screen keyboard's spacebar works, `simtap type`
+(Unicode-injection) works — which is why the UI e2e never hit it. For
+manual sim testing: click the on-screen spacebar, or focus the field
+and run `../ui-automation/simtap type "text with spaces"`.
