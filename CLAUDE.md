@@ -35,7 +35,7 @@ notes-core/            # UI-free, host-testable: cargo test -p notes-core
   examples/notes_cli.rs  # host CLI (device role) for the e2e scripts
                        #   (+ seed-words / seed-address for the recovery leg)
 src/main.rs            # app: screens, callbacks, state.json persistence
-src/notebooks.rs       # scheme-versioned index (legacy | bip86 notebooks)
+src/notebooks.rs       # bip86 notebook index (rotation seed + BIP-86 account/index)
 ui/{app.slint, callbacks.slint}
 scripts/regtest-e2e.sh          # host-only e2e vs bitcoind -regtest
 scripts/regtest-companion.sh    # companion-role helper (setup/bundle/broadcast/mine)
@@ -55,12 +55,7 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
   `identity/<attempt>`, `note-enc/v1`, `dm-enc/v1`, the PNTE envelope
   layout (flags bit0 private, bit1 directed), and the directed-note AAD
   `sender_x(32) || recipient_x(32) || note_id(4)`. Every confirmed note
-  depends on them. The **notebook** (indexed) derivations are FROZEN the
-  same way: `Identity::from_app_seed_indexed` — index 0 delegates to the
-  original rules byte-identically (pre-notebooks state IS notebook 0),
-  index ≥ 1 expands infos `identity/nb/<index_le32>/<attempt_le32>` and
-  `note-enc/nb/<index_le32>/v1` under the same salts (vectors pinned in
-  `tests/vectors.rs::notebook_derivation_vectors`). Directed-private key = HKDF(dm/v1,
+  depends on them. Directed-private key = HKDF(dm/v1,
   x(my_tweaked_seckey · lift_x(peer_output_x))) — symmetric both ways,
   frozen vector in `tests/vectors.rs`. **Recovery-seeds strings** are
   FROZEN too (`../PLAN-chain-notes-seed-rotation.md`): the seed-entropy
@@ -70,17 +65,17 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
   `chain-notes-app/enc/v1`, info `note-enc/v1`) that bip86 leaves seal
   with (`keys::enc_key_from_leaf`). Vectors + BIP-39/32/86 spec and
   rust-bitcoin cross-checks in `tests/seed_vectors.rs`.
-- **Two notebook derivation schemes coexist** (recovery seeds): a
-  notebook's `scheme` in `notebooks.json` is `legacy` (default — shipped
-  v1 files load byte-identically; HKDF-indexed, network-independent) or
-  `bip86` (`Identity::from_bip86(app_seed, seed, net, account, index)` —
-  a receive index of a BIP-86 account under rotation seed `seed`;
-  per-network coin type 0'/1'; recoverable from the seed's 24 words
-  alone in ANY taproot wallet, and fully in chain-notes-app via plain
-  BIP-39 import — byte-identical by the shared notes-core leaf rule).
-  New notebooks are always `bip86` under the active (seed, account)
-  wallet context; legacy notebooks stay derivable/spendable forever but
-  are never created anymore. **The app seed itself is NEVER exported in
+- **Every notebook is a bip86 leaf** (recovery seeds):
+  `Identity::from_bip86(app_seed, seed, net, account, index)` — a receive
+  index of a BIP-86 account under rotation seed `seed`; per-network coin
+  type 0'/1'; recoverable from the seed's 24 words alone in ANY taproot
+  wallet, and fully in chain-notes-app via plain BIP-39 import
+  (byte-identical by the shared notes-core leaf rule). New notebooks are
+  created under the active (seed, account) wallet context. The
+  pre-recovery-seeds HKDF **"legacy" scheme was removed before any
+  release** (`from_app_seed_indexed` + the Scheme enum are gone — nothing
+  shipped, so there is no on-chain data to preserve;
+  PLAN-chain-notes-seed-rotation.md). **The app seed itself is NEVER exported in
   any form** — every rotation index (including 0) goes through the
   one-way seed-entropy HKDF, so no phrase can unlock the app seed or a
   different index. Rotation is scoped; old words keep old keys (and old
@@ -124,8 +119,8 @@ vendor/{getrandom, security-api}  # KeyOS TRNG override + GetAppSeed API
 
 ## Notebooks (device port — phase 1)
 
-A **notebook = an indexed identity** (`Identity::from_app_seed_indexed`,
-account 0 = the original single-identity app, byte-identical). Boot lands
+A **notebook = a BIP-86 leaf** (`Identity::from_bip86`, keyed by rotation
+seed + account + receive index). Boot lands
 on the **notebook LIST (screen 20 — the main screen)**; tapping a row opens
 that notebook's home (screen 0, now with a back-to-list header). The device
 has NO onboarding, so a fresh install starts with an empty list and the
@@ -136,8 +131,12 @@ user creates the first notebook deliberately.
   each notebook's notes/UTXO ledger in its own
   `/.chain-notes/state-<account>.json`. `State` gained a `#[serde(skip)]
   account` (path implies it) so `save_state` routes without threading it.
-- **Migration**: a pre-notebooks `state.json` (no index yet) becomes
-  notebook 0 "Main" on first boot (`boot_notebooks`); the identity is
+- **No legacy migration**: first boot with no `notebooks.json` shows an
+  empty list (every notebook is created deliberately as bip86). The old
+  pre-notebooks `state.json` → "Main" migration was removed with the
+  legacy scheme (nothing shipped). *(Historical note below describes the
+  removed path.)* The former behavior: a pre-notebooks `state.json` became
+  notebook 0 "Main" on first boot (`boot_notebooks`); the identity was
   byte-identical, so the address/balance/notes are preserved.
 - **Active notebook**: `state`/`identity` are `Rc<RefCell<…>>` that swap on
   `switch_notebook(account)` — save the current, derive the target identity
@@ -199,9 +198,12 @@ user creates the first notebook deliberately.
   activity feed (notes are per-notebook by design, which is correct), so
   N/A.
 - **chain-notes.sh (sim e2e) is boot-to-list aware**: waits for
-  `cb: notebooks list`, then taps the migrated "Main" row to reach home
-  before its existing flow (the seeded legacy `state.json` migrates to
-  Main automatically). Full run needs bitcoind + ~3 sim cycles.
+  `cb: notebooks list`. NOTE (bip86-only collapse): the old flow relied on
+  a seeded legacy `state.json` migrating to a "Main" notebook — that
+  migration is GONE, so the suite must now CREATE a bip86 notebook (+ New
+  notebook) to reach home before its existing flow. **This leg still needs
+  updating** (tracked with the reveal-export UI leg). Full run needs
+  bitcoind + ~3 sim cycles.
 
 ## State & sync contract
 
@@ -250,9 +252,16 @@ user creates the first notebook deliberately.
   toggle; Back = `reveal-close` → Settings (wipes them). Nothing
   persisted or logged, words never in a `cb:` line.
   New notebooks derive under the active (seed, account); wallet-level
-  features scope to `visible(seed, account)` (legacy notebooks are
-  context-free — funds never hide). — actions and preferences
-  deliberately split.
+  features scope to `visible(seed, account)`. — actions and preferences
+  deliberately split. **Settings → "Export keys…" → screen 23**: the
+  active (seed, account) context's importable formats for handing the
+  identity to another wallet — format pills (xpub / descriptor / hex /
+  WIF), each shown as text + a scannable QR (`export::*` on notes-core's
+  base58check/BIP-32 serialization; index-0 leaf for hex/WIF). **No
+  private xprv on the device** (the 24 words already recover the whole
+  seed; PLAN-chain-notes-seed-rotation.md). `reveal-export` populates
+  `Recovery.export-*`, `export-select(i)` switches the shown format,
+  `export-close` wipes them; values in UI props only, never logged.
 - Sweep/consolidate (mirrors the chain-notes-app UX, minus anything
   external-wallet — a Prime holds its own keys, so NO "pay fee from
   another wallet" option exists here by design): sweep is reached from
@@ -330,6 +339,8 @@ user creates the first notebook deliberately.
 `cb: set-network <net>` ·
 `cb: set-seed-index <i>` · `cb: set-account <a>` (recovery-seeds wallet
 context; Switch STAYS on screen 21 and shows a saved confirmation) ·
+`cb: reveal-export seed=<s> account=<a> ok | cancelled` (Export keys
+screen 23; values in UI props only, never key material in the line) ·
 `cb: reveal-seed index=<i> ok | cancelled` (never carries words — the
 24 words + SeedQR live only in UI props, wiped on close) ·
 `cb: create-notebook account=<key> scheme=bip86 seed=<s> bip-account=<a>
