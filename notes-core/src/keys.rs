@@ -85,51 +85,6 @@ pub fn derive_encryption_key(app_seed: &[u8; 32]) -> [u8; 32] {
     okm
 }
 
-/// [`derive_identity_key`] for notebook `index` (the notebooks feature:
-/// one identity per notebook, ../../PLAN-chain-notes-notebooks.md).
-/// Index 0 delegates to the ORIGINAL frozen derivation, so every
-/// pre-notebooks identity IS notebook 0 unchanged; higher indexes expand
-/// "identity/nb/" || index_le32 || "/" || attempt_le32 under the same
-/// salt. FROZEN once shipped, exactly like index 0 — wipe recovery
-/// re-derives every notebook from the device seed backup.
-pub fn derive_identity_key_indexed(app_seed: &[u8; 32], index: u32) -> [u8; 32] {
-    if index == 0 {
-        return derive_identity_key(app_seed);
-    }
-    let hk = Hkdf::<Sha256>::new(Some(KEY_SALT), app_seed);
-    let mut attempt: u32 = 0;
-    loop {
-        let mut info = Vec::with_capacity(12 + 4 + 1 + 4);
-        info.extend_from_slice(b"identity/nb/");
-        info.extend_from_slice(&index.to_le_bytes());
-        info.push(b'/');
-        info.extend_from_slice(&attempt.to_le_bytes());
-        let mut okm = [0u8; 32];
-        hk.expand(&info, &mut okm).expect("32 bytes is a valid HKDF length");
-        if scalar_from_bytes(&okm).is_some() {
-            return okm;
-        }
-        attempt += 1;
-    }
-}
-
-/// [`derive_encryption_key`] for notebook `index`: 0 = the original
-/// frozen rule, higher indexes expand
-/// "note-enc/nb/" || index_le32 || "/v1". FROZEN once shipped.
-pub fn derive_encryption_key_indexed(app_seed: &[u8; 32], index: u32) -> [u8; 32] {
-    if index == 0 {
-        return derive_encryption_key(app_seed);
-    }
-    let hk = Hkdf::<Sha256>::new(Some(ENC_SALT), app_seed);
-    let mut info = Vec::with_capacity(12 + 4 + 3);
-    info.extend_from_slice(b"note-enc/nb/");
-    info.extend_from_slice(&index.to_le_bytes());
-    info.extend_from_slice(b"/v1");
-    let mut okm = [0u8; 32];
-    hk.expand(&info, &mut okm).expect("32 bytes is a valid HKDF length");
-    okm
-}
-
 /// Recovery-seed entropy for rotation `index` — the ★ step of the
 /// recovery-seeds pipeline, the ONLY place the rotation index enters:
 /// HKDF-SHA256(SEED_SALT, app_seed, "seed/" || index_le32). Everything
