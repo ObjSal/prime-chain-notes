@@ -825,7 +825,7 @@ export component AppWindow inherits Window {
 
             ScreenHeader {
                 title: "Sync";
-                back => { Callbacks.refresh-home(); Ui.screen = 0; }
+                back => { Sync.picking = false; Callbacks.refresh-home(); Ui.screen = 0; }
             }
 
             Text {
@@ -836,25 +836,67 @@ export component AppWindow inherits Window {
                 wrap: word-wrap;
             }
 
-            PrimaryAction {
-                width: 100%;
-                text: "Import sync bundle";
-                clicked => { Callbacks.import-bundle(); }
+            // Normal actions — hidden while the import picker is open.
+            if !Sync.picking: VerticalLayout {
+                spacing: 14px;
+                PrimaryAction {
+                    width: 100%;
+                    text: "Import sync bundle";
+                    clicked => { Callbacks.list-bundles(); }
+                }
+                SecondaryAction {
+                    width: 100%;
+                    text: "Export pending txs";
+                    clicked => { Callbacks.export-pending(); }
+                }
+                SecondaryAction {
+                    width: 100%;
+                    text: "Scan bundle 📷";
+                    clicked => { Callbacks.scan-bundle(); }
+                }
+                SecondaryAction {
+                    width: 100%;
+                    text: "Sign external tx ✍";
+                    clicked => { Callbacks.sign-psbt(); }
+                }
             }
-            SecondaryAction {
-                width: 100%;
-                text: "Export pending txs";
-                clicked => { Callbacks.export-pending(); }
-            }
-            SecondaryAction {
-                width: 100%;
-                text: "Scan bundle 📷";
-                clicked => { Callbacks.scan-bundle(); }
-            }
-            SecondaryAction {
-                width: 100%;
-                text: "Sign external tx ✍";
-                clicked => { Callbacks.sign-psbt(); }
+
+            // Import picker: the actual files found in the inboxes, so the
+            // user chooses one (no silent auto-pick). Empty → instructions.
+            if Sync.picking: VerticalLayout {
+                spacing: 10px;
+                Text {
+                    text: "Choose a bundle to import";
+                    color: Theme.palette-foreground;
+                    font-family: "Montserrat";
+                    font-size: 16px;
+                    font-weight: 600;
+                }
+                for b in Sync.bundles: SecondaryAction {
+                    width: 100%;
+                    text: b.label;
+                    clicked => { Callbacks.pick-bundle(b.name, b.loc); }
+                }
+                if Sync.bundles.length == 0: Text {
+                    text: Sync.empty-hint;
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 14px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    SecondaryAction {
+                        horizontal-stretch: 1;
+                        text: "Refresh";
+                        clicked => { Callbacks.list-bundles(); }
+                    }
+                    SecondaryAction {
+                        horizontal-stretch: 1;
+                        text: "Cancel";
+                        clicked => { Sync.picking = false; }
+                    }
+                }
             }
 
             Text {
@@ -1295,60 +1337,100 @@ export component AppWindow inherits Window {
                 }
             }
 
+            // Recovery seed — its own row with an explanation.
             Text {
-                text: Recovery.context-error == "" ? "Seed index · account" : Recovery.context-error;
-                color: Recovery.context-error == "" ? Theme.palette-muted : Theme.palette-danger;
+                text: "Recovery seed";
+                color: Theme.palette-foreground;
                 font-family: "Montserrat";
-                font-size: 14px;
+                font-size: 15px;
+                font-weight: 600;
             }
-            HorizontalLayout {
-                spacing: 8px;
-                Rectangle {
-                    height: 44px;
-                    horizontal-stretch: 1;
-                    background: Theme.palette-surface;
-                    border-radius: 12px;
-                    border-width: 1px;
-                    border-color: seed-input.has-focus ? Theme.palette-primary : Theme.palette-border;
-                    clip: true;
-                    seed-input := TextInput {
-                        x: 14px;
-                        width: parent.width - 28px;
-                        height: 24px;
-                        y: (parent.height - self.height) / 2;
-                        text <=> Recovery.seed-text;
-                        color: Theme.palette-foreground;
-                        font-family: "SourceCodePro";
-                        font-size: 18px;
-                        single-line: true;
-                        accepted => { self.clear-focus(); }
-                    }
+            Text {
+                text: "The 24-word phrase that backs up this wallet. Switch to a fresh index only if a phrase is ever exposed — old words keep old keys, so sweep funds first.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+            Rectangle {
+                height: 44px;
+                background: Theme.palette-surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: seed-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                clip: true;
+                seed-input := TextInput {
+                    x: 14px;
+                    width: parent.width - 28px;
+                    height: 24px;
+                    y: (parent.height - self.height) / 2;
+                    text <=> Recovery.seed-text;
+                    color: Theme.palette-foreground;
+                    font-family: "SourceCodePro";
+                    font-size: 18px;
+                    single-line: true;
+                    edited => { Recovery.saved-msg = ""; Recovery.context-error = ""; }
+                    accepted => { self.clear-focus(); }
                 }
-                Rectangle {
-                    height: 44px;
-                    horizontal-stretch: 1;
-                    background: Theme.palette-surface;
-                    border-radius: 12px;
-                    border-width: 1px;
-                    border-color: account-input.has-focus ? Theme.palette-primary : Theme.palette-border;
-                    clip: true;
-                    account-input := TextInput {
-                        x: 14px;
-                        width: parent.width - 28px;
-                        height: 24px;
-                        y: (parent.height - self.height) / 2;
-                        text <=> Recovery.account-text;
-                        color: Theme.palette-foreground;
-                        font-family: "SourceCodePro";
-                        font-size: 18px;
-                        single-line: true;
-                        accepted => { self.clear-focus(); }
-                    }
+            }
+
+            // Account — its own row with an explanation.
+            Text {
+                text: "Account";
+                color: Theme.palette-foreground;
+                font-family: "Montserrat";
+                font-size: 15px;
+                font-weight: 600;
+            }
+            Text {
+                text: "A separate wallet under this seed — its own notebooks, coins, and addresses. Keep separate accounts for separate purposes.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+            Rectangle {
+                height: 44px;
+                background: Theme.palette-surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: account-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                clip: true;
+                account-input := TextInput {
+                    x: 14px;
+                    width: parent.width - 28px;
+                    height: 24px;
+                    y: (parent.height - self.height) / 2;
+                    text <=> Recovery.account-text;
+                    color: Theme.palette-foreground;
+                    font-family: "SourceCodePro";
+                    font-size: 18px;
+                    single-line: true;
+                    edited => { Recovery.saved-msg = ""; Recovery.context-error = ""; }
+                    accepted => { self.clear-focus(); }
                 }
-                SecondaryAction {
-                    text: "Switch";
-                    clicked => { Callbacks.set-context(); }
-                }
+            }
+
+            SecondaryAction {
+                width: 100%;
+                text: "Switch";
+                clicked => { Callbacks.set-context(); }
+            }
+            // Inline feedback: validation error (red) or the saved
+            // confirmation (accent) — the Switch stays on this screen.
+            if Recovery.context-error != "": Text {
+                text: Recovery.context-error;
+                color: Theme.palette-danger;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+            if Recovery.context-error == "" && Recovery.saved-msg != "": Text {
+                text: Recovery.saved-msg;
+                color: Theme.palette-primary;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
             }
 
             SecondaryAction {

@@ -549,6 +549,34 @@ fn first_inbox_bundle(fs: &Fs) -> Option<(String, Location, &'static str)> {
     None
 }
 
+/// Every `*.json` bundle in the inboxes (Internal first, then Airlock),
+/// for the import picker. Airlock is mounted to enumerate, then unmounted
+/// — the pick step re-mounts to read the chosen file.
+fn list_inbox_bundles(fs: &Fs) -> Vec<(String, Location, &'static str)> {
+    let mut out = Vec::new();
+    for (loc, label) in [(Location::User, "internal"), (Location::Airlock, "airlock")] {
+        if loc == Location::Airlock && ensure_airlock_mounted(fs).is_err() {
+            continue;
+        }
+        let mut names: Vec<String> = Vec::new();
+        if let Ok(dir) = fs.open_dir(INBOX_DIR, loc) {
+            while let Ok(Some(entry)) = dir.next_entry() {
+                if entry.is_file && entry.name.ends_with(".json") {
+                    names.push(entry.name);
+                }
+            }
+        }
+        if loc == Location::Airlock {
+            unmount_airlock(fs);
+        }
+        names.sort();
+        for name in names {
+            out.push((name, loc, label));
+        }
+    }
+    out
+}
+
 fn sats_line(sats: u64, usd: Option<f64>) -> String {
     match usd {
         Some(price) => format!("{sats} sats (~${:.2})", sats as f64 / 1e8 * price),
@@ -2132,6 +2160,73 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
+    // Import picker: list the bundle files actually present in the inboxes
+    // so the user chooses one, instead of silently auto-picking the first.
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        ui.global::<Callbacks>().on_list_bundles(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let sync = ui.global::<Sync>();
+            let found = list_inbox_bundles(&fs);
+            let rows: Vec<BundleRow> = found
+                .iter()
+                .map(|(name, loc, _)| {
+                    let (loc_name, loc_idx) = if *loc == Location::Airlock {
+                        ("Airlock", 1)
+                    } else {
+                        ("Internal", 0)
+                    };
+                    BundleRow {
+                        name: name.clone().into(),
+                        label: format!("{name}  ·  {loc_name}").into(),
+                        loc: loc_idx,
+                    }
+                })
+                .collect();
+            sync.set_bundles(Rc::new(VecModel::from(rows)).into());
+            sync.set_empty_hint(
+                "No bundle files found. Put a .json bundle in /chain-notes/inbox on Internal (or the Airlock volume), then tap Refresh — or use \"Scan bundle\" to import by QR from the companion.".into(),
+            );
+            sync.set_picking(true);
+            log::info!("cb: list-bundles n={}", found.len());
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let fs = fs.clone();
+        let refresh_home = refresh_home.clone();
+        let apply_bundle = apply_bundle.clone();
+        ui.global::<Callbacks>().on_pick_bundle(move |name, loc_idx| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let loc = if loc_idx == 1 { Location::Airlock } else { Location::User };
+            let result = (|| -> Result<String, String> {
+                if loc == Location::Airlock {
+                    ensure_airlock_mounted(&fs)?;
+                }
+                let json = read_text(&fs, &format!("{INBOX_DIR}/{name}"), loc);
+                if loc == Location::Airlock {
+                    unmount_airlock(&fs);
+                }
+                let loc_label = if loc == Location::Airlock { "airlock" } else { "internal" };
+                apply_bundle(&json?, &format!("file={name} loc={loc_label}"))
+            })();
+            let sync = ui.global::<Sync>();
+            sync.set_picking(false);
+            match result {
+                Ok(msg) => {
+                    sync.set_result(msg.into());
+                    ui.global::<Ui>().set_error("".into());
+                }
+                Err(e) => {
+                    log::warn!("cb: pick-bundle err={e}");
+                    sync.set_result(e.into());
+                }
+            }
+            refresh_home();
+        });
+    }
+
     {
         let ui_weak = ui_weak.clone();
         let refresh_home = refresh_home.clone();
@@ -2603,14 +2698,17 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
 
     // ---- recovery seeds (screen 21 + wallet context) ----
-    {
-        // Reveal the ACTIVE seed's 24 words + SeedQR. Everything is
-        // re-derived on demand and lives only in UI properties until
-        // reveal-close wipes them; nothing is persisted or logged.
+
+    // Derive the ACTIVE seed's 24 words + SeedQR into the Recovery props.
+    // Everything is re-derived on demand and lives only in UI properties
+    // until reveal-close wipes them; nothing is persisted or logged. Shared
+    // by the reveal button AND the Switch action (which refreshes the words
+    // to the new seed while they're shown). Keeps the SeedQR in sync.
+    let reveal_words: Rc<dyn Fn()> = {
         let ui_weak = ui_weak.clone();
         let app_seed = app_seed.clone();
         let seed_idx = seed_idx.clone();
-        ui.global::<Callbacks>().on_reveal_seed(move || {
+        Rc::new(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let recovery = ui.global::<Recovery>();
             let index = *seed_idx.borrow();
@@ -2647,7 +2745,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             recovery.set_show_qr(false);
             recovery.set_title_line(format!("Seed {index} · 24 words").into());
             log::info!("cb: reveal-seed index={index} ok");
-        });
+        })
+    };
+    {
+        let reveal_words = reveal_words.clone();
+        ui.global::<Callbacks>().on_reveal_seed(move || reveal_words());
     }
     {
         let ui_weak = ui_weak.clone();
@@ -2664,9 +2766,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
     {
         // Commit the wallet context (seed index + BIP-86 account) from the
-        // Recovery fields: persist, flush the open notebook, and land on
-        // the notebook list — the context picks which bip86 notebooks are
-        // visible, exactly like the account switcher in the desktop app.
+        // Recovery fields, then STAY on the Recovery screen (Sal 2026-07-12
+        // — Switch used to jump to the list): persist, flush the open
+        // notebook, refresh the list underneath so it's ready when the user
+        // navigates back themselves, re-derive the revealed words/SeedQR for
+        // the new seed, and show an inline saved confirmation.
         let ui_weak = ui_weak.clone();
         let fs = fs.clone();
         let state = state.clone();
@@ -2675,6 +2779,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let bip_account = bip_account.clone();
         let persist_config = persist_config.clone();
         let refresh_notebooks = refresh_notebooks.clone();
+        let reveal_words = reveal_words.clone();
         ui.global::<Callbacks>().on_set_context(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let recovery = ui.global::<Recovery>();
@@ -2685,30 +2790,37 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 parse(recovery.get_seed_text().as_str()),
                 parse(recovery.get_account_text().as_str()),
             ) else {
+                recovery.set_saved_msg("".into());
                 recovery.set_context_error("Seed and account must be 0–9999.".into());
                 return;
             };
             recovery.set_context_error("".into());
             let seed_changed = *seed_idx.borrow() != new_seed;
             let acct_changed = *bip_account.borrow() != new_acct;
-            if !seed_changed && !acct_changed {
-                return;
+            if seed_changed || acct_changed {
+                if active.borrow().is_some() {
+                    save_state(&fs, &state.borrow());
+                    *active.borrow_mut() = None;
+                }
+                *seed_idx.borrow_mut() = new_seed;
+                *bip_account.borrow_mut() = new_acct;
+                persist_config();
+                if seed_changed {
+                    log::info!("cb: set-seed-index {new_seed}");
+                }
+                if acct_changed {
+                    log::info!("cb: set-account {new_acct}");
+                }
+                // Rebuild the (now background) notebook list for the new
+                // context, and refresh the revealed words to the new seed.
+                refresh_notebooks();
+                if !recovery.get_words_col1().is_empty() {
+                    reveal_words();
+                }
             }
-            if active.borrow().is_some() {
-                save_state(&fs, &state.borrow());
-                *active.borrow_mut() = None;
-            }
-            *seed_idx.borrow_mut() = new_seed;
-            *bip_account.borrow_mut() = new_acct;
-            persist_config();
-            if seed_changed {
-                log::info!("cb: set-seed-index {new_seed}");
-            }
-            if acct_changed {
-                log::info!("cb: set-account {new_acct}");
-            }
-            refresh_notebooks();
-            ui.global::<Ui>().set_screen(20);
+            recovery.set_saved_msg(
+                format!("Saved · seed {new_seed} · account {new_acct}").into(),
+            );
         });
     }
 
