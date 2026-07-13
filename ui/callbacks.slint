@@ -123,9 +123,23 @@ export global View {
     in-out property <bool> show-qr: false;
 }
 
+// A bundle file found in an inbox, for the import picker.
+export struct BundleRow {
+    name: string,     // file name
+    label: string,    // "bundle.json · Internal" (Rust-formatted)
+    loc: int,         // 0 = Internal, 1 = Airlock (matches the pick callback)
+}
+
 export global Sync {
     in-out property <string> status: "";
     in-out property <string> result: "";
+    // Import picker: tapping "Import sync bundle" lists what's actually in
+    // the inboxes so the user picks a file (instead of a silent auto-pick).
+    in-out property <bool> picking: false;
+    in-out property <[BundleRow]> bundles;
+    // Shown in the picker when no bundle files were found — tells the user
+    // where to put one.
+    in-out property <string> empty-hint: "";
 }
 
 // Signing an external transaction (PSBT) for a wallet whose coins fund a note
@@ -195,8 +209,11 @@ export global Recovery {
     // Settings fields (numeric, committed by the Switch action).
     in-out property <string> seed-text: "0";
     in-out property <string> account-text: "0";
-    // Validation error shown in the section label ("" = valid).
+    // Validation error shown under the fields ("" = valid).
     in-out property <string> context-error: "";
+    // Success confirmation after a Switch ("Saved · seed N · account M"),
+    // cleared when the user edits a field.
+    in-out property <string> saved-msg: "";
     // Reveal screen content — set on reveal, CLEARED on close.
     in-out property <string> title-line: "";
     in-out property <string> words-col1: "";   // "1. word\n… 12. word"
@@ -246,7 +263,9 @@ export global Callbacks {
     callback refresh-notes();
     callback toggle-sender(string, bool);  // exclude/include a sender key
     callback open-note(string);     // note id (hex)
-    callback import-bundle();
+    callback import-bundle();       // (legacy: auto-pick first inbox bundle)
+    callback list-bundles();        // scan inboxes → Sync.bundles, open picker
+    callback pick-bundle(string, int); // import a chosen file (name, loc 0/1)
     callback scan-bundle();         // system QR scanner → bundle import
     callback export-pending();
     callback sign-psbt();           // system QR scanner → sign our inputs → screen 8

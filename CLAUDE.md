@@ -234,15 +234,21 @@ user creates the first notebook deliberately.
   (all)" summary, live cost line, Continue → confirm dialog → sign) ·
   **21 recovery & accounts** (Settings → "Recovery & accounts…"): the
   wallet-context switcher — `Recovery.seed-text` (rotation seed index)
-  + `Recovery.account-text` (BIP-86 account), both 0–9999, "Switch"
-  commits + lands on the notebook list — and the 24-word reveal
-  (`reveal-seed` derives `keys::derive_seed_entropy` → words + the
-  standard SeedQR digit stream into `Recovery.words-col1/2` + `.qr`;
-  `reveal-close` wipes them; nothing persisted or logged, words never
-  in a `cb:` line). New notebooks derive under the active (seed,
-  account); wallet-level features scope to `visible(seed, account)`
-  (legacy notebooks are context-free — funds never hide). — actions and
-  preferences deliberately split.
+  and `Recovery.account-text` (BIP-86 account), **each in its own labeled
+  row with an explanation** (Sal 2026-07-12 — the shared row was
+  confusing), both 0–9999. **"Switch" STAYS on the screen** (Sal
+  2026-07-12 — it used to jump to the list): it persists the context,
+  rebuilds the now-background notebook list, re-derives the revealed
+  words/SeedQR to the new seed (shared `reveal_words` helper), and shows
+  an inline `Recovery.saved-msg` "Saved · seed N · account M" (cleared on
+  field edit) — the user navigates back themselves. The 24-word reveal
+  (`reveal-seed` → `keys::derive_seed_entropy` → words + the standard
+  SeedQR digit stream into `Recovery.words-col1/2` + `.qr`; `reveal-close`
+  wipes them; nothing persisted or logged, words never in a `cb:` line).
+  New notebooks derive under the active (seed, account); wallet-level
+  features scope to `visible(seed, account)` (legacy notebooks are
+  context-free — funds never hide). — actions and preferences
+  deliberately split.
 - Sweep/consolidate (mirrors the chain-notes-app UX, minus anything
   external-wallet — a Prime holds its own keys, so NO "pay fee from
   another wallet" option exists here by design): sweep is reached from
@@ -293,8 +299,16 @@ user creates the first notebook deliberately.
 - `Location::User` `/.chain-notes/state.json` — notes (plaintext cache),
   UTXO ledger (updated on sign: inputs out, change in — unconfirmed
   chaining), fee tiers/tip/btc_usd from the last bundle, network.
-- Import: first `*.json` (sorted) from `/chain-notes/inbox` on Internal,
-  else Airlock (lazy mount, format-on-failed-mount, unmount after).
+- Import: **a picker** (Sal 2026-07-12 — a silent auto-pick read like
+  magic with no instructions). "Import sync bundle" → `list-bundles`
+  enumerates every `*.json` in `/chain-notes/inbox` on Internal + Airlock
+  (`list_inbox_bundles`; airlock lazy-mounted to enumerate, unmounted
+  after) into `Sync.bundles`, sets `Sync.picking` (the actions hide,
+  "Choose a bundle to import" + tappable `name · Internal|Airlock` rows +
+  Refresh/Cancel show); empty → an `empty-hint` telling the user where to
+  drop a `.json`. `pick-bundle(name, loc)` reads + applies the chosen
+  file (airlock re-mounted for the read). The old `import-bundle`
+  auto-pick callback stays (unused by the UI) so nothing else regresses.
 - Export: signed tx → `/chain-notes/outbox/<txid>.hex` on Internal +
   Airlock. `{"network":"regtest"}` seeded as state.json is enough to switch
   network for tests (serde defaults fill the rest).
@@ -306,11 +320,12 @@ user creates the first notebook deliberately.
 `cb: compose len=<n> private=<b> to=<addr|self> chunks=<c> fee=<f> vsize=<v> gift=<sats> txid=<t> ok | err=<e>` (the UI test derives the applied sat/vB as fee/vsize; `gift` = sats to the recipient output, 0 for self-notes) ·
 `cb: sign-note id=<hex8> txid=<t> fee=<f> vsize=<v> internal=<ok|err> airlock=<ok|err>` ·
 `cb: open-note id=<hex8> status=<s>[ from=<addr>]` ·
-`cb: import-bundle file=<f> loc=<l> notes=<n> new=<k> received=<r> utxos=<m> tip=<h> ok | err=<e>` ·
+`cb: list-bundles n=<n>` (Import picker opened) then
+`cb: import-bundle file=<f> loc=<l> notes=<n> new=<k> received=<r> utxos=<m> tip=<h> ok | err=<e>` (emitted by `apply_bundle`, so `pick-bundle` and the legacy auto-pick share it) ·
 `cb: export-pending n=<n> airlock=<ok|err>` ·
 `cb: set-network <net>` ·
 `cb: set-seed-index <i>` · `cb: set-account <a>` (recovery-seeds wallet
-context; both land on the notebook list) ·
+context; Switch STAYS on screen 21 and shows a saved confirmation) ·
 `cb: reveal-seed index=<i> ok | cancelled` (never carries words — the
 24 words + SeedQR live only in UI props, wiped on close) ·
 `cb: create-notebook account=<key> scheme=bip86 seed=<s> bip-account=<a>
