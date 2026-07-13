@@ -293,6 +293,31 @@ fn derive_identity(
     Identity::from_bip86(seed, meta.seed, network, meta.bip_account, meta.index).ok()
 }
 
+/// The active notebook's leaf key rendered as (raw hex, WIF) for the
+/// Export-keys reveal — a single-address private-key export.
+fn export_leaf_formats(
+    seed: &[u8; 32],
+    seed_index: u32,
+    network: Network,
+    account: u32,
+    index: u32,
+) -> Result<(String, String), notes_core::Error> {
+    Ok((
+        notes_core::export::leaf_hex(seed, seed_index, network, account, index)?.as_str().to_string(),
+        notes_core::export::leaf_wif(seed, seed_index, network, account, index)?.as_str().to_string(),
+    ))
+}
+
+/// The reveal-screen title: master fingerprint · seed index · account.
+/// The fingerprint (BIP-32 xfp, not a secret) identifies which seed/wallet
+/// the exported keys belong to.
+fn export_title(seed: &[u8; 32], seed_index: u32, account: u32) -> String {
+    match notes_core::seeds::seed_fingerprint_hex(seed, seed_index) {
+        Ok(fp) => format!("{fp} · Seed {seed_index} · account {account}"),
+        Err(_) => format!("Seed {seed_index} · account {account}"),
+    }
+}
+
 /// Every ACTIVE notebook with spendable coins, as
 /// (account, output_x, tweaked_seckey, coins) — the inputs to a
 /// wallet-level sweep/consolidate (`build_sweep_tx_multi`). Reads each
@@ -2744,25 +2769,62 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     }
     // ---- export keys (screen 23) ----
     // Reveal the active (seed, account) context's importable formats:
-    // account xpub + tr() descriptor (all its notebooks) and the index-0
-    // leaf as hex + WIF (a single-key import). No private xprv on the
-    // device (the 24 words recover the whole seed). Values live in UI
-    // props only, wiped on close; never logged.
+    // account xpub + tr() descriptor cover the WHOLE account (all
+    // addresses); hex + WIF are one notebook's leaf, picked from the
+    // notebook list. No private xprv on the device (the 24 words recover
+    // the whole seed). Values live in UI props only, wiped on close;
+    // never logged.
     let apply_export: Rc<dyn Fn(i32)> = {
         let ui_weak = ui_weak.clone();
         Rc::new(move |which: i32| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let r = ui.global::<Recovery>();
-            let (label, value) = match which {
-                0 => ("Account xpub · watch-only", r.get_export_xpub()),
-                1 => ("Descriptor (tr) · watch-only", r.get_export_descriptor()),
-                2 => ("Notebook index 0 · hex", r.get_export_hex()),
-                _ => ("Notebook index 0 · WIF", r.get_export_wif()),
+            let nb = r.get_export_nb_name();
+            let (label, value): (String, _) = match which {
+                0 => {
+                    ("Account xpub · all addresses · watch-only".to_string(), r.get_export_xpub())
+                }
+                1 => (
+                    "Descriptor (tr) · all addresses · watch-only".to_string(),
+                    r.get_export_descriptor(),
+                ),
+                2 => (format!("Notebook \"{nb}\" · hex"), r.get_export_hex()),
+                _ => (format!("Notebook \"{nb}\" · WIF"), r.get_export_wif()),
             };
             r.set_export_which(which);
             r.set_export_label(label.into());
             r.set_export_value(value.clone());
             r.set_export_qr(qr_image(value.as_str()));
+        })
+    };
+    // The active account's notebooks as picker rows (index/name/short addr)
+    // plus the default selection (first notebook, else a synthetic index 0).
+    let export_rows: Rc<dyn Fn(u32, u32, &str, Network) -> (Vec<ExportNbRow>, i32, String)> = {
+        let app_seed = app_seed.clone();
+        let notebooks = notebooks.clone();
+        Rc::new(move |si: u32, acct: u32, net_s: &str, network: Network| {
+            let mut rows: Vec<ExportNbRow> = Vec::new();
+            let ixb = notebooks.borrow();
+            for m in ixb.visible(si, acct) {
+                let addr = derive_identity(&app_seed, m, net_s)
+                    .map(|id| id.address(network))
+                    .unwrap_or_default();
+                let short = short_addr(&addr);
+                let name = if m.name.trim().is_empty() { short.clone() } else { m.name.clone() };
+                rows.push(ExportNbRow {
+                    index: m.index as i32,
+                    name: name.into(),
+                    addr: short.into(),
+                });
+            }
+            let (sel, sel_name) = rows
+                .first()
+                .map(|r0| (r0.index, r0.name.to_string()))
+                .unwrap_or((0, "index 0".to_string()));
+            if rows.is_empty() {
+                rows.push(ExportNbRow { index: 0, name: "index 0".into(), addr: "".into() });
+            }
+            (rows, sel, sel_name)
         })
     };
     {
@@ -2772,14 +2834,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let bip_account = bip_account.clone();
         let net = net.clone();
         let apply_export = apply_export.clone();
-        ui.global::<Callbacks>().on_reveal_export(move || {
+        let export_rows = export_rows.clone();
+        ui.global::<Callbacks>().on_reveal_public(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let r = ui.global::<Recovery>();
             let si = *seed_idx.borrow();
             let acct = *bip_account.borrow();
             let Some(seed) = app_seed.as_ref() else {
                 ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
-                log::warn!("cb: reveal-export seed={si} account={acct} err=locked");
+                log::warn!("cb: reveal-public seed={si} account={acct} err=locked");
                 return;
             };
             let network = Network::from_str_opt(&net.borrow()).unwrap_or(Network::Mainnet);
@@ -2788,27 +2851,113 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 r.set_export_descriptor(
                     notes_core::export::account_descriptor(seed, si, network, acct)?.into(),
                 );
-                r.set_export_hex(
-                    notes_core::export::leaf_hex(seed, si, network, acct, 0)?.as_str().into(),
-                );
-                r.set_export_wif(
-                    notes_core::export::leaf_wif(seed, si, network, acct, 0)?.as_str().into(),
-                );
                 Ok(())
             })();
             if let Err(e) = derived {
                 ui.global::<Ui>().set_error(format!("Export failed: {e}").into());
-                log::warn!("cb: reveal-export seed={si} account={acct} err={e}");
+                log::warn!("cb: reveal-public seed={si} account={acct} err={e}");
                 return;
             }
-            r.set_export_title(format!("Seed {si} · account {acct} · index 0").into());
+            r.set_export_seed_view(false);
+            r.set_export_title(export_title(seed, si, acct).into());
             apply_export(0);
-            log::info!("cb: reveal-export seed={si} account={acct} ok");
+            log::info!("cb: reveal-public seed={si} account={acct} ok");
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let app_seed = app_seed.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let net = net.clone();
+        let apply_export = apply_export.clone();
+        let export_rows = export_rows.clone();
+        let reveal_words = reveal_words.clone();
+        ui.global::<Callbacks>().on_reveal_private(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let r = ui.global::<Recovery>();
+            let si = *seed_idx.borrow();
+            let acct = *bip_account.borrow();
+            let Some(seed) = app_seed.as_ref() else {
+                ui.global::<Ui>().set_error("Device locked — seed unavailable.".into());
+                log::warn!("cb: reveal-private seed={si} account={acct} err=locked");
+                return;
+            };
+            let net_s = net.borrow().clone();
+            let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
+            let (rows, sel, sel_name) = export_rows(si, acct, &net_s, network);
+            let derived = (|| -> Result<(), notes_core::Error> {
+                let (hex, wif) = export_leaf_formats(seed, si, network, acct, sel as u32)?;
+                r.set_export_hex(hex.into());
+                r.set_export_wif(wif.into());
+                Ok(())
+            })();
+            if let Err(e) = derived {
+                ui.global::<Ui>().set_error(format!("Export failed: {e}").into());
+                log::warn!("cb: reveal-private seed={si} account={acct} err={e}");
+                return;
+            }
+            r.set_export_notebooks(Rc::new(VecModel::from(rows)).into());
+            r.set_export_nb_index(sel);
+            r.set_export_nb_name(sel_name.into());
+            // The 24 words (whole seed) into words-col1/2 + SeedQR.
+            reveal_words();
+            r.set_export_title(export_title(seed, si, acct).into());
+            r.set_export_seed_view(true); // default to the seed-words view
+            apply_export(2); // pre-load the hex value/QR for a quick pill switch
+            log::info!("cb: reveal-private seed={si} account={acct} ok");
         });
     }
     {
         let apply_export = apply_export.clone();
         ui.global::<Callbacks>().on_export_select(move |which| apply_export(which));
+    }
+    {
+        // Pick which notebook's private key hex/WIF export (hex/WIF only).
+        let ui_weak = ui_weak.clone();
+        let app_seed = app_seed.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let net = net.clone();
+        let notebooks = notebooks.clone();
+        let apply_export = apply_export.clone();
+        ui.global::<Callbacks>().on_export_pick_notebook(move |index| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let r = ui.global::<Recovery>();
+            let si = *seed_idx.borrow();
+            let acct = *bip_account.borrow();
+            let Some(seed) = app_seed.as_ref() else { return };
+            let net_s = net.borrow().clone();
+            let network = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
+            let name = {
+                let ixb = notebooks.borrow();
+                let n = ixb
+                    .visible(si, acct)
+                    .find(|m| m.index as i32 == index)
+                    .map(|m| {
+                        if m.name.trim().is_empty() {
+                            let addr = derive_identity(&app_seed, m, &net_s)
+                                .map(|id| id.address(network))
+                                .unwrap_or_default();
+                            short_addr(&addr)
+                        } else {
+                            m.name.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| format!("index {index}"));
+                n
+            };
+            r.set_export_nb_index(index);
+            r.set_export_nb_name(name.into());
+            if let Ok((hex, wif)) = export_leaf_formats(seed, si, network, acct, index as u32) {
+                r.set_export_hex(hex.into());
+                r.set_export_wif(wif.into());
+            }
+            let which = r.get_export_which();
+            if which >= 2 {
+                apply_export(which);
+            }
+        });
     }
     {
         let ui_weak = ui_weak.clone();
@@ -2824,6 +2973,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             r.set_export_title("".into());
             r.set_export_qr(Image::default());
             r.set_export_which(0);
+            r.set_export_notebooks(Rc::new(VecModel::from(Vec::<ExportNbRow>::new())).into());
+            r.set_export_nb_index(0);
+            r.set_export_nb_name("".into());
+            // Also wipe the seed-words view (shared with reveal-seed props).
+            r.set_export_seed_view(false);
+            r.set_words_col1("".into());
+            r.set_words_col2("".into());
+            r.set_title_line("".into());
+            r.set_qr(Image::default());
+            r.set_show_qr(false);
             log::info!("cb: reveal-export cancelled");
         });
     }
