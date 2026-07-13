@@ -237,8 +237,9 @@ user creates the first notebook deliberately.
   tasks, don't share a screen). **Settings → "Accounts…" → screen 21**:
   the wallet-context switcher only — `Recovery.seed-text` (rotation seed
   index) and `Recovery.account-text` (BIP-86 account), each in its own
-  labeled row with an explanation, both 0–9999. **"Switch" STAYS on the
-  screen** (used to jump to the list): persists the context, rebuilds
+  labeled row with an explanation, both 0–9999. **"Save" STAYS on the
+  screen** (the earlier "Switch" jumped to the list): persists the
+  context, rebuilds
   the background notebook list, and shows an inline `Recovery.saved-msg`
   "Saved · seed N · account M" (cleared on field edit) — the user
   navigates back themselves. Back → Settings. **Settings → "Recovery

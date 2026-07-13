@@ -1353,7 +1353,7 @@ export component AppWindow inherits Window {
                 font-weight: 600;
             }
             Text {
-                text: "The 24-word phrase that backs up this wallet. Switch to a fresh index only if a phrase is ever exposed — old words keep old keys, so sweep funds first.";
+                text: "The 24-word phrase that backs up this wallet. Move to a fresh index only if a phrase is ever exposed — old words keep old keys, so sweep funds first.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
                 font-size: 13px;
@@ -1420,7 +1420,7 @@ export component AppWindow inherits Window {
 
             SecondaryAction {
                 width: 100%;
-                text: "Switch";
+                text: "Save";
                 clicked => { Callbacks.set-context(); }
             }
             // Inline feedback: validation error (red) or the saved
