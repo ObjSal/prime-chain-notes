@@ -20,6 +20,9 @@ pbkdf2 = "0.12"
 ripemd = "0.1"
 chacha20poly1305 = "0.10"
 bech32 = "0.11"
+# Key-export rendering (WIF, xprv/xpub) for the reveal surfaces — base58check,
+# pure Rust (no C), so the device builds it too.
+bs58 = { version = "0.5", default-features = false, features = ["check", "alloc"] }
 getrandom = "0.2"
 # Scanned-bundle payloads: CNB1 || deflate-raw(json). Pure Rust.
 miniz_oxide = "0.8"

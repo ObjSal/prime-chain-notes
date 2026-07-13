@@ -1322,6 +1322,15 @@ export component AppWindow inherits Window {
                     Ui.screen = 22;
                 }
             }
+            SecondaryAction {
+                width: 100%;
+                text: "Export keys…";
+                disabled: !Recovery.seed-available;
+                clicked => {
+                    Callbacks.reveal-export();
+                    Ui.screen = 23;
+                }
+            }
 
             Rectangle { vertical-stretch: 1; }
         }
@@ -1519,6 +1528,108 @@ export component AppWindow inherits Window {
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
                 font-size: 13px;
+                wrap: word-wrap;
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        // ------------------------------------- screen 23: export keys
+        // Reveal the active (seed, account) context's importable formats —
+        // pick one with the pills, read the value + scan its QR into
+        // another wallet. Account xpub/descriptor cover every notebook in
+        // the account; hex/WIF are the index-0 single key. No private xprv
+        // on the device by design (the 24 words recover the whole seed).
+        if Ui.screen == 23: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 16px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 12px;
+
+            ScreenHeader {
+                title: "Export keys";
+                back => {
+                    Callbacks.export-close();
+                    Ui.screen = 6;
+                }
+            }
+
+            Text {
+                text: Recovery.export-title;
+                color: Theme.palette-foreground;
+                font-family: "Montserrat";
+                font-size: 16px;
+                font-weight: 600;
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                PillOption {
+                    label: "xpub";
+                    selected: Recovery.export-which == 0;
+                    horizontal-stretch: 1;
+                    tapped => { Callbacks.export-select(0); }
+                }
+                PillOption {
+                    label: "descr";
+                    selected: Recovery.export-which == 1;
+                    horizontal-stretch: 1;
+                    tapped => { Callbacks.export-select(1); }
+                }
+                PillOption {
+                    label: "hex";
+                    selected: Recovery.export-which == 2;
+                    horizontal-stretch: 1;
+                    tapped => { Callbacks.export-select(2); }
+                }
+                PillOption {
+                    label: "WIF";
+                    selected: Recovery.export-which == 3;
+                    horizontal-stretch: 1;
+                    tapped => { Callbacks.export-select(3); }
+                }
+            }
+
+            Text {
+                text: Recovery.export-label;
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                font-weight: 600;
+            }
+            Rectangle {
+                background: Theme.palette-surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.palette-border;
+                VerticalLayout {
+                    padding: 12px;
+                    Text {
+                        text: Recovery.export-value;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 13px;
+                        wrap: char-wrap;
+                    }
+                }
+            }
+
+            Image {
+                source: Recovery.export-qr;
+                width: 176px;
+                height: 176px;
+                image-rendering: pixelated;
+                x: (parent.width - self.width) / 2;
+            }
+
+            Text {
+                text: "Scan into chain-notes-app or any wallet. hex/WIF are this account's index-0 key — each notebook (receive index) has its own. The 24-word seed backup is in \"Recovery words…\".";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 12px;
                 wrap: word-wrap;
             }
 

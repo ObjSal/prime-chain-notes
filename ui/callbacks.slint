@@ -220,6 +220,21 @@ export global Recovery {
     in-out property <string> words-col2: "";   // "13. word\n… 24. word"
     in-out property <image> qr;
     in-out property <bool> show-qr: false;
+
+    // Export-keys screen (23): the active context's importable formats.
+    // Account-level xpub/descriptor (all this account's notebooks) plus
+    // index-0 hex/WIF (a single-key import). The private xprv is
+    // deliberately NOT exported on the device — the 24 words already
+    // recover the whole seed (PLAN-chain-notes-seed-rotation.md).
+    in-out property <string> export-title: "";   // "Seed N · account M · index 0"
+    in-out property <string> export-xpub: "";
+    in-out property <string> export-descriptor: "";
+    in-out property <string> export-hex: "";
+    in-out property <string> export-wif: "";
+    in-out property <int> export-which: 0;       // 0 xpub · 1 desc · 2 hex · 3 wif
+    in-out property <string> export-label: "";   // the selected format's label
+    in-out property <string> export-value: "";   // the selected format's value
+    in-out property <image> export-qr;
 }
 
 export struct NotebookRow {
@@ -284,4 +299,7 @@ export global Callbacks {
     callback reveal-seed();         // derive the active seed's words → screen 21
     callback reveal-close();        // clear the words + QR, back to settings
     callback set-context();         // commit Recovery.seed-text/account-text
+    callback reveal-export();       // derive the active context's key exports → screen 23
+    callback export-close();        // clear the exports, back to settings
+    callback export-select(int);    // switch shown format (0 xpub · 1 desc · 2 hex · 3 wif)
 }
