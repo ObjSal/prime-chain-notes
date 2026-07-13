@@ -221,7 +221,7 @@ user creates the first notebook deliberately.
   parses the field when tier == 3 (rejects non-finite/≤0/>100k). Rust never
   overwrites the field while tier == 3. (Same collapse-on-Custom UX ships
   in the chain-notes-app peer.)
-- Screens: 0 home · 1 notes · 2 note view · 3 compose · 4 confirm ·
+- Screens (recovery adds 21 switcher + 22 words reveal): 0 home · 1 notes · 2 note view · 3 compose · 4 confirm ·
   5 sync (ACTIONS only: import/export/scan + status) · 6 settings
   (network + chunk picker + Coins / "Sweep funds…" row) · 7 contacts
   (send-to picker) · 8 "Signed" hand-off (external-PSBT result AND the
@@ -241,10 +241,13 @@ user creates the first notebook deliberately.
   rebuilds the now-background notebook list, re-derives the revealed
   words/SeedQR to the new seed (shared `reveal_words` helper), and shows
   an inline `Recovery.saved-msg` "Saved · seed N · account M" (cleared on
-  field edit) — the user navigates back themselves. The 24-word reveal
-  (`reveal-seed` → `keys::derive_seed_entropy` → words + the standard
-  SeedQR digit stream into `Recovery.words-col1/2` + `.qr`; `reveal-close`
-  wipes them; nothing persisted or logged, words never in a `cb:` line).
+  field edit) — the user navigates back themselves. "Show recovery
+  words…" opens **screen 22 (recovery words)**, a DEDICATED reveal (Sal
+  2026-07-12 — the words + QR overflowed screen 21): `reveal-seed` →
+  `keys::derive_seed_entropy` → words (2 cols) + the standard SeedQR
+  digit stream into `Recovery.words-col1/2` + `.qr`, with a words⇄SeedQR
+  toggle; its Back = `reveal-close` (wipes them, back to 21). Nothing
+  persisted or logged, words never in a `cb:` line.
   New notebooks derive under the active (seed, account); wallet-level
   features scope to `visible(seed, account)` (legacy notebooks are
   context-free — funds never hide). — actions and preferences
