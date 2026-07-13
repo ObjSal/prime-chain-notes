@@ -39,6 +39,11 @@ export global Compose {
     // tiers while tier < 3; a manual edit flips tier to 3 (custom) and the
     // field becomes the source of truth.
     in-out property <string> rate-text: "";
+    // Bumped by Rust when the keyboard's Done key (which arrives as a
+    // plain '\n' — the system keyboard has no distinct done signal) is
+    // detected in the note text: the editor watches this and clears its
+    // focus, which hides the keyboard. The newline itself is stripped.
+    in-out property <int> dismiss-nonce: 0;
     // Gift amount (directed notes only): sats the recipient output carries
     // instead of the default dust. Default "330" (= DUST_LIMIT); a value
     // below dust is bumped back up to 330 on the Rust side. The collapsible

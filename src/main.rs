@@ -1571,6 +1571,19 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     return;
                 }
             };
+            // Keyboard Done: the system keyboard's Done key has no distinct
+            // signal — it sends a plain '\n' (gui-app-keyboard maps
+            // KeyAction::Return to Key::Char('\n')). A note is composed as
+            // one paragraph on-device, so ANY newline here means "done
+            // typing": strip it and bump dismiss-nonce, which the editor
+            // watches to drop focus (focus loss hides the keyboard).
+            let raw = compose.get_text();
+            if raw.as_str().contains('\n') {
+                let stripped: String = raw.as_str().replace('\n', "");
+                compose.set_text(stripped.into());
+                compose.set_dismiss_nonce(compose.get_dismiss_nonce() + 1);
+                log::info!("cb: compose keyboard-done");
+            }
             let text = compose.get_text();
             let text_len = text.as_str().len();
             if text_len == 0 {

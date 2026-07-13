@@ -736,6 +736,11 @@ export component AppWindow inherits Window {
                 text <=> Compose.text;
                 placeholder: "Type your note…";
                 changed => { Callbacks.compose-changed(); }
+                // Keyboard Done: the system keyboard's Done key sends a
+                // plain '\n'; Rust strips it and bumps dismiss-nonce —
+                // dropping focus here hides the keyboard (IMR Disable).
+                property <int> dn: Compose.dismiss-nonce;
+                changed dn => { self.clear-focus(); }
             }
 
             // Live cost readout — updates every keystroke.
