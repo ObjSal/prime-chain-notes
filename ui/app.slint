@@ -1196,7 +1196,7 @@ export component AppWindow inherits Window {
             padding-left: 24px;
             padding-right: 24px;
             padding-top: 16px + UISize.control-center-status-bar-height;
-            padding-bottom: 24px;
+            padding-bottom: 0;
             spacing: 14px;
 
             ScreenHeader {
@@ -1204,11 +1204,21 @@ export component AppWindow inherits Window {
                 back => { Ui.screen = 20; }
             }
 
-            SecondaryAction {
-                width: 100%;
-                text: "Network: " + Home.network;
-                clicked => { Callbacks.cycle-network(); }
-            }
+            // Settings has grown (Coins/Sweep, chunk, Accounts, the whole
+            // Dangerous area) — scroll the body, keep the header fixed.
+            Flickable {
+                vertical-stretch: 1;
+                viewport-width: self.width;
+                viewport-height: s6-content.preferred-height;
+                s6-content := VerticalLayout {
+                    spacing: 14px;
+                    padding-bottom: 24px;
+
+                    SecondaryAction {
+                        width: 100%;
+                        text: "Network: " + Home.network;
+                        clicked => { Callbacks.cycle-network(); }
+                    }
 
             // Funds — viewer-first Coins (consolidate lives there) and the
             // sweep flow (destination picked first, compose-like screen).
@@ -1367,7 +1377,8 @@ export component AppWindow inherits Window {
                 wrap: word-wrap;
             }
 
-            Rectangle { vertical-stretch: 1; }
+                }
+            }
         }
 
         // ----------------------------------------- screen 21: accounts
