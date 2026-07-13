@@ -200,6 +200,14 @@ export global Settings {
 // A seed index rotates the whole 24-word phrase (scoped compromise);
 // the account is the BIP-86 wallet context — together they pick which
 // bip86 notebooks are visible (legacy notebooks are context-free).
+// Export-keys notebook picker row (screen 23, hex/WIF only): which
+// receive index's private key to export, labeled by notebook name + addr.
+export struct ExportNbRow {
+    index: int,       // BIP-86 receive index (the hex/WIF selector)
+    name: string,
+    addr: string,     // short address
+}
+
 export global Recovery {
     // True when GetAppSeed returned (set once at boot) — gates the reveal
     // independently of whether a notebook is open (the recovery flow is
@@ -235,6 +243,14 @@ export global Recovery {
     in-out property <string> export-label: "";   // the selected format's label
     in-out property <string> export-value: "";   // the selected format's value
     in-out property <image> export-qr;
+    // Notebook picker (hex/WIF only): the active account's notebooks and
+    // which receive index is selected for the single-key export.
+    in-out property <[ExportNbRow]> export-notebooks;
+    in-out property <int> export-nb-index: 0;
+    in-out property <string> export-nb-name: "";   // selected notebook's name (for the label)
+    // Private-keys screen: the "Seed words" pill shows the 24 words (+
+    // SeedQR) instead of a single-key value box.
+    in-out property <bool> export-seed-view: false;
 }
 
 export struct NotebookRow {
@@ -299,7 +315,9 @@ export global Callbacks {
     callback reveal-seed();         // derive the active seed's words → screen 21
     callback reveal-close();        // clear the words + QR, back to settings
     callback set-context();         // commit Recovery.seed-text/account-text
-    callback reveal-export();       // derive the active context's key exports → screen 23
+    callback reveal-public();       // derive account xpub + descriptor → screen 23
+    callback reveal-private();      // derive recovery words + notebook hex/WIF → screen 24
     callback export-close();        // clear the exports, back to settings
     callback export-select(int);    // switch shown format (0 xpub · 1 desc · 2 hex · 3 wif)
+    callback export-pick-notebook(int);  // hex/WIF: pick which receive index to export
 }
