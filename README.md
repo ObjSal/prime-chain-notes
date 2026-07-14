@@ -54,7 +54,6 @@ foundation sim
 ## Learn more
 
 - [THIRD-PARTY.md](THIRD-PARTY.md) — libraries this app is built on
-- `../PLAN-chain-notes.md` — the design document (workspace repo)
 
 ## Support
 
