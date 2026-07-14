@@ -51,13 +51,9 @@ With the Foundation SDK installed, build and launch in the simulator with:
 foundation sim
 ```
 
-See **[DEVELOPMENT.md](DEVELOPMENT.md)** for environment setup, the protocol, testing (including the full regtest pipeline), and the companion's internals.
-
 ## Learn more
 
-- [DEVELOPMENT.md](DEVELOPMENT.md) — building, protocol internals, testing, companion architecture
 - [THIRD-PARTY.md](THIRD-PARTY.md) — libraries this app is built on
-- [NOTES.md](NOTES.md) — verified results and platform gotchas
 - `../PLAN-chain-notes.md` — the design document (workspace repo)
 
 ## Support

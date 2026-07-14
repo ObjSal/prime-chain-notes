@@ -4,3 +4,8 @@ resources/*
 !resources/icon.svg
 manifest.toml
 companion/tests/screenshots/
+
+# Internal docs kept in the private workspace companion (prime/private/prime-chain-notes)
+CLAUDE.md
+DEVELOPMENT.md
+NOTES.md
