@@ -2,7 +2,7 @@ target/
 ui/ui
 resources/*
 !resources/icon.svg
-manifest.toml
+/manifest.toml
 companion/tests/screenshots/
 
 # Internal docs kept in the private workspace companion (prime/private/prime-chain-notes)
