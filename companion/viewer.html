@@ -84,6 +84,11 @@
 "use strict";
 
 let serverMode = false;
+// Optional &mine=<addr1,addr2,...> (comma-separated) extends OWN detection
+// to additional funding-source addresses via chain-scan.js's myAddresses
+// param — the notebook owner's link to disclose, default omits it (no
+// disclosure; PLAN-chain-notes-funding-unification.md open question 1).
+let mineAddresses = [];
 
 const $ = (id) => document.getElementById(id);
 const net = () => $("network").value;
@@ -114,6 +119,7 @@ function log(el, msg, cls) {
   const q = new URLSearchParams(location.search);
   const netParam = q.get("network");
   const addr = (q.get("address") || "").trim();
+  mineAddresses = (q.get("mine") || "").split(",").map((a) => a.trim()).filter(Boolean);
   if (netParam && API[netParam]) {
     if (document.querySelector(`#network option[value="${netParam}"]`)) {
       $("network").value = netParam;
@@ -144,7 +150,7 @@ async function loadNotes() {
   try {
     log(logEl, `Scanning ${address} on ${net()}…`);
     const scan = await scanAddress(API[net()].base, address,
-      (n) => log(logEl, `  …paged ${n} more confirmed txs`));
+      (n) => log(logEl, `  …paged ${n} more confirmed txs`), mineAddresses);
 
     render(scan.notes, address);
     const bits = [`${scan.notes.length} note(s)`, `${scan.noteTxs} note tx(s)`];
@@ -178,9 +184,11 @@ function render(notes, address) {
     return;
   }
   const explorer = API[net()].explorer;
+  const mineQuery = mineAddresses.length
+    ? `&mine=${encodeURIComponent(mineAddresses.join(","))}` : "";
   for (const n of notes) {
     const href = `note.html?address=${encodeURIComponent(address)}` +
-                 `&network=${net()}&note=${n.noteId}`;
+                 `&network=${net()}&note=${n.noteId}${mineQuery}`;
     box.appendChild(buildNoteCard(n, explorer, href));
   }
 }

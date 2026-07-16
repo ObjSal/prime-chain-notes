@@ -87,6 +87,11 @@ function log(el, msg, cls) {
   const network = q.get("network");
   const address = (q.get("address") || "").trim();
   const noteId = (q.get("note") || "").trim().toLowerCase();
+  // Optional &mine=<addr1,addr2,...> (comma-separated) extends OWN detection
+  // to additional funding-source addresses via chain-scan.js's myAddresses
+  // param — the notebook owner's link to disclose, default omits it (no
+  // disclosure; PLAN-chain-notes-funding-unification.md open question 1).
+  const mineAddresses = (q.get("mine") || "").split(",").map((a) => a.trim()).filter(Boolean);
   if (!network || !API[network] || !address || !/^[0-9a-f]{8}$/.test(noteId)) {
     return log(logEl, "Need ?address=…&network=…&note=<8-hex note id> — open a " +
       "note from the viewer to get a link.", "err");
@@ -97,12 +102,14 @@ function log(el, msg, cls) {
 
   $("noteId").textContent = noteId;
   $("addrLine").textContent = `${address} · ${network}`;
-  $("allLink").href = `viewer.html?address=${encodeURIComponent(address)}&network=${network}`;
+  const mineQuery = mineAddresses.length
+    ? `&mine=${encodeURIComponent(mineAddresses.join(","))}` : "";
+  $("allLink").href = `viewer.html?address=${encodeURIComponent(address)}&network=${network}${mineQuery}`;
 
   try {
     log(logEl, `Scanning ${address} on ${network}…`);
     const scan = await scanAddress(API[network].base, address,
-      (n) => log(logEl, `  …paged ${n} more confirmed txs`));
+      (n) => log(logEl, `  …paged ${n} more confirmed txs`), mineAddresses);
     // Own and received notes may share a note_id (separate buckets by
     // design) — render every match.
     const matches = scan.notes.filter((n) => n.noteId === noteId);

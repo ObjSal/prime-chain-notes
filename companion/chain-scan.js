@@ -93,15 +93,21 @@ function reassemble(chunks) {
   return { body };
 }
 
-// Port of notes-core extract_notes (bundle.rs). Acceptance: a tx that
-// SPENDS FROM the address carries OWN notes (spoof resistance — anyone can
-// send OP_RETURNs *to* an address, so those never count as yours); a tx
-// that only PAYS the address and carries PNTE is a RECEIVED note,
-// attributed to its (unforgeable) taproot input address. Chunks bucket by
-// (note_id, origin) so a pays-me tx reusing one of your note_ids can never
-// contaminate your own note.
+// Port of notes-core extract_notes/extract_notes_multi (bundle.rs).
+// Acceptance: a tx that SPENDS FROM the notebook address, OR from any
+// address in the optional `myAddresses` set (funding-unification PLAN,
+// "Attribution & scanner changes" — e.g. a separate spending wallet),
+// carries OWN notes (spoof resistance — anyone can send OP_RETURNs *to* an
+// address, so those never count as yours); a tx that only PAYS the address
+// and carries PNTE is a RECEIVED note, attributed to its (unforgeable)
+// taproot input address. Chunks bucket by (note_id, origin) so a pays-me tx
+// reusing one of your note_ids can never contaminate your own note.
+// `myAddresses` defaults to just [address], so every existing caller's
+// behavior is byte-identical — this is a pure extension, never a narrowing,
+// mirroring the Rust self-spk-SET rule exactly (OR, not replace).
 // Returns { notes (newest-first), noteTxs, receivedTxs, txsScanned, foreign, nonPnte }.
-async function scanAddress(base, address, onPage) {
+async function scanAddress(base, address, onPage, myAddresses) {
+  const mine = new Set([address, ...(myAddresses || [])]);
   const txs = await fullHistory(base, address, onPage);
 
   const byId = new Map();
@@ -113,7 +119,7 @@ async function scanAddress(base, address, onPage) {
       .filter(Boolean);
     if (!payloads.length) continue;
     const spendsFromSelf = t.vin.some(
-      (i) => i.prevout && i.prevout.scriptpubkey_address === address
+      (i) => i.prevout && mine.has(i.prevout.scriptpubkey_address)
     );
     const paysSelf = t.vout.some((o) => o.scriptpubkey_address === address);
     let originKey, from = null, to = null;

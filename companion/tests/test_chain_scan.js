@@ -5,6 +5,9 @@
 // acceptance rules — own notes need spends-from-self (spoof resistance),
 // pays-me PNTE txs surface as RECEIVED notes attributed to their taproot
 // input, and own/received buckets never merge even on a note_id collision.
+// Also covers the funding-unification myAddresses extension (mirrors
+// notes-core's extract_notes_multi self-spk-SET rule): additive-only, old
+// 2-arg callers byte-identical, an unrelated address never falsely OWNs.
 //
 // No network, no browser: chain-scan.js runs in a vm context against a
 // fetch stub serving synthetic esplora JSON.  Run: node tests/test_chain_scan.js
@@ -18,6 +21,7 @@ const src = fs.readFileSync(path.join(__dirname, "..", "chain-scan.js"), "utf8")
 const ADDR = "bcrt1ptestaddress";           // the scanned address (taproot-ish prefix)
 const PEER = "bcrt1ppeeraddress";           // a taproot counterparty
 const V0 = "bcrt1qsomeoneelse";             // a non-taproot address
+const FUNDER = "bcrt1qfunderfunderfunder";  // a P2WPKH funding-wallet address (not taproot)
 const FLAG_PRIVATE = 0x01;
 const FLAG_DIRECTED = 0x02;
 
@@ -89,6 +93,16 @@ const HISTORIES = {
   sent: [
     tx("tx_sent", [chunkSpk("beefbeef", 0, 1, FLAG_DIRECTED, "dear peer")], 301,
        { voutAddrs: [PEER, ADDR] }),
+  ],
+  // funding-unification: a self-note funded by an external (non-taproot)
+  // wallet — spends from FUNDER, dust-pays ADDR. Without myAddresses this
+  // is indistinguishable from a stranger's pays-me note (today's behavior,
+  // and no taproot input means no `from` attribution either); passing
+  // myAddresses=[FUNDER] must classify it OWN — the self-spk-SET rule
+  // mirrored from notes-core's extract_notes_multi.
+  funded: [
+    tx("tx_funded", [chunkSpk("f0f1f2f3", 0, 1, 0, "funded by external wallet")], 401,
+       { vinAddr: FUNDER, voutAddrs: [ADDR] }),
   ],
 };
 
@@ -169,6 +183,35 @@ vm.runInContext(`
          && s.text === "dear peer",
          "sent: own directed note carries to=PEER: " + JSON.stringify(s));
   console.log("PASS own directed note carries its recipient");
+
+  // funding-unification: myAddresses is additive-only. Old callers passing
+  // no 4th arg (every scanAddress() call above) must be byte-identical to
+  // pre-change behavior — the funded-by-FUNDER tx stays RECEIVED (from
+  // unattributable: no taproot input) exactly like an old bundle/caller
+  // that never heard of myAddresses.
+  const fundedDefault = await scanAddress("stub:funded", ${JSON.stringify(ADDR)});
+  const fd = fundedDefault.notes[0];
+  assert(fd.received && fd.from === null && fd.text === "funded by external wallet",
+         "funded (no myAddresses): must render as received, unattributed: " + JSON.stringify(fd));
+  console.log("PASS funded note without myAddresses renders as received (old behavior, unchanged)");
+
+  // Passing myAddresses=[FUNDER] (e.g. viewer.html's optional &mine=)
+  // extends OWN detection to that address — an OR, never a narrowing.
+  const fundedOwn = await scanAddress("stub:funded", ${JSON.stringify(ADDR)}, undefined,
+                                       [${JSON.stringify(FUNDER)}]);
+  const fo = fundedOwn.notes[0];
+  assert(!fo.received && fo.text === "funded by external wallet",
+         "funded (myAddresses=[FUNDER]): must classify OWN: " + JSON.stringify(fo));
+  console.log("PASS funded note WITH myAddresses=[FUNDER] classifies OWN (self-spk-SET rule)");
+
+  // A myAddresses entry that never appears as an input prevout changes
+  // nothing (still an OR against the real inputs, not a wildcard).
+  const fundedUnrelated = await scanAddress("stub:funded", ${JSON.stringify(ADDR)}, undefined,
+                                             [${JSON.stringify(PEER)}]);
+  assert(fundedUnrelated.notes[0].received,
+         "funded (myAddresses=[unrelated PEER]): must stay received: " +
+         JSON.stringify(fundedUnrelated.notes[0]));
+  console.log("PASS unrelated myAddresses entry does not falsely mark a note OWN");
 
   console.log("CHAIN-SCAN UNIT TESTS PASSED");
 })().catch((e) => { console.error("FAIL " + e.message); process.exit(1); });

@@ -278,6 +278,16 @@ $("buildBtn").addEventListener("click", async () => {
           if (a && /^(bc|tb|bcrt)1p/.test(a) && a !== address && !authorCandidates.includes(a))
             authorCandidates.push(a);
         }
+        // Raw prevout scriptPubKey hex of every input (real esplora carries
+        // prevout.scriptpubkey; the regtest server.py shim only carries
+        // prevout.scriptpubkey_address — omit an input's entry rather than
+        // fabricate its script, matching notes-core's additive
+        // input_prevout_spks field, which falls back to spends_from_self
+        // when empty). Enables the device's self-spk-SET ownership rule
+        // (PLAN-chain-notes-funding-unification.md).
+        const inputPrevoutSpks = t.vin
+          .map((i) => i.prevout && i.prevout.scriptpubkey)
+          .filter(Boolean);
         return {
           txid: t.txid,
           height: t.status.confirmed ? t.status.block_height : null,
@@ -287,6 +297,7 @@ $("buildBtn").addEventListener("click", async () => {
           sender,
           author_candidates: authorCandidates,
           recipient,
+          input_prevout_spks: inputPrevoutSpks,
           payloads,
         };
       })
