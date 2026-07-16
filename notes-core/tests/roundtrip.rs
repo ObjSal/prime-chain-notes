@@ -1207,3 +1207,50 @@ fn self_spk_set_own_received_buckets_stay_separate() {
     let recv = notes.iter().find(|n| n.received).unwrap();
     assert_eq!(recv.text.as_deref(), Some("gotcha via wpkh?"));
 }
+
+/// (d) Regression: the set rule EXTENDS `spends_from_self`, never replaces
+/// it. A new-style bundle (populated `input_prevout_spks`) whose tx DOES
+/// spend from the notebook must stay OWN for callers that pass no set
+/// (`extract_notes_watch`'s empty set) or a non-matching set — i.e. the
+/// producer's bool always still counts.
+#[test]
+fn self_spk_set_extends_spends_from_self_never_replaces() {
+    let id = identity();
+    let note =
+        compose_note(&id, &utxos(), "plain self note", false, [5, 5, 6, 6], 80, 1.0, || Ok(AUX))
+            .unwrap();
+    let onchain = OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(400),
+        blocktime: Some(1_700_000_400),
+        spends_from_self: true, // the producer's verdict: spends from the notebook
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: true,
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        // New-style bundle: raw prevout spks present (the notebook's P2TR).
+        input_prevout_spks: vec![hex::encode(notes_core::address::p2tr_script_pubkey(
+            &id.output_x,
+        ))],
+    };
+    let bundle =
+        SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
+
+    // Watch scan (empty self-spk set) on the NEW bundle format.
+    let watch = extract_notes_watch(&bundle, NET);
+    assert_eq!(watch.len(), 1);
+    assert!(!watch[0].received, "watch scan must keep OWN detection on new-style bundles");
+
+    // A caller whose set doesn't include the notebook spk (e.g. only a
+    // spending-wallet spk): spends_from_self still wins via the OR.
+    let notes = extract_notes_multi(&bundle, &id, NET, &[wpkh_spk(0x01)]);
+    assert_eq!(notes.len(), 1);
+    assert!(!notes[0].received, "spends_from_self must always still count");
+}

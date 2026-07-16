@@ -248,8 +248,10 @@ pub fn extract_notes(
 /// "Attribution & scanner changes"): the notebook spk alone today, plus the
 /// spending wallet's P2WPKH spks once that ships. `extract_notes` delegates
 /// here with a singleton `[notebook spk]`, so behavior is identical to
-/// before for every existing caller. Falls back to `spends_from_self` per
-/// tx when a bundle doesn't populate `input_prevout_spks` (legacy bundles).
+/// before for every existing caller. The set rule ORs with the producer's
+/// `spends_from_self` bool, so it extends the old rule and never narrows
+/// it (legacy bundles with an empty `input_prevout_spks` behave exactly
+/// as before).
 pub fn extract_notes_multi(
     bundle: &SyncBundle,
     identity: &Identity,
@@ -271,8 +273,9 @@ pub fn extract_notes_watch(bundle: &SyncBundle, network: Network) -> Vec<Recover
 /// [`extract_notes_watch`] generalized to a self-spk SET — see
 /// [`extract_notes_multi`]. Watch mode has no identity key, so (unlike
 /// `extract_notes`) the caller supplies whatever spks it is observing (an
-/// empty set falls back entirely to `spends_from_self`, matching today's
-/// watch-only behavior byte-for-byte).
+/// empty set adds nothing, leaving `spends_from_self` to decide alone —
+/// today's watch-only behavior, even on bundles that populate
+/// `input_prevout_spks`).
 pub fn extract_notes_watch_multi(
     bundle: &SyncBundle,
     network: Network,
@@ -306,20 +309,19 @@ fn extract_notes_inner(
     let mut by_id: Vec<([u8; 4], Pending)> = Vec::new();
 
     for tx in &bundle.notes_onchain {
-        // Self-spk-SET ownership rule: any input prevout spk in
-        // `self_spks` → OWN. Bundles that don't carry raw prevout spks
-        // (`input_prevout_spks` empty — every bundle before this change)
-        // fall back to the precomputed `spends_from_self` bool, so this is
-        // a pure extension, never a narrowing, of the old rule.
-        let is_own = if tx.input_prevout_spks.is_empty() {
-            tx.spends_from_self
-        } else {
-            tx.input_prevout_spks.iter().any(|spk_hex| {
+        // Self-spk-SET ownership rule: the producer's `spends_from_self`
+        // bool (spends from the notebook address) OR any input prevout spk
+        // in `self_spks`. An OR, deliberately — a pure extension, never a
+        // narrowing, of the old rule: a caller passing an empty set (e.g.
+        // `extract_notes_watch`) keeps full OWN detection even on bundles
+        // that populate `input_prevout_spks`, and spoof resistance is
+        // unchanged (a stranger's tx matches neither side).
+        let is_own = tx.spends_from_self
+            || tx.input_prevout_spks.iter().any(|spk_hex| {
                 hex::decode(spk_hex)
                     .map(|spk| self_spks.iter().any(|s| *s == spk))
                     .unwrap_or(false)
-            })
-        };
+            });
         let origin = if is_own {
             Origin::Own
         } else if tx.pays_self {
