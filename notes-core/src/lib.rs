@@ -23,6 +23,7 @@ pub mod sighash;
 pub mod sign;
 pub mod taproot;
 pub mod tx;
+pub mod wpkh;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -38,6 +39,8 @@ pub enum Error {
     RecipientNotTaproot,
     Psbt(&'static str),
     Derivation(&'static str),
+    /// P2WPKH (BIP143) signing failures — `wpkh.rs`.
+    Signing(&'static str),
 }
 
 impl core::fmt::Display for Error {
@@ -57,6 +60,7 @@ impl core::fmt::Display for Error {
             }
             Error::Psbt(m) => write!(f, "psbt: {m}"),
             Error::Derivation(m) => write!(f, "derivation: {m}"),
+            Error::Signing(m) => write!(f, "signing: {m}"),
         }
     }
 }

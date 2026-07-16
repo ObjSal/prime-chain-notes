@@ -52,6 +52,23 @@ pub fn p2tr_x_of_address(network: Network, address: &str) -> Option<[u8; 32]> {
     address_to_script_pubkey(network, address).ok().and_then(|spk| p2tr_x_of_spk(&spk))
 }
 
+/// scriptPubKey for a P2WPKH output: OP_0 PUSH20 <HASH160(pubkey)>
+/// (BIP141/BIP84) — the spending wallet's branch (funding-unification
+/// PLAN), unlike the notebook's witness-v1 P2TR above.
+pub fn p2wpkh_script_pubkey(pubkey_hash: &[u8; 20]) -> Vec<u8> {
+    let mut spk = Vec::with_capacity(22);
+    spk.push(0x00);
+    spk.push(0x14);
+    spk.extend_from_slice(pubkey_hash);
+    spk
+}
+
+/// P2WPKH address (witness v0 — bech32, NOT bech32m) for a pubkey hash: the
+/// BIP-84 spending wallet's bc1q…/tb1q… receive/change addresses.
+pub fn p2wpkh_address(network: Network, pubkey_hash: &[u8; 20]) -> String {
+    segwit::encode_v0(network.hrp(), pubkey_hash).expect("20-byte program is always valid")
+}
+
 /// A validated directed-note recipient: any segwit address decodes; only
 /// P2TR recipients have an x-only key to encrypt to.
 pub struct Recipient {

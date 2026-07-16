@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::address::{p2tr_x_of_address, taproot_address, Recipient};
+use crate::address::{p2tr_script_pubkey, p2tr_x_of_address, taproot_address, Recipient};
 use crate::crypt;
 use crate::dm;
 use crate::envelope::{self, Chunk, FLAG_DIRECTED, FLAG_PRIVATE};
@@ -125,6 +125,13 @@ pub struct OnchainTx {
     /// own directed note (lets the sender re-derive the DM key after a wipe).
     #[serde(default)]
     pub recipient: Option<String>,
+    /// Raw scriptPubKeys (hex) of every input's prevout — enables the
+    /// self-spk-SET ownership rule (`extract_notes_multi`/`_watch_multi`,
+    /// PLAN-chain-notes-funding-unification.md). Empty (the serde default)
+    /// falls back to `spends_from_self` for bundles that don't populate it
+    /// — old callers and old bundles are unaffected.
+    #[serde(default)]
+    pub input_prevout_spks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,7 +239,24 @@ pub fn extract_notes(
     identity: &Identity,
     network: Network,
 ) -> Vec<RecoveredNote> {
-    extract_notes_inner(bundle, Some(identity), network)
+    let self_spk = p2tr_script_pubkey(&identity.output_x);
+    extract_notes_multi(bundle, identity, network, &[self_spk])
+}
+
+/// [`extract_notes`] generalized to a SET of "my" scriptPubKeys — OWN iff a
+/// tx's input prevout spk is in `self_spks` (funding-unification PLAN,
+/// "Attribution & scanner changes"): the notebook spk alone today, plus the
+/// spending wallet's P2WPKH spks once that ships. `extract_notes` delegates
+/// here with a singleton `[notebook spk]`, so behavior is identical to
+/// before for every existing caller. Falls back to `spends_from_self` per
+/// tx when a bundle doesn't populate `input_prevout_spks` (legacy bundles).
+pub fn extract_notes_multi(
+    bundle: &SyncBundle,
+    identity: &Identity,
+    network: Network,
+    self_spks: &[Vec<u8>],
+) -> Vec<RecoveredNote> {
+    extract_notes_inner(bundle, Some(identity), network, self_spks)
 }
 
 /// Watch-only [`extract_notes`]: everything a public observer of the address
@@ -241,13 +265,27 @@ pub fn extract_notes(
 /// including own self-notes, and received directed-private notes keep their
 /// display-default sender (no candidate-key authentication is possible).
 pub fn extract_notes_watch(bundle: &SyncBundle, network: Network) -> Vec<RecoveredNote> {
-    extract_notes_inner(bundle, None, network)
+    extract_notes_watch_multi(bundle, network, &[])
+}
+
+/// [`extract_notes_watch`] generalized to a self-spk SET — see
+/// [`extract_notes_multi`]. Watch mode has no identity key, so (unlike
+/// `extract_notes`) the caller supplies whatever spks it is observing (an
+/// empty set falls back entirely to `spends_from_self`, matching today's
+/// watch-only behavior byte-for-byte).
+pub fn extract_notes_watch_multi(
+    bundle: &SyncBundle,
+    network: Network,
+    self_spks: &[Vec<u8>],
+) -> Vec<RecoveredNote> {
+    extract_notes_inner(bundle, None, network, self_spks)
 }
 
 fn extract_notes_inner(
     bundle: &SyncBundle,
     keys: Option<&Identity>,
     network: Network,
+    self_spks: &[Vec<u8>],
 ) -> Vec<RecoveredNote> {
     #[derive(PartialEq, Eq, Clone)]
     enum Origin {
@@ -268,7 +306,21 @@ fn extract_notes_inner(
     let mut by_id: Vec<([u8; 4], Pending)> = Vec::new();
 
     for tx in &bundle.notes_onchain {
-        let origin = if tx.spends_from_self {
+        // Self-spk-SET ownership rule: any input prevout spk in
+        // `self_spks` → OWN. Bundles that don't carry raw prevout spks
+        // (`input_prevout_spks` empty — every bundle before this change)
+        // fall back to the precomputed `spends_from_self` bool, so this is
+        // a pure extension, never a narrowing, of the old rule.
+        let is_own = if tx.input_prevout_spks.is_empty() {
+            tx.spends_from_self
+        } else {
+            tx.input_prevout_spks.iter().any(|spk_hex| {
+                hex::decode(spk_hex)
+                    .map(|spk| self_spks.iter().any(|s| *s == spk))
+                    .unwrap_or(false)
+            })
+        };
+        let origin = if is_own {
             Origin::Own
         } else if tx.pays_self {
             Origin::Received(tx.sender.clone())

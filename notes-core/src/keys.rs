@@ -11,6 +11,7 @@ use elliptic_curve::PrimeField;
 use hkdf::Hkdf;
 use k256::elliptic_curve;
 use k256::{ProjectivePoint, Scalar};
+use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
 
 use crate::Error;
@@ -52,6 +53,15 @@ pub fn xonly_pubkey(privkey: &[u8; 32]) -> Result<([u8; 32], bool), Error> {
 pub(crate) fn double_sha256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&Sha256::digest(Sha256::digest(data)));
+    out
+}
+
+/// HASH160 (RIPEMD160(SHA256(data))) — the P2WPKH/P2PKH pubkey-hash step
+/// (mirrors `bip32::Xprv::fingerprint`, which computes the same digest over
+/// a compressed pubkey and truncates to 4 bytes; this keeps all 20).
+pub fn hash160(data: &[u8]) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&Ripemd160::digest(Sha256::digest(data)));
     out
 }
 
