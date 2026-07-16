@@ -1254,3 +1254,66 @@ fn self_spk_set_extends_spends_from_self_never_replaces() {
     assert_eq!(notes.len(), 1);
     assert!(!notes[0].received, "spends_from_self must always still count");
 }
+
+/// (e) An OWN funded directed-private note recovers its text + recipient:
+/// the tx spends the SPENDING wallet (spends_from_self=false, ownership
+/// via the spk set), and the sender re-derives the DM key from the
+/// bundle's `recipient` field — which must therefore be populated by the
+/// producer regardless of the old spends-from-self test. Conversely a
+/// funded SELF-note's `recipient` field (which a producer computing
+/// "first non-self output" would fill with the change address) must NOT
+/// surface — only directed notes have recipients.
+#[test]
+fn funded_directed_private_own_note_recovers_text_and_recipient() {
+    let a = identity();
+    let b = identity_b();
+    let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let funding_spk = wpkh_spk(0x77);
+
+    let sent = compose_directed_note(
+        &a, &utxos(), "funded, for bob", true, [8, 0, 0, 8], &to_b, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+    let self_note =
+        compose_note(&a, &utxos(), "funded self", false, [9, 0, 0, 9], 80, 1.0, || Ok(AUX))
+            .unwrap();
+
+    let mk = |note: &notes_core::tx::NoteTx, recipient: Option<String>, h: u64| OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(h),
+        blocktime: Some(1_700_000_000 + h),
+        spends_from_self: false, // funded: inputs are the spending wallet's
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: true, // dust-to-self keeps it discoverable
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient,
+        input_prevout_spks: vec![hex::encode(&funding_spk)],
+    };
+    let bundle = SyncBundle {
+        network: "regtest".into(),
+        notes_onchain: vec![
+            mk(&sent, Some(b.address(NET)), 500),
+            // Producer naively fills "first non-self output" = the bc1q
+            // change address; the directed gate must drop it.
+            mk(&self_note, Some("bcrt1qchangechangechange".into()), 501),
+        ],
+        ..Default::default()
+    };
+
+    let notes = extract_notes_multi(&bundle, &a, NET, &[funding_spk]);
+    assert_eq!(notes.len(), 2);
+    let sent_n = notes.iter().find(|n| n.note_id == [8, 0, 0, 8]).unwrap();
+    assert!(!sent_n.received, "funded directed note is OWN via the spk set");
+    assert_eq!(sent_n.recipient.as_deref(), Some(b.address(NET).as_str()));
+    assert_eq!(sent_n.text.as_deref(), Some("funded, for bob"), "sender re-reads own sent note");
+    let self_n = notes.iter().find(|n| n.note_id == [9, 0, 0, 9]).unwrap();
+    assert!(!self_n.received);
+    assert_eq!(self_n.recipient, None, "self-note must not surface the change address");
+}

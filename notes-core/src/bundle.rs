@@ -393,7 +393,11 @@ fn extract_notes_inner(
             Origin::Received(s) => s.clone(),
             Origin::Own => None,
         };
-        let mut recipient = if received { None } else { pending.recipient.clone() };
+        // Only a DIRECTED note has a recipient (the envelope flag knows;
+        // the bundle field is just "first non-self output", which for a
+        // funded or custom-change SELF-note would be the change address).
+        let mut recipient =
+            if received || !directed { None } else { pending.recipient.clone() };
 
         let plaintext = if !private {
             Some(body)
