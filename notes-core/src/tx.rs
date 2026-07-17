@@ -328,6 +328,63 @@ pub fn build_sweep_tx_multi(
     })
 }
 
+/// Sweep analog of [`build_note_tx_mixed_exact`]: spend EXACTLY the given
+/// mixed-source inputs (coin control — notebook taproot coins and
+/// spending-wallet P2WPKH coins riding in the SAME tx, e.g. sweeping every
+/// active notebook plus the spending wallet in one go) into a SINGLE
+/// output at `dest_spk`, everything minus fee. Like `build_sweep_tx_multi`,
+/// there is no OP_RETURN, no dust-to-self, and no change — a sweep sends
+/// 100% of input value to `dest_spk` by definition. Sized via
+/// `estimate_vsize_mixed` with an empty payload list and one extra output
+/// (the destination), and signed in one pass via
+/// [`crate::wpkh::sign_mixed_inputs`], exactly like
+/// `build_note_tx_mixed_exact` signs its mixed inputs.
+pub fn build_sweep_tx_mixed(
+    inputs: &[MixedInput],
+    dest_spk: Vec<u8>,
+    fee_rate: f64,
+    mut aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    if inputs.is_empty() {
+        return Err(Error::InsufficientFunds);
+    }
+    let kinds: Vec<InputKind> = inputs.iter().map(|i| i.kind).collect();
+    let in_value: u64 = inputs.iter().map(|i| i.utxo.value).sum();
+    let vsize = estimate_vsize_mixed(&kinds, &[], &[dest_spk.len()]);
+    let fee = (vsize as f64 * fee_rate).ceil() as u64;
+    if in_value <= fee || in_value - fee < DUST_LIMIT {
+        return Err(Error::InsufficientFunds);
+    }
+
+    let mut tx = Transaction {
+        version: 2,
+        lock_time: 0,
+        inputs: inputs.iter().map(|i| i.utxo.clone()).collect(),
+        outputs: vec![TxOut { value: in_value - fee, script_pubkey: dest_spk }],
+        witnesses: Vec::new(),
+    };
+    let prevout_spks: Vec<Vec<u8>> = inputs.iter().map(|i| i.prevout_spk.clone()).collect();
+    let keys: Vec<crate::wpkh::InputKey> = inputs
+        .iter()
+        .map(|i| match i.kind {
+            InputKind::Taproot => crate::wpkh::InputKey::Taproot { tweaked_seckey: &i.seckey },
+            InputKind::P2wpkh => crate::wpkh::InputKey::P2wpkh { seckey: &i.seckey },
+        })
+        .collect();
+    crate::wpkh::sign_mixed_inputs(&mut tx, &prevout_spks, &keys, &mut aux)?;
+
+    Ok(NoteTx {
+        fee,
+        change: 0,
+        sent: 0,
+        vsize: tx.vsize(),
+        txid_hex: tx.txid_hex(),
+        raw_hex: hex::encode(tx.serialize_segwit()),
+        spent_outpoints: tx.inputs.iter().map(|i| (i.txid, i.vout)).collect(),
+        tx,
+    })
+}
+
 /// Build and sign a note tx: OP_RETURN outputs for `payloads`, then — for
 /// directed notes — a DUST_LIMIT output to `recipient_spk`, then change
 /// back to `output_x` (our own tweaked key). Inputs selected largest-first

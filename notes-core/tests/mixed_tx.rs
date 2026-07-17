@@ -7,8 +7,8 @@
 use notes_core::address::{p2tr_script_pubkey, p2wpkh_script_pubkey};
 use notes_core::keys::hash160;
 use notes_core::tx::{
-    build_note_tx_exact, build_note_tx_mixed_exact, estimate_vsize, estimate_vsize_mixed,
-    InputKind, MixedInput, Utxo,
+    build_note_tx_exact, build_note_tx_mixed_exact, build_sweep_tx_mixed, estimate_vsize,
+    estimate_vsize_mixed, InputKind, MixedInput, Utxo,
 };
 use notes_core::DUST_LIMIT;
 
@@ -269,6 +269,218 @@ fn mixed_exact_insufficient_funds_errors() {
         || Ok(AUX),
     )
     .unwrap_err();
+    assert!(matches!(err, notes_core::Error::InsufficientFunds));
+}
+
+/// `build_sweep_tx_mixed`: the sweep analog of `build_note_tx_mixed_exact`,
+/// mixing ONE taproot (notebook) input and ONE P2WPKH (spending-wallet)
+/// input into a single destination output. Covers: (1) value conservation
+/// — no leakage/creation of sats, (2) txid/vsize agreement with
+/// rust-bitcoin's independent parse, and (3) both witness kinds verifying
+/// under their own BIP (BIP340/341 schnorr for the taproot input, BIP143
+/// ECDSA for the P2WPKH one) — the same rigor
+/// `pure_spending_funded_self_note_shape_and_signature` and
+/// `mixed_taproot_and_wpkh_inputs_each_sign_correctly` apply above.
+#[test]
+fn sweep_mixed_taproot_and_wpkh_cross_check() {
+    use bitcoin::consensus::encode::deserialize as btc_deser;
+    use bitcoin::hashes::Hash;
+    use bitcoin::secp256k1::ecdsa::Signature as SecpEcdsaSignature;
+    use bitcoin::secp256k1::{
+        schnorr::Signature as SecpSchnorrSignature, Message, PublicKey as SecpPublicKey, Secp256k1,
+        XOnlyPublicKey,
+    };
+    use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
+    use bitcoin::{Amount, ScriptBuf, TxOut as BtcTxOut};
+    use notes_core::bundle::Identity;
+
+    // A real (output_x, tweaked_seckey) pair — unlike NOTEBOOK_X/TAPROOT_SECKEY
+    // (unrelated stand-ins fine for tests that only re-derive our own
+    // sighash), this test asks rust-bitcoin to verify the schnorr signature
+    // against the actual curve point, so the key and its output_x must
+    // really correspond.
+    let notebook = Identity::from_app_seed(&[0x51; 32]).unwrap();
+    let taproot_spk = p2tr_script_pubkey(&notebook.output_x);
+    let wpkh_sk = wpkh_seckey(21);
+    let wpkh_input_spk = wpkh_spk(&wpkh_sk);
+    let dest_spk = wpkh_spk(&wpkh_seckey(22)); // arbitrary external destination
+
+    let inputs = vec![
+        MixedInput {
+            utxo: Utxo { txid: [31u8; 32], vout: 0, value: 30_000 },
+            prevout_spk: taproot_spk.clone(),
+            kind: InputKind::Taproot,
+            seckey: notebook.tweaked_seckey,
+        },
+        MixedInput {
+            utxo: Utxo { txid: [32u8; 32], vout: 1, value: 70_000 },
+            prevout_spk: wpkh_input_spk.clone(),
+            kind: InputKind::P2wpkh,
+            seckey: wpkh_sk,
+        },
+    ];
+    let in_value: u64 = inputs.iter().map(|i| i.utxo.value).sum();
+
+    let sweep = build_sweep_tx_mixed(&inputs, dest_spk.clone(), 2.0, || Ok(AUX)).unwrap();
+
+    // Single destination output, everything minus fee — no change, no
+    // recipient, no OP_RETURN.
+    assert_eq!(sweep.tx.outputs.len(), 1);
+    assert_eq!(sweep.tx.outputs[0].script_pubkey, dest_spk);
+    assert_eq!(sweep.sent, 0);
+    assert_eq!(sweep.change, 0);
+
+    // (1) Value conservation.
+    assert_eq!(in_value, sweep.fee + sweep.tx.outputs[0].value);
+
+    // (2) txid/vsize agreement with rust-bitcoin.
+    let raw = hex::decode(&sweep.raw_hex).unwrap();
+    let btx: bitcoin::Transaction = btc_deser(&raw).unwrap();
+    assert_eq!(btx.compute_txid().to_string(), sweep.txid_hex);
+    assert_eq!(btx.vsize(), sweep.vsize);
+
+    // (3) Both witness kinds verify under their own BIP.
+    let prevouts: Vec<BtcTxOut> = vec![
+        BtcTxOut {
+            value: Amount::from_sat(30_000),
+            script_pubkey: ScriptBuf::from_bytes(taproot_spk),
+        },
+        BtcTxOut {
+            value: Amount::from_sat(70_000),
+            script_pubkey: ScriptBuf::from_bytes(wpkh_input_spk.clone()),
+        },
+    ];
+    let secp = Secp256k1::verification_only();
+    let mut cache = SighashCache::new(&btx);
+
+    // Input 0: taproot key-path (BIP340/341).
+    let output_key = XOnlyPublicKey::from_slice(&notebook.output_x).unwrap();
+    let tap_sighash = cache
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), TapSighashType::Default)
+        .unwrap();
+    secp.verify_schnorr(
+        &SecpSchnorrSignature::from_slice(&sweep.tx.witnesses[0][0]).unwrap(),
+        &Message::from_digest(tap_sighash.to_byte_array()),
+        &output_key,
+    )
+    .expect("taproot sweep input must verify under BIP340/341");
+
+    // Input 1: P2WPKH (BIP143).
+    let wpkh_script_spk = ScriptBuf::from_bytes(wpkh_input_spk);
+    let wpkh_sighash = cache
+        .p2wpkh_signature_hash(1, &wpkh_script_spk, Amount::from_sat(70_000), EcdsaSighashType::All)
+        .unwrap();
+    let witness1 = &sweep.tx.witnesses[1];
+    let sig_bytes = &witness1[0];
+    assert_eq!(*sig_bytes.last().unwrap(), 0x01, "SIGHASH_ALL byte");
+    let der = &sig_bytes[..sig_bytes.len() - 1];
+    let pubkey_bytes = &witness1[1];
+    let secp_sig = SecpEcdsaSignature::from_der(der).unwrap();
+    let secp_pubkey = SecpPublicKey::from_slice(pubkey_bytes).unwrap();
+    secp.verify_ecdsa(
+        &Message::from_digest(wpkh_sighash.to_byte_array()),
+        &secp_sig,
+        &secp_pubkey,
+    )
+    .expect("P2WPKH sweep input must verify under BIP143");
+}
+
+/// All-taproot-only sweep through `build_sweep_tx_mixed` (2 notebook
+/// inputs, no P2WPKH) — regression coverage that mixing in this new
+/// builder didn't disturb the pure-taproot case `build_sweep_tx_multi`
+/// already covers.
+#[test]
+fn sweep_mixed_all_taproot_only() {
+    use bitcoin::consensus::encode::deserialize as btc_deser;
+
+    let dest_spk = wpkh_spk(&wpkh_seckey(23));
+    let taproot_spk = p2tr_script_pubkey(&NOTEBOOK_X);
+    let inputs = vec![
+        MixedInput {
+            utxo: Utxo { txid: [41u8; 32], vout: 0, value: 20_000 },
+            prevout_spk: taproot_spk.clone(),
+            kind: InputKind::Taproot,
+            seckey: TAPROOT_SECKEY,
+        },
+        MixedInput {
+            utxo: Utxo { txid: [42u8; 32], vout: 1, value: 15_000 },
+            prevout_spk: taproot_spk,
+            kind: InputKind::Taproot,
+            seckey: TAPROOT_SECKEY,
+        },
+    ];
+    let in_value: u64 = inputs.iter().map(|i| i.utxo.value).sum();
+    let sweep = build_sweep_tx_mixed(&inputs, dest_spk.clone(), 1.0, || Ok(AUX)).unwrap();
+    assert_eq!(sweep.tx.inputs.len(), 2);
+    assert_eq!(sweep.tx.outputs.len(), 1);
+    assert_eq!(sweep.tx.outputs[0].script_pubkey, dest_spk);
+    assert_eq!(in_value, sweep.fee + sweep.tx.outputs[0].value);
+
+    let raw = hex::decode(&sweep.raw_hex).unwrap();
+    let btx: bitcoin::Transaction = btc_deser(&raw).unwrap();
+    assert_eq!(btx.compute_txid().to_string(), sweep.txid_hex);
+    assert_eq!(btx.vsize(), sweep.vsize);
+}
+
+/// All-P2WPKH-only sweep through `build_sweep_tx_mixed` (2 spending-wallet
+/// inputs, no taproot) — the pure-BIP143 case.
+#[test]
+fn sweep_mixed_all_wpkh_only() {
+    use bitcoin::consensus::encode::deserialize as btc_deser;
+
+    let sk1 = wpkh_seckey(24);
+    let sk2 = wpkh_seckey(25);
+    let spk1 = wpkh_spk(&sk1);
+    let spk2 = wpkh_spk(&sk2);
+    let dest_spk = p2tr_script_pubkey(&NOTEBOOK_X); // sweeping out to a notebook address
+    let inputs = vec![
+        MixedInput {
+            utxo: Utxo { txid: [51u8; 32], vout: 0, value: 12_000 },
+            prevout_spk: spk1,
+            kind: InputKind::P2wpkh,
+            seckey: sk1,
+        },
+        MixedInput {
+            utxo: Utxo { txid: [52u8; 32], vout: 2, value: 8_000 },
+            prevout_spk: spk2,
+            kind: InputKind::P2wpkh,
+            seckey: sk2,
+        },
+    ];
+    let in_value: u64 = inputs.iter().map(|i| i.utxo.value).sum();
+    let sweep = build_sweep_tx_mixed(&inputs, dest_spk.clone(), 1.0, || Ok(AUX)).unwrap();
+    assert_eq!(sweep.tx.inputs.len(), 2);
+    assert_eq!(sweep.tx.outputs.len(), 1);
+    assert_eq!(sweep.tx.outputs[0].script_pubkey, dest_spk);
+    assert_eq!(in_value, sweep.fee + sweep.tx.outputs[0].value);
+
+    let raw = hex::decode(&sweep.raw_hex).unwrap();
+    let btx: bitcoin::Transaction = btc_deser(&raw).unwrap();
+    assert_eq!(btx.compute_txid().to_string(), sweep.txid_hex);
+    assert_eq!(btx.vsize(), sweep.vsize);
+}
+
+/// Empty input list must error, mirroring `build_sweep_tx_multi`'s guard.
+#[test]
+fn sweep_mixed_empty_inputs_errors() {
+    let dest_spk = wpkh_spk(&wpkh_seckey(26));
+    let err = build_sweep_tx_mixed(&[], dest_spk, 1.0, || Ok(AUX)).unwrap_err();
+    assert!(matches!(err, notes_core::Error::InsufficientFunds));
+}
+
+/// Inputs that can't cover the fee at all must error.
+#[test]
+fn sweep_mixed_insufficient_funds_errors() {
+    let sk = wpkh_seckey(27);
+    let spk = wpkh_spk(&sk);
+    let dest_spk = wpkh_spk(&wpkh_seckey(28));
+    let inputs = vec![MixedInput {
+        utxo: Utxo { txid: [61u8; 32], vout: 0, value: 100 },
+        prevout_spk: spk,
+        kind: InputKind::P2wpkh,
+        seckey: sk,
+    }];
+    let err = build_sweep_tx_mixed(&inputs, dest_spk, 5.0, || Ok(AUX)).unwrap_err();
     assert!(matches!(err, notes_core::Error::InsufficientFunds));
 }
 
