@@ -456,6 +456,189 @@ pub fn build_note_tx_with_change(
     Err(Error::InsufficientFunds)
 }
 
+// ---------------------------------------------------------------------
+// Mixed-source (taproot + P2WPKH) note transactions — the Prime device's
+// spending-wallet port (PLAN-chain-notes-funding-unification.md, "Prime
+// device" + "New signing surface: P2WPKH in notes-core"). Unlike every
+// builder above (always P2TR key-path, one shared `tweaked_seckey`), a
+// spending-wallet coin is a P2WPKH input owned by ITS OWN fresh-address
+// key, and multiple selected coins can each carry a DIFFERENT key — so
+// this builder takes one key PER INPUT and signs via `wpkh::sign_mixed_inputs`
+// in a single pass, taproot inputs riding along (schnorr) when a notebook
+// dust coin is spent alongside spending-wallet coins (e.g. topping up a
+// note's fee from the notebook).
+// ---------------------------------------------------------------------
+
+/// One input's key material for [`build_note_tx_mixed_exact`]: either the
+/// notebook's taproot-tweaked key-path secret, or a spending-wallet P2WPKH
+/// leaf secret (raw, no tweak). Both are 32 bytes; which signing algorithm
+/// applies is decided by `kind`, kept alongside for fee estimation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    Taproot,
+    P2wpkh,
+}
+
+/// One EXACT input to a mixed-source note tx: the coin, its spent
+/// scriptPubKey (BIP341 sighashing commits every input's prevout spk even
+/// for inputs that aren't themselves taproot — see `wpkh::sign_mixed_inputs`'s
+/// doc comment), and its owning key.
+pub struct MixedInput {
+    pub utxo: Utxo,
+    pub prevout_spk: Vec<u8>,
+    pub kind: InputKind,
+    /// Taproot: the already-tweaked key-path secret. P2WPKH: the raw leaf
+    /// secret (no tweak — unlike taproot, P2WPKH has no output-key tweak).
+    pub seckey: [u8; 32],
+}
+
+/// Weight-unit cost of one input's witness stack by kind: 66 for a
+/// key-path taproot spend (1 count + 1 len + 64-byte schnorr sig, matching
+/// `estimate_vsize`'s existing all-taproot assumption), 108 for a P2WPKH
+/// spend assuming the worst-case low-S DER signature (1 count + 1 len +
+/// 72-byte sig+sighash-byte + 1 len + 33-byte compressed pubkey) — the same
+/// conservative budgeting convention most wallets use (a real signature is
+/// often 1-2 bytes shorter, so the fee is a slight, harmless overpay).
+/// Together with the shared 41-byte base these reproduce
+/// PLAN-chain-notes-funding-unification.md's cost table exactly: P2TR input
+/// 57.5 vB, P2WPKH input 68 vB ((41*4 + 66)/4 = 57.5, (41*4 + 108)/4 = 68).
+fn mixed_input_witness_wu(kind: InputKind) -> usize {
+    match kind {
+        InputKind::Taproot => 66,
+        InputKind::P2wpkh => 108,
+    }
+}
+
+/// Like [`estimate_vsize`], generalized to mixed input kinds and an
+/// explicit list of every NON-OP_RETURN output's scriptPubKey length (in
+/// output order) instead of a single hardcoded P2TR change output — a
+/// mixed-source note always has at least the notebook dust-to-self output,
+/// often a directed recipient too, and change of whichever kind the
+/// destination picker chose (fresh spending bc1q, or notebook bc1p).
+pub fn estimate_vsize_mixed(
+    kinds: &[InputKind],
+    payload_lens: &[usize],
+    extra_output_lens: &[usize],
+) -> usize {
+    let mut base = 4 + 4; // version + locktime
+    base += varint_len(kinds.len()) + kinds.len() * (32 + 4 + 1 + 4);
+    let n_outputs = payload_lens.len() + extra_output_lens.len();
+    base += varint_len(n_outputs);
+    for &len in payload_lens {
+        base += 8 + varint_len_script(len) + script_len(len);
+    }
+    for &len in extra_output_lens {
+        base += 8 + varint_len(len) + len;
+    }
+    let witness: usize =
+        2 + kinds.iter().map(|k| mixed_input_witness_wu(*k)).sum::<usize>();
+    (base * 4 + witness).div_ceil(4)
+}
+
+/// Build and sign a note tx spending EXACTLY the given mixed-source inputs
+/// (coin control only — no automatic selection, matching
+/// `build_note_tx_exact`'s coin-control shape). ALWAYS emits a
+/// `DUST_LIMIT`-sat output to `notebook_dust_spk` (decision 4 in the PLAN,
+/// "Dust-to-self stays": a funded note must still pay the notebook or it
+/// never appears in its address history, which is the whole discoverability
+/// mechanism) — callers use this builder precisely when funding is NOT
+/// pure-notebook, so that output is unconditional here, unlike the optional
+/// `recipient_spk` dust of the all-taproot builders above. Output order:
+/// OP_RETURN chunk(s), optional directed recipient, notebook dust, change —
+/// matching the already-shipped external-funding PSBT shape byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+pub fn build_note_tx_mixed_exact(
+    inputs: &[MixedInput],
+    payloads: &[Vec<u8>],
+    recipient_spk: Option<&[u8]>,
+    recipient_amount: u64,
+    notebook_dust_spk: &[u8],
+    change_spk: &[u8],
+    fee_rate: f64,
+    mut aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    if payloads.is_empty() {
+        return Err(Error::Envelope("no payloads"));
+    }
+    if inputs.is_empty() {
+        return Err(Error::InsufficientFunds);
+    }
+    if recipient_spk.is_some() && recipient_amount < DUST_LIMIT {
+        return Err(Error::Envelope("gift amount below dust limit"));
+    }
+    let payload_lens: Vec<usize> = payloads.iter().map(Vec::len).collect();
+    let sent: u64 = if recipient_spk.is_some() { recipient_amount } else { 0 };
+    let kinds: Vec<InputKind> = inputs.iter().map(|i| i.kind).collect();
+    let in_value: u64 = inputs.iter().map(|i| i.utxo.value).sum();
+
+    for change in [true, false] {
+        let mut extra_lens: Vec<usize> = Vec::with_capacity(3);
+        if let Some(spk) = recipient_spk {
+            extra_lens.push(spk.len());
+        }
+        extra_lens.push(notebook_dust_spk.len());
+        if change {
+            extra_lens.push(change_spk.len());
+        }
+        let vsize = estimate_vsize_mixed(&kinds, &payload_lens, &extra_lens);
+        let fee = (vsize as f64 * fee_rate).ceil() as u64;
+        if in_value < fee + sent + DUST_LIMIT {
+            continue;
+        }
+        let change_value = in_value - fee - sent - DUST_LIMIT;
+        if change && change_value < DUST_LIMIT {
+            continue;
+        }
+        if !change && change_value > DUST_LIMIT {
+            // Overshoot without change would burn > dust into fees; prefer
+            // the change-output branch (tried first in this loop).
+            continue;
+        }
+
+        let mut outputs: Vec<TxOut> = payloads
+            .iter()
+            .map(|p| TxOut { value: 0, script_pubkey: op_return_script(p) })
+            .collect();
+        if let Some(spk) = recipient_spk {
+            outputs.push(TxOut { value: sent, script_pubkey: spk.to_vec() });
+        }
+        outputs.push(TxOut { value: DUST_LIMIT, script_pubkey: notebook_dust_spk.to_vec() });
+        if change {
+            outputs.push(TxOut { value: change_value, script_pubkey: change_spk.to_vec() });
+        }
+
+        let mut tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            inputs: inputs.iter().map(|i| i.utxo.clone()).collect(),
+            outputs,
+            witnesses: Vec::new(),
+        };
+        let prevout_spks: Vec<Vec<u8>> = inputs.iter().map(|i| i.prevout_spk.clone()).collect();
+        let keys: Vec<crate::wpkh::InputKey> = inputs
+            .iter()
+            .map(|i| match i.kind {
+                InputKind::Taproot => crate::wpkh::InputKey::Taproot { tweaked_seckey: &i.seckey },
+                InputKind::P2wpkh => crate::wpkh::InputKey::P2wpkh { seckey: &i.seckey },
+            })
+            .collect();
+        crate::wpkh::sign_mixed_inputs(&mut tx, &prevout_spks, &keys, &mut aux)?;
+
+        let actual_fee = in_value - sent - DUST_LIMIT - if change { change_value } else { 0 };
+        return Ok(NoteTx {
+            fee: actual_fee,
+            change: if change { change_value } else { 0 },
+            sent,
+            vsize: tx.vsize(),
+            txid_hex: tx.txid_hex(),
+            raw_hex: hex::encode(tx.serialize_segwit()),
+            spent_outpoints: tx.inputs.iter().map(|i| (i.txid, i.vout)).collect(),
+            tx,
+        });
+    }
+    Err(Error::InsufficientFunds)
+}
+
 /// Build a note tx spending EXACTLY the given inputs (coin control) —
 /// no automatic selection. Change (self or `change_out`) is the leftover
 /// after the note payloads, optional dust recipient, and fee. Fails if

@@ -69,6 +69,8 @@
     <h2>1 · Build a sync bundle</h2>
     <label>Notes address (from the device's home screen)</label>
     <input type="text" id="address" placeholder="bc1p… / tb1p… / bcrt1p…" spellcheck="false">
+    <label>Spending wallet addresses (optional — paste from the device's Settings &rarr; "Separate spending wallet" card, one per line)</label>
+    <textarea id="spendingAddrs" placeholder="bc1q… / tb1q…&#10;bc1q… / tb1q…" spellcheck="false"></textarea>
     <button id="buildBtn">Build sync bundle</button>
     <button class="secondary" id="downloadBtn" disabled>Download bundle.json</button>
     <button class="secondary" id="showQrBtn" disabled>Show as QR</button>
@@ -221,6 +223,20 @@ $("buildBtn").addEventListener("click", async () => {
   const logEl = $("syncLog");
   logEl.textContent = "";
   if (!address) return log(logEl, "Enter the notes address first.", "err");
+  // Spending-wallet addresses (funding-unification, Prime device port):
+  // the device has no network, so — unlike the notebook address, whose
+  // OWN /utxo endpoint is enough — a spending-wallet coin never shows up
+  // there (it lives on a DIFFERENT, fresh bc1q address). The user pastes
+  // the device's currently-known spending addresses here; each one's
+  // /utxo is fetched too and merged into the bundle, tagged with
+  // `owner_address` so the device routes it into the right ledger. This
+  // is a manual, device-exported watch list, NOT a gap-limit discovery
+  // scan of not-yet-seen addresses — see companion/index.html's header
+  // comment / DEVELOPMENT.md for that documented limitation.
+  const spendingAddrs = $("spendingAddrs").value
+    .split(/[\s,]+/)
+    .map((a) => a.trim())
+    .filter(Boolean);
   $("buildBtn").disabled = true;
   try {
     log(logEl, `Scanning ${address} on ${net()}…`);
@@ -229,6 +245,18 @@ $("buildBtn").addEventListener("click", async () => {
       apiJson(`/address/${address}/utxo`),
       fullHistory(address, logEl),
     ]);
+    let spendingUtxos = [];
+    if (spendingAddrs.length) {
+      log(logEl, `Also checking ${spendingAddrs.length} spending-wallet address(es)…`);
+      for (const a of spendingAddrs) {
+        try {
+          const u = await apiJson(`/address/${a}/utxo`);
+          spendingUtxos.push(...u.map((x) => ({ ...x, owner_address: a })));
+        } catch (e) {
+          log(logEl, `  ${a}: ${e.message}`, "err");
+        }
+      }
+    }
     let fees = { fastestFee: 2, halfHourFee: 2, hourFee: 1, economyFee: 1, minimumFee: 1 };
     try { fees = await apiJson("/v1/fees/recommended"); }
     catch { log(logEl, "  fee endpoint unavailable — using 1-2 sat/vB placeholders"); }
@@ -311,10 +339,17 @@ $("buildBtn").addEventListener("click", async () => {
       bundle_time: Math.floor(Date.now() / 1000),
       fee_rates: fees,
       btc_usd: btcUsd,
-      utxos: utxos.map((u) => ({
-        txid: u.txid, vout: u.vout, value: u.value,
-        height: u.status.confirmed ? u.status.block_height : null,
-      })),
+      utxos: [
+        ...utxos.map((u) => ({
+          txid: u.txid, vout: u.vout, value: u.value,
+          height: u.status.confirmed ? u.status.block_height : null,
+        })),
+        ...spendingUtxos.map((u) => ({
+          txid: u.txid, vout: u.vout, value: u.value,
+          height: u.status.confirmed ? u.status.block_height : null,
+          owner_address: u.owner_address,
+        })),
+      ],
       notes_onchain: notesOnchain,
     };
 
@@ -330,8 +365,9 @@ $("buildBtn").addEventListener("click", async () => {
     stopQrCycle();
     $("qrBox").style.display = "none";
     $("showQrBtn").textContent = "Show as QR";
-    log(logEl, `Bundle ready: ${bundle.utxos.length} utxo(s), ` +
-      `${notesOnchain.length} note tx(s), ${txs.length} total txs scanned.`, "ok");
+    log(logEl, `Bundle ready: ${bundle.utxos.length} utxo(s)` +
+      (spendingUtxos.length ? ` (${spendingUtxos.length} from the spending wallet)` : "") +
+      `, ${notesOnchain.length} note tx(s), ${txs.length} total txs scanned.`, "ok");
     log(logEl, "Download it and copy to the device's /chain-notes/inbox/.");
   } catch (e) {
     log(logEl, `Failed: ${e.message}`, "err");

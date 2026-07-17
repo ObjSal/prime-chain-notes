@@ -1,4 +1,5 @@
 mod notebooks;
+mod spending;
 mod theme;
 
 use std::cell::RefCell;
@@ -7,16 +8,19 @@ use std::time::Duration;
 
 use notes_core::address::Recipient;
 use notes_core::bundle::{
-    compose_directed_note_with_change_amount, compose_note, decode_scanned, estimate_note_cost,
-    extract_notes, Identity, SyncBundle,
+    compose_directed_note_exact_amount, compose_directed_note_with_change_amount,
+    compose_note_exact, decode_scanned, estimate_note_cost, extract_notes_multi,
+    sealed_note_payloads, Identity, SyncBundle,
 };
 use notes_core::address::p2tr_script_pubkey;
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::tx::{
-    build_sweep_tx, build_sweep_tx_multi, estimate_sweep_vsize, NoteTx, SweepSource, Utxo,
+    build_note_tx_mixed_exact, build_sweep_tx_multi, estimate_sweep_vsize, estimate_vsize_mixed,
+    InputKind, MixedInput, NoteTx, SweepSource, Utxo,
 };
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
+use spending::SpendingIndex;
 use slint_keyos_platform::app_ui;
 use slint_keyos_platform::fs::{self, Location, OpenFlags};
 use slint_keyos_platform::gui_server_api::navigation::qrscanner::{ScanQrOptions, ScanQrResult};
@@ -264,6 +268,21 @@ struct Plan {
     note_id: [u8; 4],
     chunks: u64,
     recipient: Option<String>,
+    /// Funding-unification: which spending-wallet coins this note spent
+    /// (dropped from the ledger on sign) and, when change went to a fresh
+    /// spending address, the address to mark used — both applied ONLY
+    /// after a successful sign (see `resolve_change`'s doc comment).
+    spending_spent: Vec<(String, u32)>,
+    spending_change_addr: Option<spending::SpendingAddress>,
+    /// True when change (if any) belongs in the NOTEBOOK ledger — false
+    /// when it went to a fresh spending address (`spending_change_addr`
+    /// is Some) or an external custom address (neither Some, untracked).
+    change_is_notebook: bool,
+    /// True when this tx carries the mandatory notebook-dust output
+    /// (decision 4 — present whenever the spending wallet funded any part
+    /// of it), which lands as a NEW notebook coin right after the
+    /// OP_RETURN(s)/optional recipient, before change.
+    notebook_dust: bool,
 }
 
 /// A built-and-signed sweep/consolidate waiting for user confirmation.
@@ -661,6 +680,201 @@ fn to_label_for(st: &State, address: &str) -> String {
     }
 }
 
+// ----------------------------------------------------- spending wallet
+// (PLAN-chain-notes-funding-unification.md, "Prime device" + M2/M3.)
+
+/// Per-chunk OP_RETURN payload lengths for `text_len` bytes — the same
+/// arithmetic `notes_core::bundle::estimate_note_cost` uses internally,
+/// exposed locally because the funding-unification cost preview needs the
+/// actual per-chunk lengths (for `tx::estimate_vsize_mixed`), not just the
+/// single-taproot-input vsize that helper returns.
+fn payload_lens_for(text_len: usize, private: bool, max_op_return_bytes: usize) -> Result<Vec<usize>, String> {
+    let body_len = if private { text_len + notes_core::crypt::SEAL_OVERHEAD } else { text_len };
+    if body_len == 0 {
+        return Err("empty body".into());
+    }
+    if max_op_return_bytes <= notes_core::envelope::HEADER_LEN {
+        return Err("max_payload smaller than header".into());
+    }
+    let chunk_size = max_op_return_bytes - notes_core::envelope::HEADER_LEN;
+    let total = body_len.div_ceil(chunk_size);
+    if total > u8::MAX as usize {
+        return Err("too large (> 255 chunks)".into());
+    }
+    let mut payload_lens = vec![max_op_return_bytes; total - 1];
+    let tail = body_len - (total - 1) * chunk_size;
+    payload_lens.push(notes_core::envelope::HEADER_LEN + tail);
+    Ok(payload_lens)
+}
+
+/// The active notebook's (rotation seed, BIP-86 account) context — the same
+/// key a spending wallet is scoped at (`spending::SpendingIndex`).
+fn notebook_ctx(ix: &notebooks::NotebookIndex, account: Option<u32>) -> Option<(u32, u32)> {
+    let m = ix.get(account?)?;
+    Some((m.seed, m.bip_account))
+}
+
+/// A Slint `FundingCoinRow.key` for one coin: "notebook:<txid>:<vout>" or
+/// "spending:<txid>:<vout>" — stable, round-trips through `parse_funding_key`.
+fn funding_key(spending: bool, txid: &str, vout: u32) -> String {
+    format!("{}:{txid}:{vout}", if spending { "spending" } else { "notebook" })
+}
+
+fn parse_funding_key(key: &str) -> Option<(bool, String, u32)> {
+    let mut parts = key.splitn(3, ':');
+    let source = parts.next()?;
+    let txid = parts.next()?.to_string();
+    let vout: u32 = parts.next()?.parse().ok()?;
+    Some((source == "spending", txid, vout))
+}
+
+/// Which coins currently fund the compose in progress. `touched` becomes
+/// true the first time the user taps a coin on the Pay-from screen — until
+/// then, an empty `spending` selection means "use today's byte-identical
+/// auto-select over every notebook coin" (`compose_note`/
+/// `compose_directed_note_with_change_amount`); once touched (or whenever
+/// ANY spending coin is selected, touched or not — the default-source
+/// rule), Continue spends EXACTLY the selected set.
+#[derive(Default, Clone)]
+struct FundingPick {
+    notebook: Vec<(String, u32)>,
+    spending: Vec<(String, u32)>,
+    touched: bool,
+}
+
+impl FundingPick {
+    fn is_selected(&self, spending: bool, txid: &str, vout: u32) -> bool {
+        let set = if spending { &self.spending } else { &self.notebook };
+        set.iter().any(|(t, v)| t == txid && *v == vout)
+    }
+
+    fn toggle(&mut self, spending: bool, txid: String, vout: u32) {
+        let set = if spending { &mut self.spending } else { &mut self.notebook };
+        if let Some(i) = set.iter().position(|(t, v)| *t == txid && *v == vout) {
+            set.remove(i);
+        } else {
+            set.push((txid, vout));
+        }
+        self.touched = true;
+    }
+
+    /// "notebook" | "spending" | "mixed" | "none" — display + log label.
+    fn mode_label(&self) -> &'static str {
+        match (!self.notebook.is_empty(), !self.spending.is_empty()) {
+            (true, true) => "mixed",
+            (false, true) => "spending",
+            (true, false) => "notebook",
+            (false, false) => "none",
+        }
+    }
+}
+
+/// Default selection for a freshly-opened compose: spending ONLY when the
+/// wallet is enabled AND has a balance (funding-unification's default-
+/// source rule) — otherwise every notebook coin, exactly like compose
+/// behaved before this feature existed.
+fn default_funding_pick(st: &State, spending_section: Option<&spending::SpendingSection>) -> FundingPick {
+    let spending_balance = spending_section.map(|s| s.balance()).unwrap_or(0);
+    let use_spending =
+        spending_section.map(|s| s.enabled).unwrap_or(false) && spending_balance > 0;
+    if use_spending {
+        FundingPick {
+            notebook: Vec::new(),
+            spending: spending_section
+                .map(|s| s.utxos.iter().map(|u| (u.txid.clone(), u.vout)).collect())
+                .unwrap_or_default(),
+            touched: false,
+        }
+    } else {
+        FundingPick {
+            notebook: st.utxos.iter().map(|u| (u.txid.clone(), u.vout)).collect(),
+            spending: Vec::new(),
+            touched: false,
+        }
+    }
+}
+
+/// Change destination pick for the compose in progress.
+#[derive(Clone)]
+struct ChangePickState {
+    choice: String, // "auto" | "notebook" | "custom"
+    custom_address: String,
+}
+
+impl Default for ChangePickState {
+    fn default() -> Self {
+        ChangePickState { choice: "auto".into(), custom_address: String::new() }
+    }
+}
+
+/// Resolve the change destination: "custom" parses the typed address;
+/// "notebook" is always the notebook's own P2TR spk; "auto" is the notebook
+/// UNLESS the current pick spends a spending-wallet coin, in which case it's
+/// a fresh spending-wallet change address (protecting funds is the whole
+/// point of the feature) — returned alongside the `SpendingAddress` to mark
+/// used, which the caller persists ONLY after a successful sign (an aborted
+/// compose must never burn a change index).
+#[allow(clippy::too_many_arguments)]
+fn resolve_change(
+    choice: &str,
+    custom_address: &str,
+    network: Network,
+    output_x: &[u8; 32],
+    spending_participates: bool,
+    app_seed: &[u8; 32],
+    seed_index: u32,
+    bip_account: u32,
+    next_change_index: u32,
+) -> Result<(Vec<u8>, Option<spending::SpendingAddress>), String> {
+    match choice {
+        "custom" => {
+            let r = Recipient::parse(network, custom_address).map_err(|e| e.to_string())?;
+            Ok((r.spk, None))
+        }
+        "notebook" => Ok((p2tr_script_pubkey(output_x), None)),
+        _ => {
+            if spending_participates {
+                let key = notes_core::seeds::derive_spending_key(
+                    app_seed,
+                    seed_index,
+                    network,
+                    bip_account,
+                    1,
+                    next_change_index,
+                )
+                .map_err(|e| e.to_string())?;
+                let addr = spending::SpendingAddress {
+                    chain: 1,
+                    index: next_change_index,
+                    address: key.address,
+                    spk_hex: hex::encode(&key.script_pubkey),
+                };
+                Ok((key.script_pubkey, Some(addr)))
+            } else {
+                Ok((p2tr_script_pubkey(output_x), None))
+            }
+        }
+    }
+}
+
+/// Just the change spk's LENGTH, for the keystroke cost preview (no
+/// derivation needed — P2WPKH/P2TR spk lengths are fixed regardless of the
+/// specific address; only "custom" needs an actual parse).
+fn change_spk_len_preview(
+    choice: &str,
+    custom_address: &str,
+    network: Network,
+    spending_participates: bool,
+) -> Result<usize, String> {
+    match choice {
+        "custom" => {
+            Recipient::parse(network, custom_address).map(|r| r.spk.len()).map_err(|e| e.to_string())
+        }
+        "notebook" => Ok(34),
+        _ => Ok(if spending_participates { 22 } else { 34 }),
+    }
+}
+
 // ---------------------------------------------------------------- main
 
 fn app_main(cx: AppContext, ui: AppWindow) {
@@ -1024,6 +1238,197 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         }
     };
 
+    // Funding-unification: current per-coin funding pick + change pick for
+    // the compose in progress. Reset to the default rule whenever a fresh
+    // compose is entered (see `pick_contact` below).
+    let funding_pick: Rc<RefCell<FundingPick>> = Rc::new(RefCell::new(FundingPick::default()));
+    let change_pick: Rc<RefCell<ChangePickState>> = Rc::new(RefCell::new(ChangePickState::default()));
+
+    // Rebuild the Pay-from screen's rows/summaries, the compose nav row's
+    // label, AND Settings' spending card (same underlying section) from
+    // `state` + the active notebook's spending section + `funding_pick`.
+    let refresh_funding = {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let notebooks = notebooks.clone();
+        let net = net.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let active = active.clone();
+        let app_seed = app_seed.clone();
+        let funding_pick = funding_pick.clone();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let st = state.borrow();
+            let active_net = net.borrow().clone();
+            let ix = notebooks.borrow();
+            let ctx = notebook_ctx(&ix, *active.borrow())
+                .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
+            let section = ix.spending(&active_net, ctx.0, ctx.1).cloned();
+            drop(ix);
+            let pick = funding_pick.borrow();
+
+            let nb_rows: Vec<FundingCoinRow> = st
+                .utxos
+                .iter()
+                .map(|u| FundingCoinRow {
+                    key: funding_key(false, &u.txid, u.vout).into(),
+                    label: format!("{} sats", u.value).into(),
+                    meta: format!("txid {} · output {}", short_addr(&u.txid), u.vout).into(),
+                    selected: pick.is_selected(false, &u.txid, u.vout),
+                })
+                .collect();
+            let nb_total: u64 = st.utxos.iter().map(|u| u.value).sum();
+            let nb_selected_total: u64 = st
+                .utxos
+                .iter()
+                .filter(|u| pick.is_selected(false, &u.txid, u.vout))
+                .map(|u| u.value)
+                .sum();
+
+            let sp_rows: Vec<FundingCoinRow> = section
+                .as_ref()
+                .map(|s| {
+                    s.utxos
+                        .iter()
+                        .map(|u| FundingCoinRow {
+                            key: funding_key(true, &u.txid, u.vout).into(),
+                            label: format!("{} sats", u.value).into(),
+                            meta: format!(
+                                "txid {} · output {} · idx {}",
+                                short_addr(&u.txid),
+                                u.vout,
+                                u.index
+                            )
+                            .into(),
+                            selected: pick.is_selected(true, &u.txid, u.vout),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let sp_total = section.as_ref().map(|s| s.balance()).unwrap_or(0);
+            let sp_enabled = section.as_ref().map(|s| s.enabled).unwrap_or(false);
+            let sp_selected_total: u64 = section
+                .as_ref()
+                .map(|s| {
+                    s.utxos
+                        .iter()
+                        .filter(|u| pick.is_selected(true, &u.txid, u.vout))
+                        .map(|u| u.value)
+                        .sum()
+                })
+                .unwrap_or(0);
+
+            let funding = ui.global::<Funding>();
+            funding.set_notebook_coins(Rc::new(VecModel::from(nb_rows)).into());
+            funding.set_spending_coins(Rc::new(VecModel::from(sp_rows)).into());
+            funding.set_notebook_summary(
+                format!("{} coin(s) · {} sats", st.utxos.len(), nb_total).into(),
+            );
+            funding.set_spending_summary(
+                if !sp_enabled {
+                    "Off".to_string()
+                } else if sp_total == 0 {
+                    "No coins".to_string()
+                } else {
+                    format!(
+                        "{} coin(s) · {} sats",
+                        section.as_ref().map(|s| s.utxos.len()).unwrap_or(0),
+                        sp_total
+                    )
+                }
+                .into(),
+            );
+            funding.set_spending_enabled(sp_enabled);
+            let mode = pick.mode_label();
+            let selected_total = nb_selected_total + sp_selected_total;
+            let selected_n = pick.notebook.len() + pick.spending.len();
+            funding.set_warning(
+                if mode == "mixed" {
+                    "This note spends from both the notebook and the spending wallet — their addresses become publicly linked on-chain.".to_string()
+                } else {
+                    String::new()
+                }
+                .into(),
+            );
+
+            let compose = ui.global::<Compose>();
+            compose.set_pay_from_label(
+                match mode {
+                    "mixed" => "Mixed",
+                    "spending" => "Spending wallet",
+                    _ => "Notebook",
+                }
+                .into(),
+            );
+            compose
+                .set_pay_from_balance(format!("{selected_total} sats · {selected_n} coin(s)").into());
+
+            // Settings' spending card mirrors the SAME section — harmless to
+            // refresh even when Settings isn't the visible screen.
+            let settings = ui.global::<Settings>();
+            settings.set_spending_enabled(sp_enabled);
+            if let Some(s) = &section {
+                settings.set_spending_balance_line(
+                    format!("{} coin(s) · {} sats", s.utxos.len(), s.balance()).into(),
+                );
+                if let Some(seed) = app_seed.as_ref() {
+                    let net_v = Network::from_str_opt(&active_net).unwrap_or(Network::Mainnet);
+                    if let Ok(key) = notes_core::seeds::derive_spending_key(
+                        seed, ctx.0, net_v, ctx.1, 0, s.next_receive,
+                    ) {
+                        settings.set_spending_address(key.address.clone().into());
+                        settings.set_spending_qr(qr_image(&key.address.to_uppercase()));
+                    }
+                }
+                let addr_lines: Vec<String> = s
+                    .used
+                    .iter()
+                    .map(|a| {
+                        format!(
+                            "{}/{}  {}",
+                            if a.chain == 1 { "change" } else { "receive" },
+                            a.index,
+                            a.address
+                        )
+                    })
+                    .collect();
+                settings.set_spending_addresses_text(addr_lines.join("\n").into());
+            } else {
+                settings.set_spending_balance_line("0 coin(s) · 0 sats".into());
+                settings.set_spending_addresses_text("".into());
+            }
+        }
+    };
+
+    // Rebuild the compose nav row's Change label + the Change screen's
+    // "Auto" sub-line from `change_pick` + whether the CURRENT funding pick
+    // spends any spending-wallet coin.
+    let refresh_change = {
+        let ui_weak = ui_weak.clone();
+        let funding_pick = funding_pick.clone();
+        let change_pick = change_pick.clone();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let participates = !funding_pick.borrow().spending.is_empty();
+            let cp = change_pick.borrow();
+            let auto_label = if participates {
+                "Fresh spending-wallet address — protects the change from address reuse."
+            } else {
+                "Notebook address — the same address it goes to today."
+            };
+            ui.global::<ChangePick>().set_auto_label(auto_label.into());
+            let label = match cp.choice.as_str() {
+                "custom" if !cp.custom_address.is_empty() => short_addr(&cp.custom_address),
+                "custom" => "custom address".to_string(),
+                "notebook" => "notebook".to_string(),
+                _ if participates => "fresh spending address".to_string(),
+                _ => "back to you".to_string(),
+            };
+            ui.global::<Compose>().set_change_label(label.into());
+        }
+    };
+
     // A notebook's display name: its local name, else its address short
     // form (never empty — rows and the home title read this).
     fn notebook_name(ix: &notebooks::NotebookIndex, account: u32, addr_short: &str) -> String {
@@ -1114,6 +1519,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let refresh_notes = refresh_notes.clone();
         let refresh_coins = refresh_coins.clone();
         let refresh_contacts = refresh_contacts.clone();
+        let refresh_funding = refresh_funding.clone();
         Rc::new(move |account: u32| {
             let Some(ui) = ui_weak.upgrade() else { return };
             if active.borrow().is_some() {
@@ -1139,6 +1545,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             refresh_notes();
             refresh_coins();
             refresh_contacts();
+            refresh_funding();
             ui.global::<Ui>().set_screen(0);
         })
     };
@@ -1151,6 +1558,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let fs = fs.clone();
         let update_sweep = update_sweep.clone();
+        let notebooks = notebooks.clone();
+        let net = net.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let active = active.clone();
+        let funding_pick = funding_pick.clone();
+        let change_pick = change_pick.clone();
+        let refresh_funding = refresh_funding.clone();
+        let refresh_change = refresh_change.clone();
         move |addr_raw: &str| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let addr = addr_raw.trim().to_string();
@@ -1196,6 +1612,19 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 update_sweep();
                 ui.global::<Ui>().set_screen(10);
             } else {
+                // Fresh compose: reset the funding/change picks to their
+                // default rule (spending only when enabled AND funded).
+                let st = state.borrow();
+                let ix = notebooks.borrow();
+                let ctx = notebook_ctx(&ix, *active.borrow())
+                    .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
+                let section = ix.spending(&net.borrow(), ctx.0, ctx.1).cloned();
+                drop(ix);
+                *funding_pick.borrow_mut() = default_funding_pick(&st, section.as_ref());
+                drop(st);
+                *change_pick.borrow_mut() = ChangePickState::default();
+                refresh_funding();
+                refresh_change();
                 ui.global::<Callbacks>().invoke_compose_changed();
                 ui.global::<Ui>().set_screen(3);
             }
@@ -1574,6 +2003,103 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
+    // Spending wallet: Settings toggle.
+    {
+        let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let net = net.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let active = active.clone();
+        let refresh_funding = refresh_funding.clone();
+        ui.global::<Callbacks>().on_set_spending_enabled(move |on| {
+            let mut ix = notebooks.borrow_mut();
+            let ctx = notebook_ctx(&ix, *active.borrow())
+                .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
+            let net_s = net.borrow().clone();
+            ix.spending_mut(&net_s, ctx.0, ctx.1).enabled = on;
+            save_notebooks(&fs, &ix);
+            drop(ix);
+            log::info!("cb: set-spending enabled={on}");
+            refresh_funding();
+        });
+    }
+
+    // Pay-from screen (25): notebook / spending-wallet per-coin selection.
+    {
+        let refresh_funding = refresh_funding.clone();
+        ui.global::<Callbacks>().on_funding_open(move || {
+            log::info!("cb: funding-open");
+            refresh_funding();
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let funding_pick = funding_pick.clone();
+        let refresh_funding = refresh_funding.clone();
+        let refresh_change = refresh_change.clone();
+        ui.global::<Callbacks>().on_funding_toggle_coin(move |key| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if let Some((spending_src, txid, vout)) = parse_funding_key(key.as_str()) {
+                funding_pick.borrow_mut().toggle(spending_src, txid, vout);
+            }
+            refresh_funding();
+            refresh_change();
+            ui.global::<Callbacks>().invoke_compose_changed();
+        });
+    }
+    {
+        let funding_pick = funding_pick.clone();
+        ui.global::<Callbacks>().on_funding_done(move || {
+            let pick = funding_pick.borrow();
+            log::info!(
+                "cb: pay-from {} coins={}",
+                pick.mode_label(),
+                pick.notebook.len() + pick.spending.len()
+            );
+        });
+    }
+
+    // Change screen (26): compose destination for change.
+    {
+        let refresh_change = refresh_change.clone();
+        ui.global::<Callbacks>().on_change_open(move || {
+            refresh_change();
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let change_pick = change_pick.clone();
+        let refresh_change = refresh_change.clone();
+        ui.global::<Callbacks>().on_change_pick(move |choice| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            change_pick.borrow_mut().choice = choice.to_string();
+            ui.global::<ChangePick>().set_choice(choice.clone());
+            ui.global::<ChangePick>().set_custom_error("".into());
+            log::info!("cb: change-pick {choice}");
+            refresh_change();
+            ui.global::<Callbacks>().invoke_compose_changed();
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        let change_pick = change_pick.clone();
+        ui.global::<Callbacks>().on_change_address_changed(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            change_pick.borrow_mut().custom_address =
+                ui.global::<ChangePick>().get_custom_address().to_string();
+            ui.global::<ChangePick>().set_custom_error("".into());
+            ui.global::<Callbacks>().invoke_compose_changed();
+        });
+    }
+    {
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_change_done(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            ui.global::<Callbacks>().invoke_compose_changed();
+        });
+    }
+
     // Edge-tracks whether the compose draft is over the broadcast ceiling, so
     // the "too large" dialog pops once on crossing — not on every keystroke.
     let compose_oversize = Rc::new(std::cell::Cell::new(false));
@@ -1584,6 +2110,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let compose_oversize = compose_oversize.clone();
+        let funding_pick = funding_pick.clone();
+        let change_pick = change_pick.clone();
+        let notebooks = notebooks.clone();
+        let net = net.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let active = active.clone();
         ui.global::<Callbacks>().on_compose_changed(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let compose = ui.global::<Compose>();
@@ -1623,7 +2156,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 compose_oversize.set(false); // clearing the draft re-arms the dialog
                 return;
             }
-            if st.utxos.is_empty() {
+            let ix = notebooks.borrow();
+            let ctx = notebook_ctx(&ix, *active.borrow())
+                .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
+            let net_s = net.borrow().clone();
+            let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
+            drop(ix);
+            if st.utxos.is_empty() && section.as_ref().map(|s| s.balance()).unwrap_or(0) == 0 {
                 compose
                     .set_cost_line("No funds — fund the address and import a sync bundle.".into());
                 compose.set_can_continue(false);
@@ -1703,35 +2242,158 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 return;
             }
             compose_oversize.set(false);
-            match est {
-                Ok((chunks, vsize)) => {
-                    let fee = (vsize as f64 * rate).ceil() as u64;
-                    if fee + gift > st.balance() {
-                        compose.set_cost_line(
-                            format!("Needs ~{} sats — balance is {}.", fee + gift, st.balance())
+
+            let pick = funding_pick.borrow();
+            let sp_participates = !pick.spending.is_empty();
+            let mode_auto = !pick.touched && !sp_participates;
+
+            if mode_auto {
+                // Byte-identical to pre-funding-unification behavior.
+                match est {
+                    Ok((chunks, vsize)) => {
+                        let fee = (vsize as f64 * rate).ceil() as u64;
+                        if fee + gift > st.balance() {
+                            compose.set_cost_line(
+                                format!("Needs ~{} sats — balance is {}.", fee + gift, st.balance())
+                                    .into(),
+                            );
+                            compose.set_can_continue(false);
+                        } else {
+                            compose.set_cost_line(
+                                format!(
+                                    "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}",
+                                    sats_line(fee, st.btc_usd),
+                                    if directed {
+                                        format!(" + {gift} sats to recipient")
+                                    } else {
+                                        String::new()
+                                    }
+                                )
                                 .into(),
-                        );
+                            );
+                            compose.set_can_continue(true);
+                        }
+                    }
+                    Err(e) => {
+                        compose.set_cost_line(format!("{e}").into());
                         compose.set_can_continue(false);
-                    } else {
-                        compose.set_cost_line(
-                            format!(
-                                "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}",
-                                sats_line(fee, st.btc_usd),
-                                if directed {
-                                    format!(" + {gift} sats to recipient")
-                                } else {
-                                    String::new()
-                                }
-                            )
-                            .into(),
-                        );
-                        compose.set_can_continue(true);
                     }
                 }
+                return;
+            }
+
+            // Exact-selected-coins preview (notebook subset, spending, or
+            // mixed): real selected input kinds/count and real extra
+            // outputs, unlike `estimate_note_cost`'s single-taproot-input
+            // approximation above (used only for `fit_check`'s ceiling test).
+            let payload_lens = match payload_lens_for(text_len, private, effective) {
+                Ok(v) => v,
                 Err(e) => {
-                    compose.set_cost_line(format!("{e}").into());
+                    compose.set_cost_line(e.into());
                     compose.set_can_continue(false);
+                    return;
                 }
+            };
+            let chunks = payload_lens.len();
+            let n_notebook = pick.notebook.len();
+            let n_spending = pick.spending.len();
+            if n_notebook + n_spending == 0 {
+                compose.set_cost_line("Select at least one coin — \"Pay from\" above.".into());
+                compose.set_can_continue(false);
+                return;
+            }
+            let kinds: Vec<InputKind> = std::iter::repeat(InputKind::Taproot)
+                .take(n_notebook)
+                .chain(std::iter::repeat(InputKind::P2wpkh).take(n_spending))
+                .collect();
+            let cp = change_pick.borrow();
+            let change_len = match change_spk_len_preview(
+                &cp.choice,
+                &cp.custom_address,
+                st.network(),
+                sp_participates,
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    compose.set_cost_line(e.into());
+                    compose.set_can_continue(false);
+                    return;
+                }
+            };
+            drop(cp);
+            let nb_total: u64 = st
+                .utxos
+                .iter()
+                .filter(|u| pick.is_selected(false, &u.txid, u.vout))
+                .map(|u| u.value)
+                .sum();
+            let sp_total: u64 = section
+                .as_ref()
+                .map(|s| {
+                    s.utxos
+                        .iter()
+                        .filter(|u| pick.is_selected(true, &u.txid, u.vout))
+                        .map(|u| u.value)
+                        .sum()
+                })
+                .unwrap_or(0);
+            let in_value = nb_total + sp_total;
+            let dust_needed = if sp_participates { notes_core::DUST_LIMIT } else { 0 };
+
+            let mut extra_with_change: Vec<usize> = Vec::new();
+            if let Some(l) = recipient_spk_len {
+                extra_with_change.push(l);
+            }
+            if sp_participates {
+                extra_with_change.push(34); // notebook dust spk (P2TR, always 34 bytes)
+            }
+            extra_with_change.push(change_len);
+            let vsize_with_change = estimate_vsize_mixed(&kinds, &payload_lens, &extra_with_change);
+            let fee_with_change = (vsize_with_change as f64 * rate).ceil() as u64;
+            let leftover_with_change =
+                in_value.checked_sub(fee_with_change + gift + dust_needed);
+
+            let (vsize, fee, ok) = match leftover_with_change {
+                Some(v) if v >= notes_core::DUST_LIMIT => (vsize_with_change, fee_with_change, true),
+                _ => {
+                    let mut extra_no_change: Vec<usize> = Vec::new();
+                    if let Some(l) = recipient_spk_len {
+                        extra_no_change.push(l);
+                    }
+                    if sp_participates {
+                        extra_no_change.push(34);
+                    }
+                    let vsize2 = estimate_vsize_mixed(&kinds, &payload_lens, &extra_no_change);
+                    let fee2 = (vsize2 as f64 * rate).ceil() as u64;
+                    let ok2 = matches!(in_value.checked_sub(fee2 + gift + dust_needed), Some(v) if v <= notes_core::DUST_LIMIT);
+                    (vsize2, fee2, ok2)
+                }
+            };
+            if !ok {
+                compose.set_cost_line(
+                    format!(
+                        "Needs ~{} sats — selected coins total {}.",
+                        fee + gift + dust_needed,
+                        in_value
+                    )
+                    .into(),
+                );
+                compose.set_can_continue(false);
+            } else {
+                compose.set_cost_line(
+                    format!(
+                        "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}{}",
+                        sats_line(fee, st.btc_usd),
+                        if directed { format!(" + {gift} sats to recipient") } else { String::new() },
+                        if sp_participates {
+                            format!(" + {} sats dust to notebook", notes_core::DUST_LIMIT)
+                        } else {
+                            String::new()
+                        }
+                    )
+                    .into(),
+                );
+                compose.set_can_continue(true);
             }
         });
     }
@@ -1741,6 +2403,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let identity = identity.clone();
         let plan = plan.clone();
+        let notebooks = notebooks.clone();
+        let net = net.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let active = active.clone();
+        let app_seed = app_seed.clone();
+        let funding_pick = funding_pick.clone();
+        let change_pick = change_pick.clone();
         ui.global::<Callbacks>().on_compose_continue(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.global::<Ui>().set_busy(true);
@@ -1748,6 +2418,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let state = state.clone();
             let identity = identity.clone();
             let plan = plan.clone();
+            let notebooks = notebooks.clone();
+            let net = net.clone();
+            let seed_idx = seed_idx.clone();
+            let bip_account = bip_account.clone();
+            let active = active.clone();
+            let app_seed = app_seed.clone();
+            let funding_pick = funding_pick.clone();
+            let change_pick = change_pick.clone();
             // Let the busy overlay paint one frame before the blocking work.
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
@@ -1761,7 +2439,27 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
                 let st = state.borrow();
                 let id_guard = identity.borrow();
-                let result = id_guard
+                let pick = funding_pick.borrow().clone();
+                let change_choice = change_pick.borrow().clone();
+                let ix = notebooks.borrow();
+                let ctx = notebook_ctx(&ix, *active.borrow())
+                    .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
+                let net_s = net.borrow().clone();
+                let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
+                drop(ix);
+
+                // (note_id, note, spending inputs spent, spending change addr
+                // to mark used, change went to notebook?, mandatory notebook
+                // dust output present?)
+                type ComposeOut = (
+                    [u8; 4],
+                    NoteTx,
+                    Vec<(String, u32)>,
+                    Option<spending::SpendingAddress>,
+                    bool,
+                    bool,
+                );
+                let result: Result<ComposeOut, String> = id_guard
                     .as_ref()
                     .ok_or_else(|| "identity unavailable".to_string())
                     .and_then(|id| {
@@ -1771,49 +2469,224 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             st.notes.iter().any(|n| n.id == id_hex)
                         })
                         .map_err(|e| e.to_string())?;
-                        let note = if directed {
-                            let recipient = Recipient::parse(st.network(), &to_address)
-                                .map_err(|e| e.to_string())?;
-                            // Gift amount: the recipient output carries `gift`
-                            // sats (>= dust). change_spk None = change to self.
-                            compose_directed_note_with_change_amount(
-                                id,
-                                &st.core_utxos(),
-                                &text,
-                                private,
-                                note_id,
-                                &recipient,
-                                gift,
-                                None,
-                                st.effective_chunk(),
-                                rate,
-                                || generate_aux_rand(),
-                            )
+                        let recipient = if directed {
+                            Some(Recipient::parse(st.network(), &to_address).map_err(|e| e.to_string())?)
                         } else {
-                            compose_note(
+                            None
+                        };
+                        let sp_participates = !pick.spending.is_empty();
+                        let mode_auto = !pick.touched && !sp_participates;
+
+                        if mode_auto {
+                            // Byte-identical input selection to before this
+                            // feature — change destination is still
+                            // independently resolvable (the picker screen).
+                            let (change_spk, _) = resolve_change(
+                                &change_choice.choice,
+                                &change_choice.custom_address,
+                                st.network(),
+                                &id.output_x,
+                                false,
+                                &app_seed.as_ref().ok_or("identity unavailable")?,
+                                ctx.0,
+                                ctx.1,
+                                0,
+                            )?;
+                            let change_is_notebook = change_choice.choice != "custom";
+                            let note = if let Some(r) = &recipient {
+                                compose_directed_note_with_change_amount(
+                                    id,
+                                    &st.core_utxos(),
+                                    &text,
+                                    private,
+                                    note_id,
+                                    r,
+                                    gift,
+                                    Some(&change_spk),
+                                    st.effective_chunk(),
+                                    rate,
+                                    || generate_aux_rand(),
+                                )
+                            } else {
+                                notes_core::bundle::compose_note_with_change(
+                                    id,
+                                    &st.core_utxos(),
+                                    &text,
+                                    private,
+                                    note_id,
+                                    Some(&change_spk),
+                                    st.effective_chunk(),
+                                    rate,
+                                    || generate_aux_rand(),
+                                )
+                            }
+                            .map_err(|e| e.to_string())?;
+                            Ok((note_id, note, Vec::new(), None, change_is_notebook, false))
+                        } else if !sp_participates {
+                            // Notebook-only coin control (a subset was
+                            // explicitly picked, or explicitly re-confirmed).
+                            let inputs: Vec<Utxo> = st
+                                .utxos
+                                .iter()
+                                .filter(|u| pick.is_selected(false, &u.txid, u.vout))
+                                .filter_map(|u| {
+                                    let mut txid = [0u8; 32];
+                                    hex::decode_to_slice(&u.txid, &mut txid).ok()?;
+                                    txid.reverse();
+                                    Some(Utxo { txid, vout: u.vout, value: u.value })
+                                })
+                                .collect();
+                            if inputs.is_empty() {
+                                return Err("Select at least one coin to pay from.".into());
+                            }
+                            let (change_spk, _) = resolve_change(
+                                &change_choice.choice,
+                                &change_choice.custom_address,
+                                st.network(),
+                                &id.output_x,
+                                false,
+                                &app_seed.as_ref().ok_or("identity unavailable")?,
+                                ctx.0,
+                                ctx.1,
+                                0,
+                            )?;
+                            let change_is_notebook = change_choice.choice != "custom";
+                            let note = if let Some(r) = &recipient {
+                                compose_directed_note_exact_amount(
+                                    id,
+                                    &inputs,
+                                    &text,
+                                    private,
+                                    note_id,
+                                    r,
+                                    gift,
+                                    Some(&change_spk),
+                                    st.effective_chunk(),
+                                    rate,
+                                    || generate_aux_rand(),
+                                )
+                            } else {
+                                compose_note_exact(
+                                    id,
+                                    &inputs,
+                                    &text,
+                                    private,
+                                    note_id,
+                                    Some(&change_spk),
+                                    st.effective_chunk(),
+                                    rate,
+                                    || generate_aux_rand(),
+                                )
+                            }
+                            .map_err(|e| e.to_string())?;
+                            Ok((note_id, note, Vec::new(), None, change_is_notebook, false))
+                        } else {
+                            // Spending-wallet participates (pure spending or
+                            // mixed with notebook coins) — mixed builder,
+                            // mandatory notebook-dust output.
+                            let seed: &[u8; 32] =
+                                &app_seed.as_ref().ok_or("identity unavailable")?;
+                            let notebook_dust_spk = p2tr_script_pubkey(&id.output_x);
+                            let mut mixed_inputs: Vec<MixedInput> = Vec::new();
+                            for u in
+                                st.utxos.iter().filter(|u| pick.is_selected(false, &u.txid, u.vout))
+                            {
+                                let mut txid = [0u8; 32];
+                                hex::decode_to_slice(&u.txid, &mut txid)
+                                    .map_err(|_| "bad notebook txid".to_string())?;
+                                txid.reverse();
+                                mixed_inputs.push(MixedInput {
+                                    utxo: Utxo { txid, vout: u.vout, value: u.value },
+                                    prevout_spk: notebook_dust_spk.clone(),
+                                    kind: InputKind::Taproot,
+                                    seckey: id.tweaked_seckey,
+                                });
+                            }
+                            let sec =
+                                section.as_ref().ok_or("spending wallet not set up".to_string())?;
+                            let mut spent_spending: Vec<(String, u32)> = Vec::new();
+                            for su in
+                                sec.utxos.iter().filter(|u| pick.is_selected(true, &u.txid, u.vout))
+                            {
+                                let key = notes_core::seeds::derive_spending_key(
+                                    seed,
+                                    ctx.0,
+                                    st.network(),
+                                    ctx.1,
+                                    su.chain,
+                                    su.index,
+                                )
+                                .map_err(|e| e.to_string())?;
+                                let mut txid = [0u8; 32];
+                                hex::decode_to_slice(&su.txid, &mut txid)
+                                    .map_err(|_| "bad spending txid".to_string())?;
+                                txid.reverse();
+                                mixed_inputs.push(MixedInput {
+                                    utxo: Utxo { txid, vout: su.vout, value: su.value },
+                                    prevout_spk: key.script_pubkey.clone(),
+                                    kind: InputKind::P2wpkh,
+                                    seckey: key.seckey,
+                                });
+                                spent_spending.push((su.txid.clone(), su.vout));
+                            }
+                            if mixed_inputs.is_empty() {
+                                return Err("Select at least one coin to pay from.".into());
+                            }
+                            let (payloads, recipient_spk) = sealed_note_payloads(
                                 id,
-                                &st.core_utxos(),
                                 &text,
                                 private,
+                                recipient.as_ref(),
                                 note_id,
                                 st.effective_chunk(),
+                            )
+                            .map_err(|e| e.to_string())?;
+                            let recipient_amount = if recipient.is_some() { gift } else { 0 };
+                            let (change_spk, change_addr) = resolve_change(
+                                &change_choice.choice,
+                                &change_choice.custom_address,
+                                st.network(),
+                                &id.output_x,
+                                true,
+                                seed,
+                                ctx.0,
+                                ctx.1,
+                                sec.next_change,
+                            )?;
+                            let change_is_notebook = change_choice.choice == "notebook";
+                            let note = build_note_tx_mixed_exact(
+                                &mixed_inputs,
+                                &payloads,
+                                recipient_spk.as_deref(),
+                                recipient_amount,
+                                &notebook_dust_spk,
+                                &change_spk,
                                 rate,
                                 || generate_aux_rand(),
                             )
-                        };
-                        note.map(|n| (note_id, n)).map_err(|e| e.to_string())
+                            .map_err(|e| e.to_string())?;
+                            Ok((
+                                note_id,
+                                note,
+                                spent_spending,
+                                change_addr,
+                                change_is_notebook,
+                                true,
+                            ))
+                        }
                     });
                 ui.global::<Ui>().set_busy(false);
                 match result {
-                    Ok((note_id, note)) => {
+                    Ok((note_id, note, spending_spent, spending_change_addr, change_is_notebook, notebook_dust)) => {
                         let chunks = note
                             .tx
                             .outputs
                             .iter()
                             .filter(|o| o.script_pubkey.first() == Some(&0x6a))
                             .count() as u64;
+                        let funded_by = pick.mode_label();
                         log::info!(
-                            "cb: compose len={} private={} to={} chunks={} fee={} vsize={} gift={} txid={} ok",
+                            "cb: compose len={} private={} to={} chunks={} fee={} vsize={} gift={} funded={funded_by} txid={} ok",
                             text.len(),
                             private,
                             if directed { to_address.as_str() } else { "self" },
@@ -1823,10 +2696,38 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             note.sent,
                             note.txid_hex
                         );
-                        let balance_after = st.balance() - note.fee - note.sent;
+                        // Notebook balance after signing: subtract whatever
+                        // notebook-owned value this tx actually spent (all of
+                        // it, via fee+sent+change, when funding was pure
+                        // notebook — the pre-feature formula; else exactly
+                        // the selected notebook coins, 0 for pure spending),
+                        // add back the mandatory dust + any change that
+                        // landed back in the notebook.
+                        let notebook_spent: u64 = if !pick.spending.is_empty() {
+                            st.utxos
+                                .iter()
+                                .filter(|u| pick.is_selected(false, &u.txid, u.vout))
+                                .map(|u| u.value)
+                                .sum()
+                        } else {
+                            note.fee + note.sent + note.change
+                        };
+                        let notebook_gained: u64 =
+                            (if notebook_dust { notes_core::DUST_LIMIT } else { 0 })
+                                + if change_is_notebook { note.change } else { 0 };
+                        let balance_after = st.balance() - notebook_spent + notebook_gained;
+                        let change_dest_line = if note.change == 0 {
+                            String::new()
+                        } else if change_is_notebook {
+                            format!("\nchange back to your notebook: {} sats", note.change)
+                        } else if spending_change_addr.is_some() {
+                            format!("\nchange to a fresh spending-wallet address: {} sats", note.change)
+                        } else {
+                            format!("\nchange to your custom address: {} sats", note.change)
+                        };
                         ui.global::<Confirm>().set_summary(
                             format!(
-                                "{}{}\n\nsize: {} bytes in {} chunk(s)\ntx: {} vB · {} input(s)\nfee: {}{}\nchange back to you: {} sats\nbalance after: {} sats\n\ntxid:\n{}",
+                                "{}{}\n\nfunded by: {funded_by}\nsize: {} bytes in {} chunk(s)\ntx: {} vB · {} input(s)\nfee: {}{}{}{}\nbalance after: {} sats\n\ntxid:\n{}",
                                 match (private, directed) {
                                     (true, true) => "PRIVATE — sealed for the recipient (ECDH)",
                                     (true, false) => "PRIVATE — encrypted with your device seed",
@@ -1847,15 +2748,30 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 } else {
                                     String::new()
                                 },
-                                note.change,
+                                if notebook_dust {
+                                    format!("\ndust to notebook (discoverability): {} sats", notes_core::DUST_LIMIT)
+                                } else {
+                                    String::new()
+                                },
+                                change_dest_line,
                                 balance_after,
                                 note.txid_hex
                             )
                             .into(),
                         );
                         let recipient = if directed { Some(to_address) } else { None };
-                        *plan.borrow_mut() =
-                            Some(Plan { note, text, private, note_id, chunks, recipient });
+                        *plan.borrow_mut() = Some(Plan {
+                            note,
+                            text,
+                            private,
+                            note_id,
+                            chunks,
+                            recipient,
+                            spending_spent,
+                            spending_change_addr,
+                            change_is_notebook,
+                            notebook_dust,
+                        });
                         ui.global::<Ui>().set_screen(4);
                     }
                     Err(e) => {
@@ -1873,6 +2789,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let plan = plan.clone();
         let fs = fs.clone();
         let refresh_notes = refresh_notes.clone();
+        let notebooks = notebooks.clone();
+        let net = net.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let active = active.clone();
+        let refresh_funding = refresh_funding.clone();
+        let funding_pick = funding_pick.clone();
+        let change_pick = change_pick.clone();
         ui.global::<Callbacks>().on_confirm_sign(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let Some(p) = plan.borrow_mut().take() else { return };
@@ -1881,12 +2805,23 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let state = state.clone();
             let fs = fs.clone();
             let refresh_notes = refresh_notes.clone();
+            let notebooks = notebooks.clone();
+            let net = net.clone();
+            let seed_idx = seed_idx.clone();
+            let bip_account = bip_account.clone();
+            let active = active.clone();
+            let refresh_funding = refresh_funding.clone();
+            let funding_pick = funding_pick.clone();
+            let change_pick = change_pick.clone();
             Timer::single_shot(Duration::from_millis(150), move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
                 let mut st = state.borrow_mut();
 
-                // Ledger: drop spent inputs, add our own change (chaining
-                // between syncs — several notes can queue unconfirmed).
+                // Notebook ledger: drop spent notebook inputs. Spending-wallet
+                // inputs (if any) are dropped from the SEPARATE spending
+                // ledger below via `p.spending_spent` — `p.note.spent_outpoints`
+                // covers both kinds, but only notebook outpoints ever match
+                // an entry in `st.utxos`, so this retain is safe either way.
                 let spent: Vec<(String, u32)> = p
                     .note
                     .spent_outpoints
@@ -1898,14 +2833,55 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     })
                     .collect();
                 st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
-                if p.note.change > 0 {
+
+                // Output order: OP_RETURN(s), [directed recipient], [notebook
+                // dust — mandatory whenever the spending wallet funded any
+                // part of this note], [change]. `p.chunks` + the recipient
+                // flag place the dust; +1 more when it's present places change.
+                let dust_vout = p.chunks as u32 + u32::from(p.recipient.is_some());
+                if p.notebook_dust {
                     st.utxos.push(UtxoRec {
                         txid: p.note.txid_hex.clone(),
-                        // Change follows the OP_RETURNs — and, for directed
-                        // notes, the recipient dust output.
-                        vout: p.chunks as u32 + u32::from(p.recipient.is_some()),
+                        vout: dust_vout,
+                        value: notes_core::DUST_LIMIT,
+                    });
+                }
+                let change_vout = dust_vout + u32::from(p.notebook_dust);
+                if p.note.change > 0 && p.change_is_notebook {
+                    st.utxos.push(UtxoRec {
+                        txid: p.note.txid_hex.clone(),
+                        vout: change_vout,
                         value: p.note.change,
                     });
+                }
+                // Custom/external change: not our coin, nothing to track
+                // (matches how a directed recipient's dust isn't tracked).
+
+                // Spending ledger: drop spent inputs + add change (if it
+                // went to a fresh spending address) in one pass — mirrors
+                // the notebook ledger's unconfirmed-chaining update above.
+                if !p.spending_spent.is_empty() || p.spending_change_addr.is_some() {
+                    let mut ix = notebooks.borrow_mut();
+                    let ctx = notebook_ctx(&ix, *active.borrow())
+                        .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
+                    let net_s = net.borrow().clone();
+                    let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
+                    let change_coin =
+                        if p.note.change > 0 { p.spending_change_addr.as_ref() } else { None };
+                    if let Some(addr) = change_coin {
+                        sec.mark_used(addr.clone());
+                    }
+                    sec.apply_spend(
+                        &p.spending_spent,
+                        change_coin.map(|addr| spending::SpendingUtxo {
+                            txid: p.note.txid_hex.clone(),
+                            vout: change_vout,
+                            value: p.note.change,
+                            chain: addr.chain,
+                            index: addr.index,
+                        }),
+                    );
+                    save_notebooks(&fs, &ix);
                 }
 
                 let rec = NoteRec {
@@ -1957,6 +2933,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 st.notes.push(rec.clone());
                 save_state(&fs, &st);
                 drop(st);
+                refresh_funding();
 
                 let view = ui.global::<View>();
                 view.set_id(rec.id.clone().into());
@@ -1980,6 +2957,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // into the next note.
                 ui.global::<Compose>().set_gift_sats("330".into());
                 ui.global::<Compose>().set_gift_expanded(false);
+                // Funding/change picks reset too — a stale coin selection or
+                // custom change address must never leak into the next note.
+                *funding_pick.borrow_mut() = FundingPick::default();
+                *change_pick.borrow_mut() = ChangePickState::default();
+                ui.global::<ChangePick>().set_choice("auto".into());
+                ui.global::<ChangePick>().set_custom_address("".into());
                 ui.global::<Ui>().set_busy(false);
                 refresh_notes();
                 ui.global::<Ui>().set_screen(2);
@@ -2028,6 +3011,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let state = state.clone();
         let identity = identity.clone();
         let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let net = net.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let active = active.clone();
         Rc::new(move |json: &str, src: &str| -> Result<String, String> {
             let id_guard = identity.borrow();
             let id = id_guard.as_ref().ok_or("identity unavailable")?;
@@ -2042,7 +3030,27 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     ));
                 }
 
-                let recovered = extract_notes(&bundle, id, st.network());
+                // Spending-unification: the self-spk SET is the notebook's
+                // own spk plus every address the spending wallet has issued
+                // (`SpendingSection.self_spks`) — extends OWN detection to
+                // funded/mixed-source notes (extract_notes_multi ORs with
+                // the producer's spends_from_self, never narrows).
+                let ix = notebooks.borrow();
+                let ctx = notebook_ctx(&ix, *active.borrow())
+                    .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
+                let net_s = net.borrow().clone();
+                let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
+                drop(ix);
+                let notebook_addr = id.address(st.network());
+                let self_spks: Vec<Vec<u8>> = {
+                    let mut v = vec![p2tr_script_pubkey(&id.output_x)];
+                    if let Some(s) = &section {
+                        v.extend(s.self_spks());
+                    }
+                    v
+                };
+
+                let recovered = extract_notes_multi(&bundle, id, st.network(), &self_spks);
                 let mut new_notes = 0usize;
                 let mut received_notes = 0usize;
                 for r in &recovered {
@@ -2096,11 +3104,45 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     }
                 }
 
-                st.utxos = bundle
-                    .utxos
-                    .iter()
-                    .map(|u| UtxoRec { txid: u.txid.clone(), vout: u.vout, value: u.value })
-                    .collect();
+                // Split the bundle's UTXOs by owner: no `owner_address` (or
+                // one matching the notebook's own address) is a notebook
+                // coin; an address matching a KNOWN spending-wallet `used`
+                // entry routes to the spending ledger (tagged with its
+                // chain/index so signing can re-derive the key). A coin at
+                // an owner address the device hasn't recorded as used yet
+                // is dropped — see the Settings spending card / DEVELOPMENT
+                // notes for the sync-flow limitation this implies.
+                let mut nb_utxos: Vec<UtxoRec> = Vec::new();
+                let mut sp_utxos: Vec<spending::SpendingUtxo> = Vec::new();
+                for u in &bundle.utxos {
+                    match &u.owner_address {
+                        None => {
+                            nb_utxos.push(UtxoRec { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                        }
+                        Some(a) if *a == notebook_addr => {
+                            nb_utxos.push(UtxoRec { txid: u.txid.clone(), vout: u.vout, value: u.value })
+                        }
+                        Some(a) => {
+                            if let Some(used) =
+                                section.as_ref().and_then(|s| s.used.iter().find(|x| &x.address == a))
+                            {
+                                sp_utxos.push(spending::SpendingUtxo {
+                                    txid: u.txid.clone(),
+                                    vout: u.vout,
+                                    value: u.value,
+                                    chain: used.chain,
+                                    index: used.index,
+                                });
+                            }
+                        }
+                    }
+                }
+                st.utxos = nb_utxos;
+                if section.is_some() {
+                    let mut ix = notebooks.borrow_mut();
+                    ix.spending_mut(&net_s, ctx.0, ctx.1).set_utxos(sp_utxos);
+                    save_notebooks(&fs, &ix);
+                }
                 st.tip_height = Some(bundle.tip_height);
                 st.bundle_time = Some(bundle.bundle_time);
                 // Chunk size is a pure device setting — any relay-policy

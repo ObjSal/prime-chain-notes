@@ -49,14 +49,30 @@ impl NotebookMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NotebookIndex {
     pub version: u32,
     pub notebooks: Vec<NotebookMeta>,
+    /// Spending-wallet bookkeeping, one section per (network, seed,
+    /// bip_account) context — account-level, a sibling of `notebooks`
+    /// rather than a per-notebook field, because several sibling notebooks
+    /// of one account share ONE spending wallet (`crate::spending`).
+    #[serde(default)]
+    pub spending: Vec<crate::spending::SpendingSection>,
 }
 
 impl Default for NotebookIndex {
     fn default() -> Self {
-        NotebookIndex { version: 2, notebooks: Vec::new() }
+        NotebookIndex { version: 2, notebooks: Vec::new(), spending: Vec::new() }
+    }
+}
+
+impl crate::spending::SpendingIndex for NotebookIndex {
+    fn spending_sections(&self) -> &[crate::spending::SpendingSection] {
+        &self.spending
+    }
+    fn spending_sections_mut(&mut self) -> &mut Vec<crate::spending::SpendingSection> {
+        &mut self.spending
     }
 }
 

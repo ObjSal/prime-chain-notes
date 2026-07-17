@@ -92,6 +92,16 @@ pub struct BundleUtxo {
     pub value: u64,
     #[serde(default)]
     pub height: Option<u64>,
+    /// The address this coin actually belongs to, when it is NOT the bundle's
+    /// scanned notebook address (funding-unification: a Prime device's
+    /// spending-wallet coins). Empty/absent (serde default) = the scanned
+    /// address, i.e. today's behavior for every existing bundle producer —
+    /// additive, never a narrowing. A companion that also probes the
+    /// spending wallet's known addresses (device-exported list; see
+    /// companion/index.html) sets this so the device can route the coin into
+    /// the right ledger instead of guessing from scriptPubKey shape alone.
+    #[serde(default)]
+    pub owner_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
