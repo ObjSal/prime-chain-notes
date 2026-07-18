@@ -11,20 +11,20 @@ use crate::{Error, DUST_LIMIT};
 
 /// An unspent output of OUR notes address (all inputs are ours by
 /// construction). `txid` is internal byte order (reversed display hex).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Utxo {
     pub txid: [u8; 32],
     pub vout: u32,
     pub value: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxOut {
     pub value: u64,
     pub script_pubkey: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub version: i32,
     pub lock_time: u32,
