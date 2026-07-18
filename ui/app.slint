@@ -1,8 +1,8 @@
 import { Theme, UISize, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize } from "@ui/theme.slint";
-import { Callbacks, Ui, Home, Compose, Confirm, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick } from "callbacks.slint";
+import { Callbacks, Ui, Home, Compose, Confirm, ConfirmSign, ConfirmRow, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick } from "callbacks.slint";
 import { Button } from "@ui/button.slint";
 
-export { Callbacks, Ui, Home, Compose, Confirm, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
+export { Callbacks, Ui, Home, Compose, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
 
 component PrimaryAction inherits Button {
     background: Theme.palette-primary;
@@ -343,6 +343,49 @@ component ContactEntry inherits Rectangle {
                 height: parent.height;
             }
             rename-touch := TouchArea { clicked => { root.rename(); } }
+        }
+    }
+}
+
+// One row on the universal Confirm & sign screen (4) — an input or output
+// decoded from the actual tx bytes (`notes_core::confirm::SummaryRow`).
+// Output rows with no address (the OP_RETURN note row) show the subtitle
+// as the main line instead; an unrecognized-address output ("other") is
+// flagged in the danger color, same convention as the rest of the app.
+component ConfirmRowEntry inherits Rectangle {
+    in property <ConfirmRow> entry;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: entry.kind == "other" ? Theme.palette-danger : Theme.palette-border;
+    VerticalLayout {
+        padding: 10px;
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: entry.title != "" ? entry.title : entry.subtitle;
+                color: Theme.palette-foreground;
+                font-family: "SourceCodePro";
+                font-size: 14px;
+                font-weight: 600;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            if entry.amount != "": Text {
+                text: entry.amount + " sats";
+                color: Theme.palette-foreground;
+                font-family: "SourceCodePro";
+                font-size: 14px;
+                font-weight: 700;
+            }
+        }
+        if entry.title != "": Text {
+            text: entry.subtitle;
+            color: entry.kind == "other" ? Theme.palette-danger : Theme.palette-muted;
+            font-family: "SourceCodePro";
+            font-size: 12px;
+            overflow: elide;
+            wrap: word-wrap;
         }
     }
 }
@@ -919,7 +962,13 @@ export component AppWindow inherits Window {
             Rectangle { vertical-stretch: 1; }
         }
 
-        // ----------------------------------------- screen 4: confirm-sign
+        // ----------------------------------- screen 4: universal Confirm & sign
+        // Shared by compose/sweep/consolidate/external-PSBT: every fact shown
+        // here is decoded from the actual (un)signed tx bytes by notes-core's
+        // `confirm::summarize_signed_tx` — never from the app's own intent —
+        // so it's the last line of defense before anything hits the wire.
+        // The Flickable stretches so the Sign button stays pinned at the
+        // screen's true bottom regardless of how many rows there are.
         if Ui.screen == 4: VerticalLayout {
             width: parent.width;
             height: parent.height;
@@ -927,40 +976,137 @@ export component AppWindow inherits Window {
             padding-right: 24px;
             padding-top: 16px + UISize.control-center-status-bar-height;
             padding-bottom: 24px;
-            spacing: 14px;
+            spacing: 10px;
 
             ScreenHeader {
-                title: "Confirm";
-                back => { Ui.screen = 3; }
+                vertical-stretch: 0;
+                title: "Confirm & sign";
+                back => { Callbacks.confirm-cancel(); }
             }
 
-            Rectangle {
+            Flickable {
                 vertical-stretch: 1;
-                background: Theme.palette-surface;
-                border-radius: 16px;
-                Text {
-                    x: 16px; y: 16px;
-                    width: parent.width - 32px;
-                    text: Confirm.summary;
-                    color: Theme.palette-foreground;
-                    font-family: "SourceCodePro";
-                    font-size: 16px;
-                    wrap: word-wrap;
+                viewport-width: self.width;
+                viewport-height: confirm-content.preferred-height;
+                confirm-content := VerticalLayout {
+                    width: parent.width;
+                    spacing: 12px;
+
+                    Text {
+                        text: ConfirmSign.context;
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
+
+                    Text {
+                        text: "txid: " + ConfirmSign.txid;
+                        color: Theme.palette-muted;
+                        font-family: "SourceCodePro";
+                        font-size: 12px;
+                        wrap: char-wrap;
+                    }
+
+                    if ConfirmSign.warn != "": Rectangle {
+                        background: #332400;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: #eab308;
+                        VerticalLayout {
+                            padding: 12px;
+                            Text {
+                                text: "Heads up: " + ConfirmSign.warn;
+                                color: #eab308;
+                                font-family: "Montserrat";
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    if ConfirmSign.note != "": Rectangle {
+                        background: Theme.palette-surface;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: Theme.palette-border;
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 4px;
+                            Text {
+                                text: "NOTE";
+                                color: Theme.palette-muted;
+                                font-family: "Montserrat";
+                                font-size: 12px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: ConfirmSign.note;
+                                color: Theme.palette-foreground;
+                                font-family: "SourceCodePro";
+                                font-size: 14px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "INPUTS";
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 12px;
+                        font-weight: 700;
+                    }
+                    VerticalLayout {
+                        spacing: 6px;
+                        for row in ConfirmSign.inputs: ConfirmRowEntry { entry: row; }
+                    }
+
+                    Text {
+                        text: "OUTPUTS";
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 12px;
+                        font-weight: 700;
+                    }
+                    VerticalLayout {
+                        spacing: 6px;
+                        for row in ConfirmSign.outputs: ConfirmRowEntry { entry: row; }
+                    }
+
+                    Rectangle {
+                        background: Theme.palette-surface;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: Theme.palette-border;
+                        VerticalLayout {
+                            padding: 12px;
+                            Text {
+                                text: "Fee: " + ConfirmSign.fee-line;
+                                color: Theme.palette-foreground;
+                                font-family: "SourceCodePro";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+                        }
+                    }
                 }
             }
 
             Text {
-                text: "Signing spends real sats and writes this note to the blockchain forever.";
+                vertical-stretch: 0;
+                text: "Signing spends real sats and writes this to the blockchain forever.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
-                font-size: 14px;
+                font-size: 13px;
                 wrap: word-wrap;
                 horizontal-alignment: center;
             }
 
             PrimaryAction {
+                vertical-stretch: 0;
                 width: 100%;
-                text: "Sign & export";
+                text: ConfirmSign.sign-label;
                 clicked => { Callbacks.confirm-sign(); }
             }
         }
@@ -2815,57 +2961,6 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                             text: "Switch to Standard";
                             clicked => { Callbacks.oversize-bump(); }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sweep/consolidate confirm dialog — modal over screen 10, nested in
-        // root (sibling-app overlay gotcha). Anchored near the top like the
-        // other dialogs; the tx is already built + signed at this point.
-        if Sweep.show-confirm: Rectangle {
-            width: parent.width;
-            height: parent.height;
-            background: #00000088;
-            TouchArea { }   // swallow taps outside the panel
-            Rectangle {
-                x: 24px;
-                y: 90px + UISize.control-center-status-bar-height;
-                width: parent.width - 48px;
-                height: sweep-confirm-panel.preferred-height;
-                background: Theme.palette-surface;
-                border-radius: 16px;
-                border-width: 1px;
-                border-color: Theme.palette-border;
-                sweep-confirm-panel := VerticalLayout {
-                    padding: 16px;
-                    spacing: 12px;
-                    Text {
-                        text: Sweep.kind == "consolidate" ? "Consolidate coins?" : "Sweep funds?";
-                        color: Theme.palette-foreground;
-                        font-family: "Montserrat";
-                        font-size: 16px;
-                        font-weight: 600;
-                    }
-                    Text {
-                        text: Sweep.confirm-summary;
-                        color: Theme.palette-muted;
-                        font-family: "SourceCodePro";
-                        font-size: 14px;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: 10px;
-                        SecondaryAction {
-                            horizontal-stretch: 1;
-                            text: "Cancel";
-                            clicked => { Sweep.show-confirm = false; }
-                        }
-                        PrimaryAction {
-                            horizontal-stretch: 1;
-                            text: "Sign & export";
-                            clicked => { Callbacks.sweep-sign(); }
                         }
                     }
                 }

@@ -3,6 +3,7 @@ mod spending;
 mod theme;
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -875,6 +876,101 @@ fn change_spk_len_preview(
     }
 }
 
+// ------------------------------------------------ universal confirm gate
+// (funding-unification's structured "Confirm & sign" screen, screen 4 —
+// every fact shown there is decoded from the actual tx bytes by
+// notes-core's `confirm::summarize_signed_tx`; these helpers only gather
+// the LOOKUPS `ConfirmCtx` needs, never a verdict.)
+
+/// Every scriptPubKey this wallet controls in context (`seed`, `bip_account`)
+/// — every VISIBLE notebook's own P2TR spk (so consolidate-to-self and
+/// cross-notebook outputs classify correctly) plus the spending wallet's
+/// already-issued addresses. Returns (every self spk, the spending-only
+/// subset), matching `ConfirmCtx`'s `self_spks`/`spending_spks` fields.
+fn confirm_self_spks(
+    ix: &notebooks::NotebookIndex,
+    app_seed: &Option<[u8; 32]>,
+    net: &str,
+    ctx: (u32, u32),
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let notebook_spks: Vec<Vec<u8>> = ix
+        .visible(ctx.0, ctx.1)
+        .filter_map(|m| derive_identity(app_seed, m, net))
+        .map(|id| p2tr_script_pubkey(&id.output_x))
+        .collect();
+    let spending_spks: Vec<Vec<u8>> =
+        ix.spending(net, ctx.0, ctx.1).map(|s| s.self_spks()).unwrap_or_default();
+    let mut self_spks = notebook_spks;
+    self_spks.extend(spending_spks.iter().cloned());
+    (self_spks, spending_spks)
+}
+
+/// A short public-note preview decoded from a tx's OP_RETURN output(s) —
+/// used only where the caller doesn't already hold the plaintext (the
+/// external-PSBT flow; compose already has `text` in hand and sweeps carry
+/// no note). Private notes read back as a fixed caption (the ciphertext
+/// isn't readable here either way); no PNTE output at all returns `None`
+/// (hides the confirm screen's NOTE block).
+fn confirm_note_preview(outputs: &[notes_core::tx::TxOut]) -> Option<String> {
+    for o in outputs {
+        let Some(payload) = notes_core::tx::op_return_payload(&o.script_pubkey) else { continue };
+        let Some(chunk) = notes_core::envelope::decode(payload) else { continue };
+        if chunk.flags & notes_core::envelope::FLAG_PRIVATE != 0 {
+            return Some("Private note (encrypted)".to_string());
+        }
+        return Some(match notes_core::envelope::reassemble(&[chunk]) {
+            Ok(body) => String::from_utf8(body).unwrap_or_else(|_| "(unreadable note)".to_string()),
+            Err(_) => "(unreadable note)".to_string(),
+        });
+    }
+    None
+}
+
+/// Populate `ConfirmSign` from notes-core's byte-truth decode of `raw_hex`
+/// and show screen 4 — the shared tail for all three confirm-gate
+/// producers (compose/sweep/psbt). On `Err`, the caller shows the message
+/// on its own origin screen and must NOT navigate.
+fn show_confirm_screen(
+    ui: &AppWindow,
+    kind: &str,
+    raw_hex: &str,
+    ctx: &notes_core::confirm::ConfirmCtx,
+    context_line: String,
+    sign_label: &str,
+) -> Result<(), String> {
+    let summary =
+        notes_core::confirm::summarize_signed_tx(raw_hex, ctx).map_err(|e| e.to_string())?;
+    let to_row = |r: &notes_core::confirm::SummaryRow| ConfirmRow {
+        title: r.title.clone().into(),
+        subtitle: r.subtitle.clone().into(),
+        amount: r.amount.clone().into(),
+        kind: r.kind.clone().into(),
+    };
+    let cs = ui.global::<ConfirmSign>();
+    cs.set_inputs(Rc::new(VecModel::from(summary.inputs.iter().map(to_row).collect::<Vec<_>>())).into());
+    cs.set_outputs(Rc::new(VecModel::from(summary.outputs.iter().map(to_row).collect::<Vec<_>>())).into());
+    cs.set_context(context_line.into());
+    cs.set_txid(summary.txid.clone().into());
+    // Display-only pass-through — `summarize_signed_tx` never reads this
+    // field itself (see `ConfirmCtx::note_preview`'s doc comment).
+    cs.set_note(ctx.note_preview.clone().unwrap_or_default().into());
+    cs.set_fee_line(summary.fee_line.clone().into());
+    cs.set_warn(summary.warn.clone().unwrap_or_default().into());
+    cs.set_kind(kind.into());
+    cs.set_sign_label(sign_label.into());
+    log::info!(
+        "cb: confirm show kind={kind} txid={} fee={} vsize={} inputs={} outputs={} warn={}",
+        summary.txid,
+        summary.fee.map(|f| f.to_string()).unwrap_or_else(|| "?".to_string()),
+        summary.vsize,
+        summary.inputs.len(),
+        summary.outputs.len(),
+        u8::from(summary.warn.is_some()),
+    );
+    ui.global::<Ui>().set_screen(4);
+    Ok(())
+}
+
 // ---------------------------------------------------------------- main
 
 fn app_main(cx: AppContext, ui: AppWindow) {
@@ -888,6 +984,11 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
     let plan: Rc<RefCell<Option<Plan>>> = Rc::new(RefCell::new(None));
     let sweep_plan: Rc<RefCell<Option<SweepPlan>>> = Rc::new(RefCell::new(None));
+    // External PSBT signing (funding-unification): the deserialized-but-
+    // UNSIGNED Psbt scanned in stage A (`on_sign_psbt`), stashed until the
+    // universal confirm screen's Sign tap actually signs it in stage B —
+    // nothing about it is persisted before then.
+    let psbt_pending: Rc<RefCell<Option<notes_core::psbt::Psbt>>> = Rc::new(RefCell::new(None));
 
     // The app seed (GetAppSeed, PIN-gated on hardware) — kept so each
     // notebook's identity can be derived on demand (`Identity::from_bip86`
@@ -1823,7 +1924,6 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 ui.global::<Ui>().set_busy(false);
                 match result {
                     Ok(tx) => {
-                        let total: u64 = sources_raw.iter().flat_map(|(_, _, _, c)| c).map(|u| u.value).sum();
                         let recv = tx.tx.outputs[0].value;
                         let n_notebooks = sources_raw.len();
                         // Spent outpoints per source notebook (display txid).
@@ -1849,156 +1949,82 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             tx.vsize,
                             tx.txid_hex
                         );
-                        // On-chain linkage warning when >1 notebook contributes.
-                        let link = if n_notebooks > 1 {
-                            "\n\nHeads up: this spends coins from several notebooks in one tx, publicly linking their addresses on-chain."
-                        } else {
-                            ""
+                        // ConfirmCtx: byte-truth decode gate (screen 4).
+                        // `sources_raw` already carries each contributing
+                        // notebook's (account, output_x, coins), so the
+                        // prevout labels come straight from it.
+                        let ix = notebooks.borrow();
+                        let (self_spks, spending_spks) =
+                            confirm_self_spks(&ix, &app_seed, &st.network, (*seed_idx.borrow(), *bip_account.borrow()));
+                        let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> =
+                            BTreeMap::new();
+                        for (acct, ox, _, coins) in &sources_raw {
+                            let addr = notes_core::address::taproot_address(st.network(), ox);
+                            let name = notebook_name(&ix, *acct, &short_addr(&addr));
+                            for u in coins.iter() {
+                                let mut t = u.txid;
+                                t.reverse();
+                                prevouts.insert(
+                                    format!("{}:{}", hex::encode(t), u.vout),
+                                    notes_core::confirm::PrevoutInfo {
+                                        value: u.value,
+                                        address: Some(addr.clone()),
+                                        source: format!("Notebook · {name}"),
+                                    },
+                                );
+                            }
+                        }
+                        drop(ix);
+
+                        let cctx = notes_core::confirm::ConfirmCtx {
+                            network: st.network(),
+                            prevouts,
+                            self_spks,
+                            spending_spks,
+                            expected_change: None,
+                            recipient: if consolidate { None } else { Some(dest.clone()) },
+                            recipient_name: None,
+                            note_preview: None,
                         };
-                        sweep.set_confirm_summary(
-                            format!(
-                                "{}\n\ninputs: {} coin(s) from {n_notebooks} notebook(s) · {total} sats\nfee: {}\n{}: {recv} sats{link}\n\ntxid:\n{}",
-                                if consolidate {
-                                    "Consolidates the WHOLE wallet into one coin at this notebook's address."
-                                } else {
-                                    "Sweeps the WHOLE wallet to the destination — this empties every notebook."
-                                },
-                                tx.tx.inputs.len(),
-                                sats_line(tx.fee, st.btc_usd),
-                                if consolidate { "new coin" } else { "destination receives" },
-                                tx.txid_hex
-                            )
-                            .into(),
+                        let mut context_line = format!(
+                            "{} · {}",
+                            if consolidate { "Consolidate" } else { "Sweep" },
+                            st.network
                         );
-                        *sweep_plan.borrow_mut() = Some(SweepPlan {
-                            tx,
-                            kind: if consolidate { "consolidate" } else { "sweep" },
-                            dest: (!consolidate).then(|| dest.clone()),
-                            spent_by_account,
-                            dest_account,
-                        });
-                        sweep.set_show_confirm(true);
+                        if n_notebooks > 1 {
+                            context_line.push_str(&format!(
+                                " - spends coins from {n_notebooks} notebooks, publicly linking their addresses on-chain."
+                            ));
+                        }
+
+                        match show_confirm_screen(
+                            &ui,
+                            kind,
+                            &tx.raw_hex,
+                            &cctx,
+                            context_line,
+                            "Sign & export",
+                        ) {
+                            Ok(()) => {
+                                *sweep_plan.borrow_mut() = Some(SweepPlan {
+                                    tx,
+                                    kind: if consolidate { "consolidate" } else { "sweep" },
+                                    dest: (!consolidate).then(|| dest.clone()),
+                                    spent_by_account,
+                                    dest_account,
+                                });
+                            }
+                            Err(e) => {
+                                log::warn!("cb: confirm summarize err={e}");
+                                sweep.set_cost_line(format!("Cannot show confirm: {e}").into());
+                            }
+                        }
                     }
                     Err(e) => {
                         log::warn!("cb: sweep kind={kind} err={e}");
                         sweep.set_cost_line(format!("Cannot build: {e}").into());
                     }
                 }
-            });
-        });
-    }
-
-    // Confirmed: persist the ledger effect, export the signed tx (internal +
-    // Airlock outbox), and hand off on the shared "Signed" screen (8) with
-    // the broadcast QR. Money flows return home from there.
-    {
-        let ui_weak = ui_weak.clone();
-        let state = state.clone();
-        let sweep_plan = sweep_plan.clone();
-        let fs = fs.clone();
-        let active = active.clone();
-        let net = net.clone();
-        let refresh_home = refresh_home.clone();
-        ui.global::<Callbacks>().on_sweep_sign(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let Some(p) = sweep_plan.borrow_mut().take() else { return };
-            ui.global::<Ui>().set_busy(true);
-            let ui_weak = ui_weak.clone();
-            let state = state.clone();
-            let fs = fs.clone();
-            let active = active.clone();
-            let net = net.clone();
-            let refresh_home = refresh_home.clone();
-            Timer::single_shot(Duration::from_millis(150), move || {
-                let Some(ui) = ui_weak.upgrade() else { return };
-                let mut st = state.borrow_mut();
-                let active_acct = active.borrow().unwrap_or(p.dest_account);
-
-                // Wallet-level ledger: remove each notebook's spent inputs
-                // from its own state file (the active one via the live
-                // `st`); a consolidate's single output lands in the
-                // destination notebook as its new (unconfirmed) coin.
-                let inputs: usize = p.spent_by_account.iter().map(|(_, o)| o.len()).sum();
-                let recv = p.tx.tx.outputs[0].value;
-                for (acct, spent) in &p.spent_by_account {
-                    if *acct == active_acct {
-                        st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
-                    } else {
-                        let mut other = load_state(&fs, &net.borrow(), *acct);
-                        other.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
-                        save_state(&fs, &other);
-                    }
-                }
-                if p.kind == "consolidate" {
-                    let coin = UtxoRec { txid: p.tx.txid_hex.clone(), vout: 0, value: recv };
-                    if p.dest_account == active_acct {
-                        st.utxos.push(coin);
-                    } else {
-                        let mut dest = load_state(&fs, &net.borrow(), p.dest_account);
-                        dest.utxos.push(coin);
-                        save_state(&fs, &dest);
-                    }
-                }
-
-                let file = format!("{OUTBOX_DIR}/{}.hex", p.tx.txid_hex);
-                let internal = ensure_dir(&fs, OUTBOX_DIR, Location::User)
-                    .and_then(|_| write_file(&fs, &file, Location::User, p.tx.raw_hex.as_bytes()));
-                let airlock = ensure_airlock_mounted(&fs).and_then(|_| {
-                    let r = ensure_dir(&fs, OUTBOX_DIR, Location::Airlock).and_then(|_| {
-                        write_file(&fs, &file, Location::Airlock, p.tx.raw_hex.as_bytes())
-                    });
-                    unmount_airlock(&fs);
-                    r
-                });
-                save_state(&fs, &st);
-                log::info!(
-                    "cb: sign-sweep kind={} txid={} fee={} internal={} airlock={}",
-                    p.kind,
-                    p.tx.txid_hex,
-                    p.tx.fee,
-                    if internal.is_ok() { "ok" } else { "err" },
-                    if airlock.is_ok() { "ok" } else { "err" },
-                );
-                drop(st);
-
-                let sp = ui.global::<SignPsbt>();
-                sp.set_summary(
-                    format!(
-                        "{}\nfee {} sats · {} vB\ntxid: {}",
-                        match (p.kind, &p.dest) {
-                            ("consolidate", _) =>
-                                format!("Consolidated {inputs} coin(s) into one · {recv} sats"),
-                            (_, Some(d)) =>
-                                format!("Swept {inputs} coin(s) · {recv} sats to {}", short_addr(d)),
-                            _ => format!("Swept {inputs} coin(s) · {recv} sats"),
-                        },
-                        p.tx.fee,
-                        p.tx.vsize,
-                        p.tx.txid_hex
-                    )
-                    .into(),
-                );
-                if p.tx.raw_hex.len() <= MAX_QR_HEX_CHARS {
-                    sp.set_qr(qr_image(&p.tx.raw_hex.to_uppercase()));
-                    sp.set_has_qr(true);
-                } else {
-                    sp.set_has_qr(false);
-                }
-                sp.set_back_screen(0);
-
-                // Reset the sweep flow so nothing leaks into the next run.
-                let sweep = ui.global::<Sweep>();
-                sweep.set_show_confirm(false);
-                sweep.set_dest("".into());
-                sweep.set_dest_label("".into());
-                sweep.set_tier(1);
-                sweep.set_cost_line("".into());
-                sweep.set_can_continue(false);
-                ui.global::<Contacts>().set_pick_mode("compose".into());
-
-                ui.global::<Ui>().set_busy(false);
-                refresh_home();
-                ui.global::<Ui>().set_screen(8);
             });
         });
     }
@@ -2696,83 +2722,158 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             note.sent,
                             note.txid_hex
                         );
-                        // Notebook balance after signing: subtract whatever
-                        // notebook-owned value this tx actually spent (all of
-                        // it, via fee+sent+change, when funding was pure
-                        // notebook — the pre-feature formula; else exactly
-                        // the selected notebook coins, 0 for pure spending),
-                        // add back the mandatory dust + any change that
-                        // landed back in the notebook.
-                        let notebook_spent: u64 = if !pick.spending.is_empty() {
-                            st.utxos
+                        let recipient = if directed { Some(to_address.clone()) } else { None };
+                        let recipient_name = if directed {
+                            st.contacts
                                 .iter()
-                                .filter(|u| pick.is_selected(false, &u.txid, u.vout))
-                                .map(|u| u.value)
-                                .sum()
+                                .find(|c| c.address == to_address && !c.name.is_empty())
+                                .map(|c| c.name.clone())
                         } else {
-                            note.fee + note.sent + note.change
+                            None
                         };
-                        let notebook_gained: u64 =
-                            (if notebook_dust { notes_core::DUST_LIMIT } else { 0 })
-                                + if change_is_notebook { note.change } else { 0 };
-                        let balance_after = st.balance() - notebook_spent + notebook_gained;
-                        let change_dest_line = if note.change == 0 {
-                            String::new()
-                        } else if change_is_notebook {
-                            format!("\nchange back to your notebook: {} sats", note.change)
-                        } else if spending_change_addr.is_some() {
-                            format!("\nchange to a fresh spending-wallet address: {} sats", note.change)
+
+                        // ConfirmCtx: the universal byte-truth decode gate
+                        // (screen 4) — every fact it shows comes from
+                        // decoding `note.raw_hex` itself; this only gathers
+                        // the LOOKUPS (source labels, self/change spks).
+                        let active_acct = active.borrow().unwrap_or(0);
+                        let ix = notebooks.borrow();
+                        let active_name = {
+                            let short = id_guard
+                                .as_ref()
+                                .map(|id| short_addr(&id.address(st.network())))
+                                .unwrap_or_default();
+                            notebook_name(&ix, active_acct, &short)
+                        };
+                        let (mut self_spks, mut spending_spks) =
+                            confirm_self_spks(&ix, &app_seed, &net_s, ctx);
+                        drop(ix);
+                        // A fresh spending-wallet change address this very
+                        // tx pays isn't in `used` yet (marked only after a
+                        // successful sign) — add it so the change output
+                        // classifies as ours, not "other".
+                        if let Some(addr) = &spending_change_addr {
+                            if let Ok(spk) = hex::decode(&addr.spk_hex) {
+                                if !spending_spks.iter().any(|s| s == &spk) {
+                                    spending_spks.push(spk.clone());
+                                }
+                                if !self_spks.iter().any(|s| s == &spk) {
+                                    self_spks.push(spk);
+                                }
+                            }
+                        }
+
+                        // Addresses of any spending-wallet coins this tx
+                        // spent, for the input rows' title (best-effort —
+                        // display only, never affects classification).
+                        let spending_addrs: std::collections::HashMap<(String, u32), String> =
+                            if spending_spent.is_empty() {
+                                Default::default()
+                            } else {
+                                section
+                                    .as_ref()
+                                    .into_iter()
+                                    .flat_map(|s| s.utxos.iter())
+                                    .filter(|u| {
+                                        spending_spent.iter().any(|(t, v)| *t == u.txid && *v == u.vout)
+                                    })
+                                    .filter_map(|u| {
+                                        let seed_bytes = (*app_seed).as_ref()?;
+                                        notes_core::seeds::derive_spending_key(
+                                            seed_bytes,
+                                            ctx.0,
+                                            st.network(),
+                                            ctx.1,
+                                            u.chain,
+                                            u.index,
+                                        )
+                                        .ok()
+                                        .map(|k| ((u.txid.clone(), u.vout), k.address))
+                                    })
+                                    .collect()
+                            };
+
+                        let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> =
+                            BTreeMap::new();
+                        for u in &note.tx.inputs {
+                            let mut t = u.txid;
+                            t.reverse();
+                            let txid_hex = hex::encode(t);
+                            let is_spending =
+                                spending_spent.iter().any(|(t2, v2)| *t2 == txid_hex && *v2 == u.vout);
+                            let (source, address) = if is_spending {
+                                (
+                                    "Spending wallet".to_string(),
+                                    spending_addrs.get(&(txid_hex.clone(), u.vout)).cloned(),
+                                )
+                            } else {
+                                (
+                                    format!("Notebook · {active_name}"),
+                                    id_guard.as_ref().map(|id| id.address(st.network())),
+                                )
+                            };
+                            prevouts.insert(
+                                format!("{txid_hex}:{}", u.vout),
+                                notes_core::confirm::PrevoutInfo { value: u.value, address, source },
+                            );
+                        }
+
+                        let note_preview = Some(if private {
+                            "Private note (encrypted)".to_string()
                         } else {
-                            format!("\nchange to your custom address: {} sats", note.change)
-                        };
-                        ui.global::<Confirm>().set_summary(
-                            format!(
-                                "{}{}\n\nfunded by: {funded_by}\nsize: {} bytes in {} chunk(s)\ntx: {} vB · {} input(s)\nfee: {}{}{}{}\nbalance after: {} sats\n\ntxid:\n{}",
-                                match (private, directed) {
-                                    (true, true) => "PRIVATE — sealed for the recipient (ECDH)",
-                                    (true, false) => "PRIVATE — encrypted with your device seed",
-                                    (false, _) => "PUBLIC — plaintext, world-readable forever",
-                                },
-                                if directed {
-                                    format!("\nto: {to_address}")
-                                } else {
-                                    String::new()
-                                },
-                                text.len(),
-                                chunks,
-                                note.vsize,
-                                note.tx.inputs.len(),
-                                sats_line(note.fee, st.btc_usd),
-                                if directed {
-                                    format!(" + {} sats to recipient", note.sent)
-                                } else {
-                                    String::new()
-                                },
-                                if notebook_dust {
-                                    format!("\ndust to notebook (discoverability): {} sats", notes_core::DUST_LIMIT)
-                                } else {
-                                    String::new()
-                                },
-                                change_dest_line,
-                                balance_after,
-                                note.txid_hex
-                            )
-                            .into(),
-                        );
-                        let recipient = if directed { Some(to_address) } else { None };
-                        *plan.borrow_mut() = Some(Plan {
-                            note,
-                            text,
-                            private,
-                            note_id,
-                            chunks,
-                            recipient,
-                            spending_spent,
-                            spending_change_addr,
-                            change_is_notebook,
-                            notebook_dust,
+                            text.clone()
                         });
-                        ui.global::<Ui>().set_screen(4);
+                        let cctx = notes_core::confirm::ConfirmCtx {
+                            network: st.network(),
+                            prevouts,
+                            self_spks,
+                            spending_spks,
+                            expected_change: (change_choice.choice == "custom"
+                                && !change_choice.custom_address.trim().is_empty())
+                            .then(|| change_choice.custom_address.trim().to_string()),
+                            recipient: recipient.clone(),
+                            recipient_name,
+                            note_preview,
+                        };
+                        let context_line = format!(
+                            "{} note · {}",
+                            if directed {
+                                "Directed"
+                            } else if private {
+                                "Private"
+                            } else {
+                                "Public"
+                            },
+                            st.network
+                        );
+
+                        match show_confirm_screen(
+                            &ui,
+                            "compose",
+                            &note.raw_hex,
+                            &cctx,
+                            context_line,
+                            "Sign & export",
+                        ) {
+                            Ok(()) => {
+                                *plan.borrow_mut() = Some(Plan {
+                                    note,
+                                    text,
+                                    private,
+                                    note_id,
+                                    chunks,
+                                    recipient,
+                                    spending_spent,
+                                    spending_change_addr,
+                                    change_is_notebook,
+                                    notebook_dust,
+                                });
+                            }
+                            Err(e) => {
+                                log::warn!("cb: confirm summarize err={e}");
+                                compose.set_cost_line(format!("Cannot show confirm: {e}").into());
+                            }
+                        }
                     }
                     Err(e) => {
                         log::warn!("cb: compose len={} private={} err={e}", text.len(), private);
@@ -2783,10 +2884,18 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
+    // Universal Confirm & sign gate (screen 4) — dispatches on
+    // ConfirmSign.kind to the three sign bodies (each was its own
+    // dedicated callback before the confirm-gate refactor; merged here so
+    // Sign always fires through one place, no callback-from-callback
+    // re-entrancy). Ledger/outbox mutations happen ONLY past this point.
     {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
         let plan = plan.clone();
+        let sweep_plan = sweep_plan.clone();
+        let psbt_pending = psbt_pending.clone();
+        let identity = identity.clone();
         let fs = fs.clone();
         let refresh_notes = refresh_notes.clone();
         let notebooks = notebooks.clone();
@@ -2797,176 +2906,373 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let refresh_funding = refresh_funding.clone();
         let funding_pick = funding_pick.clone();
         let change_pick = change_pick.clone();
+        let refresh_home = refresh_home.clone();
         ui.global::<Callbacks>().on_confirm_sign(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let Some(p) = plan.borrow_mut().take() else { return };
-            ui.global::<Ui>().set_busy(true);
-            let ui_weak = ui_weak.clone();
-            let state = state.clone();
-            let fs = fs.clone();
-            let refresh_notes = refresh_notes.clone();
-            let notebooks = notebooks.clone();
-            let net = net.clone();
-            let seed_idx = seed_idx.clone();
-            let bip_account = bip_account.clone();
-            let active = active.clone();
-            let refresh_funding = refresh_funding.clone();
-            let funding_pick = funding_pick.clone();
-            let change_pick = change_pick.clone();
-            Timer::single_shot(Duration::from_millis(150), move || {
-                let Some(ui) = ui_weak.upgrade() else { return };
-                let mut st = state.borrow_mut();
+            let kind = ui.global::<ConfirmSign>().get_kind().to_string();
+            let txid = ui.global::<ConfirmSign>().get_txid().to_string();
+            log::info!("cb: confirm sign kind={kind} txid={txid}");
+            match kind.as_str() {
+                "sweep" | "consolidate" => {
+                    let Some(p) = sweep_plan.borrow_mut().take() else { return };
+                    ui.global::<Ui>().set_busy(true);
+                    let ui_weak = ui_weak.clone();
+                    let state = state.clone();
+                    let fs = fs.clone();
+                    let active = active.clone();
+                    let net = net.clone();
+                    let refresh_home = refresh_home.clone();
+                    Timer::single_shot(Duration::from_millis(150), move || {
+                        let Some(ui) = ui_weak.upgrade() else { return };
+                        let mut st = state.borrow_mut();
+                        let active_acct = active.borrow().unwrap_or(p.dest_account);
 
-                // Notebook ledger: drop spent notebook inputs. Spending-wallet
-                // inputs (if any) are dropped from the SEPARATE spending
-                // ledger below via `p.spending_spent` — `p.note.spent_outpoints`
-                // covers both kinds, but only notebook outpoints ever match
-                // an entry in `st.utxos`, so this retain is safe either way.
-                let spent: Vec<(String, u32)> = p
-                    .note
-                    .spent_outpoints
-                    .iter()
-                    .map(|(txid, vout)| {
-                        let mut t = *txid;
-                        t.reverse();
-                        (hex::encode(t), *vout)
-                    })
-                    .collect();
-                st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                        // Wallet-level ledger: remove each notebook's spent
+                        // inputs from its own state file (the active one via
+                        // the live `st`); a consolidate's single output lands
+                        // in the destination notebook as its new
+                        // (unconfirmed) coin.
+                        let inputs: usize = p.spent_by_account.iter().map(|(_, o)| o.len()).sum();
+                        let recv = p.tx.tx.outputs[0].value;
+                        for (acct, spent) in &p.spent_by_account {
+                            if *acct == active_acct {
+                                st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                            } else {
+                                let mut other = load_state(&fs, &net.borrow(), *acct);
+                                other.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+                                save_state(&fs, &other);
+                            }
+                        }
+                        if p.kind == "consolidate" {
+                            let coin = UtxoRec { txid: p.tx.txid_hex.clone(), vout: 0, value: recv };
+                            if p.dest_account == active_acct {
+                                st.utxos.push(coin);
+                            } else {
+                                let mut dest = load_state(&fs, &net.borrow(), p.dest_account);
+                                dest.utxos.push(coin);
+                                save_state(&fs, &dest);
+                            }
+                        }
 
-                // Output order: OP_RETURN(s), [directed recipient], [notebook
-                // dust — mandatory whenever the spending wallet funded any
-                // part of this note], [change]. `p.chunks` + the recipient
-                // flag place the dust; +1 more when it's present places change.
-                let dust_vout = p.chunks as u32 + u32::from(p.recipient.is_some());
-                if p.notebook_dust {
-                    st.utxos.push(UtxoRec {
-                        txid: p.note.txid_hex.clone(),
-                        vout: dust_vout,
-                        value: notes_core::DUST_LIMIT,
+                        let file = format!("{OUTBOX_DIR}/{}.hex", p.tx.txid_hex);
+                        let internal = ensure_dir(&fs, OUTBOX_DIR, Location::User).and_then(|_| {
+                            write_file(&fs, &file, Location::User, p.tx.raw_hex.as_bytes())
+                        });
+                        let airlock = ensure_airlock_mounted(&fs).and_then(|_| {
+                            let r = ensure_dir(&fs, OUTBOX_DIR, Location::Airlock).and_then(|_| {
+                                write_file(&fs, &file, Location::Airlock, p.tx.raw_hex.as_bytes())
+                            });
+                            unmount_airlock(&fs);
+                            r
+                        });
+                        save_state(&fs, &st);
+                        log::info!(
+                            "cb: sign-sweep kind={} txid={} fee={} internal={} airlock={}",
+                            p.kind,
+                            p.tx.txid_hex,
+                            p.tx.fee,
+                            if internal.is_ok() { "ok" } else { "err" },
+                            if airlock.is_ok() { "ok" } else { "err" },
+                        );
+                        drop(st);
+
+                        let sp = ui.global::<SignPsbt>();
+                        sp.set_summary(
+                            format!(
+                                "{}\nfee {} sats · {} vB\ntxid: {}",
+                                match (p.kind, &p.dest) {
+                                    ("consolidate", _) =>
+                                        format!("Consolidated {inputs} coin(s) into one · {recv} sats"),
+                                    (_, Some(d)) =>
+                                        format!("Swept {inputs} coin(s) · {recv} sats to {}", short_addr(d)),
+                                    _ => format!("Swept {inputs} coin(s) · {recv} sats"),
+                                },
+                                p.tx.fee,
+                                p.tx.vsize,
+                                p.tx.txid_hex
+                            )
+                            .into(),
+                        );
+                        if p.tx.raw_hex.len() <= MAX_QR_HEX_CHARS {
+                            sp.set_qr(qr_image(&p.tx.raw_hex.to_uppercase()));
+                            sp.set_has_qr(true);
+                        } else {
+                            sp.set_has_qr(false);
+                        }
+                        sp.set_back_screen(0);
+
+                        // Reset the sweep flow so nothing leaks into the next run.
+                        let sweep = ui.global::<Sweep>();
+                        sweep.set_dest("".into());
+                        sweep.set_dest_label("".into());
+                        sweep.set_tier(1);
+                        sweep.set_cost_line("".into());
+                        sweep.set_can_continue(false);
+                        ui.global::<Contacts>().set_pick_mode("compose".into());
+
+                        ui.global::<Ui>().set_busy(false);
+                        refresh_home();
+                        ui.global::<Ui>().set_screen(8);
                     });
                 }
-                let change_vout = dust_vout + u32::from(p.notebook_dust);
-                if p.note.change > 0 && p.change_is_notebook {
-                    st.utxos.push(UtxoRec {
-                        txid: p.note.txid_hex.clone(),
-                        vout: change_vout,
-                        value: p.note.change,
+                "psbt" => {
+                    let Some(psbt) = psbt_pending.borrow_mut().take() else { return };
+                    let id_guard = identity.borrow();
+                    let Some(id) = id_guard.as_ref() else {
+                        drop(id_guard);
+                        ui.global::<Sync>().set_result("Device locked — no signing key.".into());
+                        ui.global::<Ui>().set_screen(5);
+                        return;
+                    };
+                    let output_x = id.output_x;
+                    let tweaked_seckey = id.tweaked_seckey;
+                    drop(id_guard);
+                    ui.global::<Ui>().set_busy(true);
+                    let ui_weak = ui_weak.clone();
+                    let fs = fs.clone();
+                    let mut psbt = psbt;
+                    Timer::single_shot(Duration::from_millis(150), move || {
+                        let Some(ui) = ui_weak.upgrade() else { return };
+                        let (ours, signed) =
+                            match psbt.sign_own_taproot(&output_x, &tweaked_seckey, generate_aux_rand) {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    ui.global::<Ui>().set_busy(false);
+                                    ui.global::<Sync>().set_result(format!("Sign failed: {e}").into());
+                                    ui.global::<Ui>().set_screen(5);
+                                    return;
+                                }
+                            };
+                        log::info!("cb: sign-psbt inputs={ours} signed={signed} ok");
+                        let hex_str = hex::encode_upper(psbt.serialize());
+                        let out_txid = psbt.unsigned_tx.txid_hex();
+                        let file = format!("{OUTBOX_DIR}/{out_txid}.psbt.hex");
+                        let _ = ensure_dir(&fs, OUTBOX_DIR, Location::User)
+                            .and_then(|_| write_file(&fs, &file, Location::User, hex_str.as_bytes()));
+                        let fee = psbt_fee(&psbt);
+                        let note = psbt_note_summary(&psbt);
+                        let sp = ui.global::<SignPsbt>();
+                        sp.set_summary(
+                            format!("Signed {signed} of {ours} input(s) · fee {fee} sats\n{note}")
+                                .into(),
+                        );
+                        if hex_str.len() <= MAX_QR_HEX_CHARS {
+                            sp.set_qr(qr_image(&hex_str));
+                            sp.set_has_qr(true);
+                        } else {
+                            sp.set_has_qr(false);
+                        }
+                        ui.global::<Ui>().set_error("".into());
+                        ui.global::<Ui>().set_busy(false);
+                        ui.global::<Ui>().set_screen(8);
                     });
                 }
-                // Custom/external change: not our coin, nothing to track
-                // (matches how a directed recipient's dust isn't tracked).
+                _ => {
+                    // "compose" — the default arm.
+                    let Some(p) = plan.borrow_mut().take() else { return };
+                    ui.global::<Ui>().set_busy(true);
+                    let ui_weak = ui_weak.clone();
+                    let state = state.clone();
+                    let fs = fs.clone();
+                    let refresh_notes = refresh_notes.clone();
+                    let notebooks = notebooks.clone();
+                    let net = net.clone();
+                    let seed_idx = seed_idx.clone();
+                    let bip_account = bip_account.clone();
+                    let active = active.clone();
+                    let refresh_funding = refresh_funding.clone();
+                    let funding_pick = funding_pick.clone();
+                    let change_pick = change_pick.clone();
+                    Timer::single_shot(Duration::from_millis(150), move || {
+                        let Some(ui) = ui_weak.upgrade() else { return };
+                        let mut st = state.borrow_mut();
 
-                // Spending ledger: drop spent inputs + add change (if it
-                // went to a fresh spending address) in one pass — mirrors
-                // the notebook ledger's unconfirmed-chaining update above.
-                if !p.spending_spent.is_empty() || p.spending_change_addr.is_some() {
-                    let mut ix = notebooks.borrow_mut();
-                    let ctx = notebook_ctx(&ix, *active.borrow())
-                        .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
-                    let net_s = net.borrow().clone();
-                    let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
-                    let change_coin =
-                        if p.note.change > 0 { p.spending_change_addr.as_ref() } else { None };
-                    if let Some(addr) = change_coin {
-                        sec.mark_used(addr.clone());
-                    }
-                    sec.apply_spend(
-                        &p.spending_spent,
-                        change_coin.map(|addr| spending::SpendingUtxo {
+                        // Notebook ledger: drop spent notebook inputs. Spending-wallet
+                        // inputs (if any) are dropped from the SEPARATE spending
+                        // ledger below via `p.spending_spent` — `p.note.spent_outpoints`
+                        // covers both kinds, but only notebook outpoints ever match
+                        // an entry in `st.utxos`, so this retain is safe either way.
+                        let spent: Vec<(String, u32)> = p
+                            .note
+                            .spent_outpoints
+                            .iter()
+                            .map(|(txid, vout)| {
+                                let mut t = *txid;
+                                t.reverse();
+                                (hex::encode(t), *vout)
+                            })
+                            .collect();
+                        st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
+
+                        // Output order: OP_RETURN(s), [directed recipient], [notebook
+                        // dust — mandatory whenever the spending wallet funded any
+                        // part of this note], [change]. `p.chunks` + the recipient
+                        // flag place the dust; +1 more when it's present places change.
+                        let dust_vout = p.chunks as u32 + u32::from(p.recipient.is_some());
+                        if p.notebook_dust {
+                            st.utxos.push(UtxoRec {
+                                txid: p.note.txid_hex.clone(),
+                                vout: dust_vout,
+                                value: notes_core::DUST_LIMIT,
+                            });
+                        }
+                        let change_vout = dust_vout + u32::from(p.notebook_dust);
+                        if p.note.change > 0 && p.change_is_notebook {
+                            st.utxos.push(UtxoRec {
+                                txid: p.note.txid_hex.clone(),
+                                vout: change_vout,
+                                value: p.note.change,
+                            });
+                        }
+                        // Custom/external change: not our coin, nothing to track
+                        // (matches how a directed recipient's dust isn't tracked).
+
+                        // Spending ledger: drop spent inputs + add change (if it
+                        // went to a fresh spending address) in one pass — mirrors
+                        // the notebook ledger's unconfirmed-chaining update above.
+                        if !p.spending_spent.is_empty() || p.spending_change_addr.is_some() {
+                            let mut ix = notebooks.borrow_mut();
+                            let ctx = notebook_ctx(&ix, *active.borrow())
+                                .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
+                            let net_s = net.borrow().clone();
+                            let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
+                            let change_coin =
+                                if p.note.change > 0 { p.spending_change_addr.as_ref() } else { None };
+                            if let Some(addr) = change_coin {
+                                sec.mark_used(addr.clone());
+                            }
+                            sec.apply_spend(
+                                &p.spending_spent,
+                                change_coin.map(|addr| spending::SpendingUtxo {
+                                    txid: p.note.txid_hex.clone(),
+                                    vout: change_vout,
+                                    value: p.note.change,
+                                    chain: addr.chain,
+                                    index: addr.index,
+                                }),
+                            );
+                            save_notebooks(&fs, &ix);
+                        }
+
+                        let rec = NoteRec {
+                            id: hex::encode(p.note_id),
+                            text: p.text.clone(),
+                            private: p.private,
                             txid: p.note.txid_hex.clone(),
-                            vout: change_vout,
-                            value: p.note.change,
-                            chain: addr.chain,
-                            index: addr.index,
-                        }),
-                    );
-                    save_notebooks(&fs, &ix);
-                }
+                            raw_hex: p.note.raw_hex.clone(),
+                            fee: p.note.fee,
+                            vsize: p.note.vsize as u64,
+                            chunks: p.chunks,
+                            height: None,
+                            blocktime: None,
+                            status: "pending".into(),
+                            directed: p.recipient.is_some(),
+                            to: p.recipient.clone(),
+                            from: None,
+                        };
 
-                let rec = NoteRec {
-                    id: hex::encode(p.note_id),
-                    text: p.text.clone(),
-                    private: p.private,
-                    txid: p.note.txid_hex.clone(),
-                    raw_hex: p.note.raw_hex.clone(),
-                    fee: p.note.fee,
-                    vsize: p.note.vsize as u64,
-                    chunks: p.chunks,
-                    height: None,
-                    blocktime: None,
-                    status: "pending".into(),
-                    directed: p.recipient.is_some(),
-                    to: p.recipient.clone(),
-                    from: None,
-                };
+                        // Export the signed tx for the companion to broadcast:
+                        // always to internal outbox; Airlock too when available.
+                        let file = format!("{OUTBOX_DIR}/{}.hex", p.note.txid_hex);
+                        let internal = ensure_dir(&fs, OUTBOX_DIR, Location::User).and_then(|_| {
+                            write_file(&fs, &file, Location::User, p.note.raw_hex.as_bytes())
+                        });
+                        let airlock = ensure_airlock_mounted(&fs).and_then(|_| {
+                            let r = ensure_dir(&fs, OUTBOX_DIR, Location::Airlock).and_then(|_| {
+                                write_file(&fs, &file, Location::Airlock, p.note.raw_hex.as_bytes())
+                            });
+                            // Full flush so the file survives unplug (paper-wallet
+                            // pattern).
+                            unmount_airlock(&fs);
+                            r
+                        });
+                        log::info!(
+                            "cb: sign-note id={} txid={} fee={} vsize={} internal={} airlock={}",
+                            rec.id,
+                            rec.txid,
+                            rec.fee,
+                            rec.vsize,
+                            if internal.is_ok() { "ok" } else { "err" },
+                            if airlock.is_ok() { "ok" } else { "err" },
+                        );
 
-                // Export the signed tx for the companion to broadcast:
-                // always to internal outbox; Airlock too when available.
-                let file = format!("{OUTBOX_DIR}/{}.hex", p.note.txid_hex);
-                let internal = ensure_dir(&fs, OUTBOX_DIR, Location::User)
-                    .and_then(|_| write_file(&fs, &file, Location::User, p.note.raw_hex.as_bytes()));
-                let airlock = ensure_airlock_mounted(&fs).and_then(|_| {
-                    let r = ensure_dir(&fs, OUTBOX_DIR, Location::Airlock).and_then(|_| {
-                        write_file(&fs, &file, Location::Airlock, p.note.raw_hex.as_bytes())
+                        // Auto-save the recipient as a recent contact (usually a
+                        // no-op re-front after the pick, but covers every path).
+                        if let Some(to) = &p.recipient {
+                            upsert_contact(&mut st, to);
+                        }
+                        st.notes.push(rec.clone());
+                        save_state(&fs, &st);
+                        drop(st);
+                        refresh_funding();
+
+                        let view = ui.global::<View>();
+                        view.set_id(rec.id.clone().into());
+                        view.set_text(rec.text.clone().into());
+                        view.set_badge(if rec.private { "PRIVATE" } else { "PUBLIC" }.into());
+                        view.set_meta(
+                            format!(
+                                "pending — scan the QR with the companion, or broadcast {}.hex\nfee {} sats · {} vB",
+                                rec.txid, rec.fee, rec.vsize
+                            )
+                            .into(),
+                        );
+                        // Straight to the QR after signing — that's the broadcast path.
+                        set_view_qr(&view, &rec);
+                        view.set_show_qr(view.get_has_qr());
+                        ui.global::<Compose>().set_text("".into());
+                        // A stale recipient must never silently direct the next note.
+                        ui.global::<Compose>().set_to_address("".into());
+                        ui.global::<Compose>().set_to_label("".into());
+                        // Gift resets with the recipient so a large gift can't leak
+                        // into the next note.
+                        ui.global::<Compose>().set_gift_sats("330".into());
+                        ui.global::<Compose>().set_gift_expanded(false);
+                        // Funding/change picks reset too — a stale coin selection or
+                        // custom change address must never leak into the next note.
+                        *funding_pick.borrow_mut() = FundingPick::default();
+                        *change_pick.borrow_mut() = ChangePickState::default();
+                        ui.global::<ChangePick>().set_choice("auto".into());
+                        ui.global::<ChangePick>().set_custom_address("".into());
+                        ui.global::<Ui>().set_busy(false);
+                        refresh_notes();
+                        ui.global::<Ui>().set_screen(2);
                     });
-                    // Full flush so the file survives unplug (paper-wallet
-                    // pattern).
-                    unmount_airlock(&fs);
-                    r
-                });
-                log::info!(
-                    "cb: sign-note id={} txid={} fee={} vsize={} internal={} airlock={}",
-                    rec.id,
-                    rec.txid,
-                    rec.fee,
-                    rec.vsize,
-                    if internal.is_ok() { "ok" } else { "err" },
-                    if airlock.is_ok() { "ok" } else { "err" },
-                );
-
-                // Auto-save the recipient as a recent contact (usually a
-                // no-op re-front after the pick, but covers every path).
-                if let Some(to) = &p.recipient {
-                    upsert_contact(&mut st, to);
                 }
-                st.notes.push(rec.clone());
-                save_state(&fs, &st);
-                drop(st);
-                refresh_funding();
+            }
+        });
+    }
 
-                let view = ui.global::<View>();
-                view.set_id(rec.id.clone().into());
-                view.set_text(rec.text.clone().into());
-                view.set_badge(if rec.private { "PRIVATE" } else { "PUBLIC" }.into());
-                view.set_meta(
-                    format!(
-                        "pending — scan the QR with the companion, or broadcast {}.hex\nfee {} sats · {} vB",
-                        rec.txid, rec.fee, rec.vsize
-                    )
-                    .into(),
-                );
-                // Straight to the QR after signing — that's the broadcast path.
-                set_view_qr(&view, &rec);
-                view.set_show_qr(view.get_has_qr());
-                ui.global::<Compose>().set_text("".into());
-                // A stale recipient must never silently direct the next note.
-                ui.global::<Compose>().set_to_address("".into());
-                ui.global::<Compose>().set_to_label("".into());
-                // Gift resets with the recipient so a large gift can't leak
-                // into the next note.
-                ui.global::<Compose>().set_gift_sats("330".into());
-                ui.global::<Compose>().set_gift_expanded(false);
-                // Funding/change picks reset too — a stale coin selection or
-                // custom change address must never leak into the next note.
-                *funding_pick.borrow_mut() = FundingPick::default();
-                *change_pick.borrow_mut() = ChangePickState::default();
-                ui.global::<ChangePick>().set_choice("auto".into());
-                ui.global::<ChangePick>().set_custom_address("".into());
-                ui.global::<Ui>().set_busy(false);
-                refresh_notes();
-                ui.global::<Ui>().set_screen(2);
-            });
+    // Back from the universal Confirm & sign screen (4): discard whatever
+    // was staged (Plan/SweepPlan/the stashed Psbt) and clear the shown
+    // rows, then return to the kind's origin screen.
+    {
+        let ui_weak = ui_weak.clone();
+        let plan = plan.clone();
+        let sweep_plan = sweep_plan.clone();
+        let psbt_pending = psbt_pending.clone();
+        ui.global::<Callbacks>().on_confirm_cancel(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let kind = ui.global::<ConfirmSign>().get_kind().to_string();
+            log::info!("cb: confirm cancel kind={kind}");
+            *plan.borrow_mut() = None;
+            *sweep_plan.borrow_mut() = None;
+            *psbt_pending.borrow_mut() = None;
+            let cs = ui.global::<ConfirmSign>();
+            cs.set_inputs(Rc::new(VecModel::from(Vec::<ConfirmRow>::new())).into());
+            cs.set_outputs(Rc::new(VecModel::from(Vec::<ConfirmRow>::new())).into());
+            cs.set_context("".into());
+            cs.set_txid("".into());
+            cs.set_note("".into());
+            cs.set_fee_line("".into());
+            cs.set_warn("".into());
+            cs.set_kind("".into());
+            let back = match kind.as_str() {
+                "sweep" | "consolidate" => 10,
+                "psbt" => 5,
+                _ => 3,
+            };
+            ui.global::<Ui>().set_screen(back);
         });
     }
 
@@ -3360,12 +3666,21 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         });
     }
 
-    // Sign an external transaction (PSBT): scan it, sign every input that pays
-    // THIS device's taproot address, and hand back the signed PSBT as a QR.
+    // Sign an external transaction (PSBT) — stage A: scan it, validate it
+    // pays THIS device's taproot address, and show the universal confirm
+    // gate (screen 4) built from the UNSIGNED tx's own bytes + each input's
+    // witness_utxo. The actual signing (+ outbox export) is stage B, in the
+    // confirm-sign dispatcher below — nothing about a scanned PSBT touches
+    // disk until the user taps Sign.
     {
         let ui_weak = ui_weak.clone();
         let identity = identity.clone();
-        let fs = fs.clone();
+        let notebooks = notebooks.clone();
+        let net = net.clone();
+        let seed_idx = seed_idx.clone();
+        let bip_account = bip_account.clone();
+        let app_seed = app_seed.clone();
+        let psbt_pending = psbt_pending.clone();
         ui.global::<Callbacks>().on_sign_psbt(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let id_guard = identity.borrow();
@@ -3391,7 +3706,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 }
             };
             let bytes = normalize_psbt_bytes(&data);
-            let mut psbt = match notes_core::psbt::Psbt::deserialize(&bytes) {
+            let psbt = match notes_core::psbt::Psbt::deserialize(&bytes) {
                 Ok(p) => p,
                 Err(e) => {
                     log::warn!("cb: sign-psbt err={e}");
@@ -3399,39 +3714,67 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     return;
                 }
             };
-            let (ours, signed) =
-                match psbt.sign_own_taproot(&id.output_x, &id.tweaked_seckey, generate_aux_rand) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        ui.global::<Sync>().set_result(format!("Sign failed: {e}").into());
-                        return;
-                    }
-                };
-            log::info!("cb: sign-psbt inputs={ours} signed={signed} ok");
+            let our_spk = p2tr_script_pubkey(&id.output_x);
+            let ours = psbt
+                .inputs
+                .iter()
+                .filter(|i| {
+                    i.witness_utxo.as_ref().map(|w| w.script_pubkey == our_spk).unwrap_or(false)
+                })
+                .count();
             if ours == 0 {
                 ui.global::<Sync>()
                     .set_result("No inputs belong to this device's address.".into());
                 return;
             }
-            let hex_str = hex::encode_upper(psbt.serialize());
-            let txid = psbt.unsigned_tx.txid_hex();
-            let file = format!("{OUTBOX_DIR}/{txid}.psbt.hex");
-            let _ = ensure_dir(&fs, OUTBOX_DIR, Location::User)
-                .and_then(|_| write_file(&fs, &file, Location::User, hex_str.as_bytes()));
-            let fee = psbt_fee(&psbt);
-            let note = psbt_note_summary(&psbt);
-            let sp = ui.global::<SignPsbt>();
-            sp.set_summary(
-                format!("Signed {signed} of {ours} input(s) · fee {fee} sats\n{note}").into(),
-            );
-            if hex_str.len() <= MAX_QR_HEX_CHARS {
-                sp.set_qr(qr_image(&hex_str));
-                sp.set_has_qr(true);
-            } else {
-                sp.set_has_qr(false);
+
+            let net_dev = net.borrow().clone();
+            let network = Network::from_str_opt(&net_dev).unwrap_or(Network::Mainnet);
+            let wallet_ctx = (*seed_idx.borrow(), *bip_account.borrow());
+            let ix = notebooks.borrow();
+            let (self_spks, spending_spks) = confirm_self_spks(&ix, &app_seed, &net_dev, wallet_ctx);
+            drop(ix);
+
+            let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> = BTreeMap::new();
+            for (i, txin) in psbt.unsigned_tx.inputs.iter().enumerate() {
+                let Some(wu) = psbt.inputs.get(i).and_then(|p| p.witness_utxo.as_ref()) else {
+                    continue;
+                };
+                let mut t = txin.txid;
+                t.reverse();
+                let is_ours = wu.script_pubkey == our_spk;
+                let address = notes_core::address::address_from_spk(&wu.script_pubkey, network);
+                let source =
+                    if is_ours { "This notebook".to_string() } else { "External funding".to_string() };
+                prevouts.insert(
+                    format!("{}:{}", hex::encode(t), txin.vout),
+                    notes_core::confirm::PrevoutInfo { value: wu.value, address, source },
+                );
             }
-            ui.global::<Ui>().set_error("".into());
-            ui.global::<Ui>().set_screen(8);
+            let note_preview = confirm_note_preview(&psbt.unsigned_tx.outputs);
+
+            let cctx = notes_core::confirm::ConfirmCtx {
+                network,
+                prevouts,
+                self_spks,
+                spending_spks,
+                expected_change: None,
+                recipient: None,
+                recipient_name: None,
+                note_preview,
+            };
+            let raw_hex = hex::encode(psbt.unsigned_tx.serialize_legacy());
+            drop(id_guard);
+
+            match show_confirm_screen(&ui, "psbt", &raw_hex, &cctx, "External funding tx".to_string(), "Sign & export") {
+                Ok(()) => {
+                    *psbt_pending.borrow_mut() = Some(psbt);
+                }
+                Err(e) => {
+                    log::warn!("cb: confirm summarize err={e}");
+                    ui.global::<Sync>().set_result(format!("Cannot show confirm: {e}").into());
+                }
+            }
         });
     }
 

@@ -72,6 +72,36 @@ export global Confirm {
     in-out property <string> summary: "";
 }
 
+// Universal "Confirm & sign" gate (screen 4) — one row per input/output,
+// decoded from the ACTUAL signed (or, for an external PSBT pre-sign,
+// unsigned) tx bytes by notes-core's `confirm::summarize_signed_tx`.
+// `kind` mirrors title/subtitle/amount/kind row-for-row against
+// `notes_core::confirm::SummaryRow`.
+export struct ConfirmRow {
+    title: string,
+    subtitle: string,
+    amount: string,
+    kind: string,     // inputs: "input"; outputs: "note" | "recipient" | "self" | "change" | "other"
+}
+
+export global ConfirmSign {
+    in-out property <[ConfirmRow]> inputs;
+    in-out property <[ConfirmRow]> outputs;
+    // Short caption above the txid, e.g. "Directed note · testnet4" or
+    // "Sweep · mainnet - spends coins from 2 notebooks...".
+    in-out property <string> context;
+    in-out property <string> txid;
+    // Public-note preview / "Private note (encrypted)" — "" hides the block.
+    in-out property <string> note;
+    in-out property <string> fee-line;
+    // "" = no warning banner.
+    in-out property <string> warn;
+    // "compose" | "sweep" | "consolidate" | "psbt" — which sign body
+    // `confirm-sign` dispatches to, and where `confirm-cancel` returns.
+    in-out property <string> kind;
+    in-out property <string> sign-label: "Sign & export";
+}
+
 export struct NoteRow {
     id: string,
     preview: string,
@@ -189,9 +219,6 @@ export global Sweep {
     in-out property <string> inputs-line: ""; // "Inputs · 3 coins · 45000 sats (all)"
     in-out property <string> cost-line: "";
     in-out property <bool> can-continue: false;
-    // Confirm dialog (modal over screen 10): summary + Sign & export.
-    in-out property <bool> show-confirm: false;
-    in-out property <string> confirm-summary: "";
 }
 
 export global Settings {
@@ -348,7 +375,12 @@ export global Callbacks {
     callback compose-changed();     // every keystroke / toggle / tier change
     callback compose-continue();    // build + sign, then screen 4
     callback oversize-bump();       // raise chunk size to Standard from the dialog
-    callback confirm-sign();        // persist + export, then note view
+    // Universal Confirm & sign gate (screen 4), dispatched on ConfirmSign.kind:
+    // "compose" persists + exports then note view; "sweep"/"consolidate"
+    // persists the wallet ledger + exports then screen 8; "psbt" signs the
+    // stashed external PSBT then screen 8.
+    callback confirm-sign();
+    callback confirm-cancel();      // Back from screen 4 — discard + return to the origin screen
     callback refresh-notes();
     callback toggle-sender(string, bool);  // exclude/include a sender key
     callback open-note(string);     // note id (hex)
@@ -368,8 +400,7 @@ export global Callbacks {
     callback refresh-coins();       // rebuild Coins.rows from the UTXO ledger
     callback consolidate-open();    // Coins → sweep screen with kind=consolidate
     callback sweep-changed();       // tier pill / custom rate edited → reprice
-    callback sweep-continue();      // build + sign, then the confirm dialog
-    callback sweep-sign();          // persist ledger + export + QR → screen 8
+    callback sweep-continue();      // build + sign, then the universal confirm screen (4)
     callback reveal-seed();         // derive the active seed's words → screen 21
     callback reveal-close();        // clear the words + QR, back to settings
     callback set-context();         // commit Recovery.seed-text/account-text
