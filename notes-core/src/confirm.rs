@@ -65,7 +65,7 @@ pub struct TxSummary {
     pub total_out: u64,
     pub fee: Option<u64>, // total_in - total_out; None if total_in is None
     pub vsize: u64,
-    pub fee_line: String, // "1,234 sats · 2.0 sat/vB" or "fee unknown — missing input data"
+    pub fee_line: String, // "1,234 sats · 2.0 sat/vB" or "fee unknown - missing input data"
     pub warn: Option<String>, // set when something needs user attention (see rules)
 }
 
@@ -182,7 +182,7 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
     // data is wrong, which is exactly what this module exists to catch.
     if let Some(ti) = total_in {
         if total_out > ti {
-            warns.push("outputs exceed the known input total — the input data is inconsistent".to_string());
+            warns.push("outputs exceed the known input total - the input data is inconsistent".to_string());
         }
     }
     let fee = total_in.filter(|ti| *ti >= total_out).map(|ti| ti - total_out);
@@ -191,10 +191,10 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
             let rate = if vsize > 0 { f as f64 / vsize as f64 } else { 0.0 };
             format!("{} sats · {rate:.1} sat/vB", commas(f))
         }
-        None if total_in.is_some() => "fee unknown — inconsistent input data".to_string(),
+        None if total_in.is_some() => "fee unknown - inconsistent input data".to_string(),
         None => {
-            warns.push("one or more input amounts are unknown — the fee could not be verified".to_string());
-            "fee unknown — missing input data".to_string()
+            warns.push("one or more input amounts are unknown - the fee could not be verified".to_string());
+            "fee unknown - missing input data".to_string()
         }
     };
 

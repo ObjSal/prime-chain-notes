@@ -233,7 +233,7 @@ fn missing_prevout_makes_fee_unknown() {
     let sum = summarize_signed_tx(&hex_str, &ctx).unwrap();
     assert_eq!(sum.total_in, None);
     assert_eq!(sum.fee, None);
-    assert_eq!(sum.fee_line, "fee unknown — missing input data");
+    assert_eq!(sum.fee_line, "fee unknown - missing input data");
     assert!(sum.warn.is_some());
     assert_eq!(sum.inputs[1].amount, "?");
     assert_eq!(sum.inputs[1].subtitle, "outpoint · amount unknown");
