@@ -603,6 +603,10 @@ pub fn estimate_vsize_mixed(
 /// `recipient_spk` dust of the all-taproot builders above. Output order:
 /// OP_RETURN chunk(s), optional directed recipient, notebook dust, change —
 /// matching the already-shipped external-funding PSBT shape byte-for-byte.
+///
+/// Kept byte-identical for existing callers; prefer
+/// [`build_note_tx_mixed_exact_anchored`] for new callers — it skips this
+/// dust output when the tx is already input-anchored to the notebook.
 #[allow(clippy::too_many_arguments)]
 pub fn build_note_tx_mixed_exact(
     inputs: &[MixedInput],
@@ -612,6 +616,73 @@ pub fn build_note_tx_mixed_exact(
     notebook_dust_spk: &[u8],
     change_spk: &[u8],
     fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    build_note_tx_mixed_exact_inner(
+        inputs,
+        payloads,
+        recipient_spk,
+        recipient_amount,
+        notebook_dust_spk,
+        change_spk,
+        fee_rate,
+        true, // always emit the dust-to-self anchor, matching this fn's historical behavior
+        aux,
+    )
+}
+
+/// Like [`build_note_tx_mixed_exact`], but the notebook dust-to-self anchor
+/// is emitted ONLY when no input already spends from `notebook_dust_spk`
+/// (design decision, funding-unification, 2026-07-18): a tx with a notebook
+/// coin among its inputs is already anchored in that address's history and
+/// already owned by the OWN-note rule (`spends_from_self` / input-prevout-spk
+/// matching), so the dust output would be pure waste (~43 vB now, ~58 vB
+/// again whenever the minted dust coin is later spent). The skip condition
+/// is computed HERE, from the inputs actually being spent — it is `true`
+/// (dust emitted) unless some `inputs[i].prevout_spk == notebook_dust_spk`.
+/// Fee/change math and the order of every OTHER output (OP_RETURNs,
+/// optional recipient, then change) are unchanged; the dust output simply
+/// drops out of that order when skipped.
+#[allow(clippy::too_many_arguments)]
+pub fn build_note_tx_mixed_exact_anchored(
+    inputs: &[MixedInput],
+    payloads: &[Vec<u8>],
+    recipient_spk: Option<&[u8]>,
+    recipient_amount: u64,
+    notebook_dust_spk: &[u8],
+    change_spk: &[u8],
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let anchored_by_input = inputs.iter().any(|i| i.prevout_spk == notebook_dust_spk);
+    build_note_tx_mixed_exact_inner(
+        inputs,
+        payloads,
+        recipient_spk,
+        recipient_amount,
+        notebook_dust_spk,
+        change_spk,
+        fee_rate,
+        !anchored_by_input,
+        aux,
+    )
+}
+
+/// Shared implementation of `build_note_tx_mixed_exact` /
+/// `build_note_tx_mixed_exact_anchored` — `emit_dust` decides whether the
+/// `DUST_LIMIT`-sat notebook output is included; everything else (fee math,
+/// coin data, remaining output order) is identical between the two public
+/// entry points.
+#[allow(clippy::too_many_arguments)]
+fn build_note_tx_mixed_exact_inner(
+    inputs: &[MixedInput],
+    payloads: &[Vec<u8>],
+    recipient_spk: Option<&[u8]>,
+    recipient_amount: u64,
+    notebook_dust_spk: &[u8],
+    change_spk: &[u8],
+    fee_rate: f64,
+    emit_dust: bool,
     mut aux: impl FnMut() -> Result<[u8; 32], Error>,
 ) -> Result<NoteTx, Error> {
     if payloads.is_empty() {
@@ -625,6 +696,7 @@ pub fn build_note_tx_mixed_exact(
     }
     let payload_lens: Vec<usize> = payloads.iter().map(Vec::len).collect();
     let sent: u64 = if recipient_spk.is_some() { recipient_amount } else { 0 };
+    let dust: u64 = if emit_dust { DUST_LIMIT } else { 0 };
     let kinds: Vec<InputKind> = inputs.iter().map(|i| i.kind).collect();
     let in_value: u64 = inputs.iter().map(|i| i.utxo.value).sum();
 
@@ -633,16 +705,18 @@ pub fn build_note_tx_mixed_exact(
         if let Some(spk) = recipient_spk {
             extra_lens.push(spk.len());
         }
-        extra_lens.push(notebook_dust_spk.len());
+        if emit_dust {
+            extra_lens.push(notebook_dust_spk.len());
+        }
         if change {
             extra_lens.push(change_spk.len());
         }
         let vsize = estimate_vsize_mixed(&kinds, &payload_lens, &extra_lens);
         let fee = (vsize as f64 * fee_rate).ceil() as u64;
-        if in_value < fee + sent + DUST_LIMIT {
+        if in_value < fee + sent + dust {
             continue;
         }
-        let change_value = in_value - fee - sent - DUST_LIMIT;
+        let change_value = in_value - fee - sent - dust;
         if change && change_value < DUST_LIMIT {
             continue;
         }
@@ -659,7 +733,9 @@ pub fn build_note_tx_mixed_exact(
         if let Some(spk) = recipient_spk {
             outputs.push(TxOut { value: sent, script_pubkey: spk.to_vec() });
         }
-        outputs.push(TxOut { value: DUST_LIMIT, script_pubkey: notebook_dust_spk.to_vec() });
+        if emit_dust {
+            outputs.push(TxOut { value: DUST_LIMIT, script_pubkey: notebook_dust_spk.to_vec() });
+        }
         if change {
             outputs.push(TxOut { value: change_value, script_pubkey: change_spk.to_vec() });
         }
@@ -681,7 +757,7 @@ pub fn build_note_tx_mixed_exact(
             .collect();
         crate::wpkh::sign_mixed_inputs(&mut tx, &prevout_spks, &keys, &mut aux)?;
 
-        let actual_fee = in_value - sent - DUST_LIMIT - if change { change_value } else { 0 };
+        let actual_fee = in_value - sent - dust - if change { change_value } else { 0 };
         return Ok(NoteTx {
             fee: actual_fee,
             change: if change { change_value } else { 0 },

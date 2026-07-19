@@ -304,3 +304,95 @@ fn address_from_spk_round_trips_every_network() {
     // Anything else (e.g. a bare OP_RETURN payload) renders to nothing.
     assert!(address_from_spk(&pnte_op_return("x"), NET).is_none());
 }
+
+/// Decode/confirm round-trip of a REAL anchored mixed build
+/// (`build_note_tx_mixed_exact_anchored`, funding-unification's
+/// dust-skip rule): notebook input present ⇒ no dust-to-self output ⇒
+/// `summarize_signed_tx` shows no "self" row, only the notebook's "input"
+/// row and a spending-wallet "change" row — proving the classifier needs
+/// no special-casing for the anchored shape (it just decodes what's
+/// actually on the wire).
+#[test]
+fn anchored_mixed_tx_round_trip_has_no_self_row() {
+    use notes_core::address::p2wpkh_script_pubkey;
+    use notes_core::keys::hash160;
+    use notes_core::tx::{build_note_tx_mixed_exact_anchored, InputKind, MixedInput};
+    use k256::ecdsa::SigningKey;
+
+    fn wpkh_spk_of(seckey: &[u8; 32]) -> Vec<u8> {
+        let sk = SigningKey::from_bytes(seckey.into()).unwrap();
+        let pk: [u8; 33] = sk.verifying_key().to_encoded_point(true).as_bytes().try_into().unwrap();
+        p2wpkh_script_pubkey(&hash160(&pk))
+    }
+
+    let notebook = Identity::from_app_seed(&NOTEBOOK_SEED).unwrap();
+    let notebook_dust_spk = p2tr_script_pubkey(&notebook.output_x);
+    let wpkh_sk = [0x51u8; 32];
+    let wpkh_input_spk = wpkh_spk_of(&wpkh_sk);
+    let change_sk = [0x52u8; 32];
+    let change_spk = wpkh_spk_of(&change_sk);
+
+    let inputs = vec![
+        MixedInput {
+            utxo: Utxo { txid: [1u8; 32], vout: 0, value: 1_000 },
+            prevout_spk: notebook_dust_spk.clone(), // anchors the tx
+            kind: InputKind::Taproot,
+            seckey: notebook.tweaked_seckey,
+        },
+        MixedInput {
+            utxo: Utxo { txid: [2u8; 32], vout: 1, value: 50_000 },
+            prevout_spk: wpkh_input_spk.clone(),
+            kind: InputKind::P2wpkh,
+            seckey: wpkh_sk,
+        },
+    ];
+
+    let note = build_note_tx_mixed_exact_anchored(
+        &inputs,
+        &[b"anchored confirm round-trip".to_vec()],
+        None,
+        0,
+        &notebook_dust_spk,
+        &change_spk,
+        1.0,
+        || Ok([0x77u8; 32]),
+    )
+    .unwrap();
+
+    let mut ctx = base_ctx(
+        vec![notebook_dust_spk.clone(), wpkh_input_spk.clone(), change_spk.clone()],
+        vec![wpkh_input_spk.clone(), change_spk.clone()],
+    );
+    ctx.prevouts.insert(
+        prevout_key(1, 0),
+        PrevoutInfo { value: 1_000, address: Some(addr_of(&notebook_dust_spk)), source: "Notebook · Alice".into() },
+    );
+    ctx.prevouts.insert(
+        prevout_key(2, 1),
+        PrevoutInfo { value: 50_000, address: Some(addr_of(&wpkh_input_spk)), source: "Spending wallet".into() },
+    );
+
+    let sum = summarize_signed_tx(&note.raw_hex, &ctx).unwrap();
+    assert_eq!(sum.txid, note.txid_hex);
+
+    // Notebook input row present.
+    assert_eq!(sum.inputs.len(), 2);
+    assert_eq!(sum.inputs[0].subtitle, "Notebook · Alice");
+    assert_eq!(sum.inputs[0].title, addr_of(&notebook_dust_spk));
+
+    // No dust-to-self output on the wire at all, so no "self" row.
+    assert!(sum.outputs.iter().all(|o| o.kind != "self"), "anchored tx must have no self row");
+    assert!(
+        sum.outputs.iter().all(|o| o.title != addr_of(&notebook_dust_spk)),
+        "no output should pay the notebook address when anchored"
+    );
+
+    // The change goes to the spending wallet, classified accordingly.
+    let change_row = sum.outputs.iter().find(|o| o.kind == "change").expect("change output");
+    assert_eq!(change_row.subtitle, "change · Spending wallet");
+    assert_eq!(change_row.title, addr_of(&change_spk));
+
+    assert_eq!(sum.total_in, Some(51_000));
+    assert_eq!(sum.fee, Some(note.fee));
+    assert!(sum.warn.is_none());
+}
