@@ -18,6 +18,7 @@ pub mod decode;
 pub mod dm;
 pub mod envelope;
 pub mod export;
+pub mod fold;
 pub mod keys;
 pub mod psbt;
 pub mod seeds;

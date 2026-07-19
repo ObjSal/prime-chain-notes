@@ -609,6 +609,25 @@ fn list_inbox_bundles(fs: &Fs) -> Vec<(String, Location, &'static str)> {
     out
 }
 
+/// Honest-fee-label (2026-07-19, ported from chain-notes-app): the
+/// sub-dust leftover a real signed [`notes_core::tx::NoteTx`] folded into
+/// its own fee, decomposed from numbers the build already reports —
+/// unlike the compose cost line's PRE-build prediction (`notes-core`'s
+/// `fold` module, used before a real tx exists), this is a plain
+/// decomposition of an ALREADY-BUILT tx: `note.change == 0` is the exact
+/// signal a no-change shape was taken (`tx.rs`'s builders set `change: 0`
+/// in that branch, never a `Some(0)` vs `None` ambiguity), so the nominal
+/// byte-cost is `ceil(vsize * rate)` and anything the real fee pays ABOVE
+/// that must be the folded leftover — zero when nothing folded (an exact
+/// fit, or a with-change build).
+fn note_fold_amount(fee: u64, vsize: usize, change: u64, rate: f64) -> u64 {
+    if change != 0 {
+        return 0;
+    }
+    let nominal = (vsize as f64 * rate).ceil().max(0.0) as u64;
+    fee.saturating_sub(nominal)
+}
+
 fn sats_line(sats: u64, usd: Option<f64>) -> String {
     match usd {
         Some(price) => format!("{sats} sats (~${:.2})", sats as f64 / 1e8 * price),
@@ -978,6 +997,12 @@ fn show_confirm_screen(
     cs.set_note(ctx.note_preview.clone().unwrap_or_default().into());
     cs.set_fee_line(summary.fee_line.clone().into());
     cs.set_warn(summary.warn.clone().unwrap_or_default().into());
+    // Cleared unconditionally here (every kind) so a fold row from a
+    // previous compose confirm can never leak into a later sweep/psbt
+    // confirm that has no fold of its own — callers that DO have a fold
+    // to show (compose only; see `on_compose_continue`) set it themselves
+    // right after this call returns `Ok`.
+    cs.set_fold("".into());
     cs.set_kind(kind.into());
     cs.set_sign_label(sign_label.into());
     log::info!(
@@ -2395,34 +2420,60 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let dust_applies = sp_participates && n_notebook == 0;
             let dust_needed = if dust_applies { notes_core::DUST_LIMIT } else { 0 };
 
-            let mut extra_with_change: Vec<usize> = Vec::new();
+            // Both shapes' extra (non-OP_RETURN) output lengths, computed
+            // unconditionally now (previously the no-change list was only
+            // built inside the folded branch) so the honest-fee-label
+            // fold prediction below can always compare the two, exactly
+            // mirroring what `notes_core::fold::predict_fold` needs.
+            let mut extra_no_change: Vec<usize> = Vec::new();
             if let Some(l) = recipient_spk_len {
-                extra_with_change.push(l);
+                extra_no_change.push(l);
             }
             if dust_applies {
-                extra_with_change.push(34); // notebook dust spk (P2TR, always 34 bytes)
+                extra_no_change.push(34); // notebook dust spk (P2TR, always 34 bytes)
             }
+            let mut extra_with_change = extra_no_change.clone();
             extra_with_change.push(change_len);
             let vsize_with_change = estimate_vsize_mixed(&kinds, &payload_lens, &extra_with_change);
             let fee_with_change = (vsize_with_change as f64 * rate).ceil() as u64;
+            let vsize_no_change = estimate_vsize_mixed(&kinds, &payload_lens, &extra_no_change);
+            let fee_no_change = (vsize_no_change as f64 * rate).ceil() as u64;
             let leftover_with_change =
                 in_value.checked_sub(fee_with_change + gift + dust_needed);
 
-            let (vsize, fee, ok) = match leftover_with_change {
-                Some(v) if v >= notes_core::DUST_LIMIT => (vsize_with_change, fee_with_change, true),
-                _ => {
-                    let mut extra_no_change: Vec<usize> = Vec::new();
-                    if let Some(l) = recipient_spk_len {
-                        extra_no_change.push(l);
-                    }
-                    if dust_applies {
-                        extra_no_change.push(34);
-                    }
-                    let vsize2 = estimate_vsize_mixed(&kinds, &payload_lens, &extra_no_change);
-                    let fee2 = (vsize2 as f64 * rate).ceil() as u64;
-                    let ok2 = matches!(in_value.checked_sub(fee2 + gift + dust_needed), Some(v) if v <= notes_core::DUST_LIMIT);
-                    (vsize2, fee2, ok2)
+            // took_no_change tracks which shape `(vsize, fee, ok)` below
+            // actually reflects — needed because `ok2`'s success range
+            // (`<= DUST_LIMIT`, including exactly 0 — an exact fit, not a
+            // fold) is intentionally broader than
+            // `notes_core::fold::predict_fold`'s "something folded"
+            // signal (which excludes a 0 leftover); keeping this boolean
+            // means the fold suffix below can never fire on an exact-fit
+            // no-change build that isn't actually folding anything.
+            let (vsize, fee, ok, took_no_change) = match leftover_with_change {
+                Some(v) if v >= notes_core::DUST_LIMIT => {
+                    (vsize_with_change, fee_with_change, true, false)
                 }
+                _ => {
+                    let ok2 = matches!(in_value.checked_sub(fee_no_change + gift + dust_needed), Some(v) if v <= notes_core::DUST_LIMIT);
+                    (vsize_no_change, fee_no_change, ok2, true)
+                }
+            };
+            // Honest-fee-label (2026-07-19, ported from chain-notes-app):
+            // when the no-change (dust-fold) shape is what a real build
+            // would take, `fee` above is already the byte-true NOMINAL
+            // fee — but the actual signed tx's fee also carries the
+            // sub-dust leftover on top of it (it can't be its own output,
+            // so the builder folds it into the fee instead).
+            // `predict_fold` mirrors that builder decision exactly for
+            // this fixed selection (pin-tested in notes-core's
+            // `tests/fold.rs` against `build_note_tx_exact`/
+            // `build_note_tx_mixed_exact_anchored`), so the cost line can
+            // show the split honestly instead of a single number that
+            // reads as an inflated fee.
+            let fold = if ok && took_no_change {
+                notes_core::fold::predict_fold(in_value, gift + dust_needed, fee_with_change, fee_no_change, true)
+            } else {
+                None
             };
             if !ok {
                 compose.set_cost_line(
@@ -2437,11 +2488,16 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             } else {
                 compose.set_cost_line(
                     format!(
-                        "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}{}",
+                        "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}{}{}",
                         sats_line(fee, st.btc_usd),
                         if directed { format!(" + {gift} sats to recipient") } else { String::new() },
                         if dust_applies {
                             format!(" + {} sats dust to notebook", notes_core::DUST_LIMIT)
+                        } else {
+                            String::new()
+                        },
+                        if let Some((_, folded)) = fold {
+                            format!(" + {folded} sats leftover (dust rule)")
                         } else {
                             String::new()
                         }
@@ -2900,6 +2956,23 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             "Sign & export",
                         ) {
                             Ok(()) => {
+                                // Honest-fee-label: `note` is the REAL
+                                // signed tx, so this is a decomposition of
+                                // its own numbers (see `note_fold_amount`'s
+                                // doc), not a prediction — `rate` resolves
+                                // deterministically from the same
+                                // `tier`/`rate_text`/`st` that already
+                                // built `note` successfully, so this can't
+                                // fail here.
+                                if let Ok(rate) = resolve_rate(tier, &rate_text, &st) {
+                                    let fold_amount =
+                                        note_fold_amount(note.fee, note.vsize, note.change, rate);
+                                    if fold_amount > 0 {
+                                        ui.global::<ConfirmSign>()
+                                            .set_fold(format!("{fold_amount} sats").into());
+                                        log::info!("cb: confirm fold amount={fold_amount}");
+                                    }
+                                }
                                 *plan.borrow_mut() = Some(Plan {
                                     note,
                                     text,
@@ -3792,11 +3865,62 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             }
 
             let net_dev = net.borrow().clone();
-            let network = Network::from_str_opt(&net_dev).unwrap_or(Network::Mainnet);
+            let mut network = Network::from_str_opt(&net_dev).unwrap_or(Network::Mainnet);
             let wallet_ctx = (*seed_idx.borrow(), *bip_account.borrow());
             let ix = notebooks.borrow();
             let (self_spks, spending_spks) = confirm_self_spks(&ix, &app_seed, &net_dev, wallet_ctx);
             drop(ix);
+
+            // Port B (network-display fix, 2026-07-19): a PSBT's
+            // scriptPubKeys carry NO network/HRP information at all — HRP
+            // is purely an address-ENCODING artifact, never part of the
+            // wire format — so rendering every address below with the
+            // DEVICE's current network setting is wrong whenever this PSBT
+            // was built for a different chain (it will show the right
+            // bytes with the wrong prefix). The only honest signal
+            // available at this call site is a BIP32 derivation path
+            // attached to one of OUR OWN recognized inputs (an external
+            // tool that imported this device's `export.rs` account
+            // descriptor would naturally embed one) — its hardened
+            // coin-type level (`seeds::coin_type`: 0' mainnet, else 1')
+            // reflects what that tool believed the network to be. Only
+            // inputs already proven ours (`witness_utxo.script_pubkey ==
+            // our_spk`) are consulted; a foreign/external-funding input's
+            // derivation convention is none of this device's business.
+            // coin-type 1' can't distinguish testnet4/signet/regtest from
+            // one another (this crate's own `coin_type()` doesn't either),
+            // but testnet4 and signet already share the "tb" HRP here, so
+            // `Testnet4` is the right display for the overwhelming
+            // majority of that bucket; a real external tool handing a
+            // REGTEST PSBT to a physical device is not a scenario this
+            // display-only fix needs to get byte-perfect. No derivation
+            // signal at all (the common case today) changes nothing —
+            // this only ever ADDS information on top of the existing
+            // device-network fallback, never removes it, and it can never
+            // affect signing/validation/tx bytes (display only).
+            let device_network_label = network.as_str();
+            let mut coin_types: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            for (i, inp) in psbt.inputs.iter().enumerate() {
+                let is_ours = inp.witness_utxo.as_ref().map(|w| w.script_pubkey == our_spk).unwrap_or(false);
+                if !is_ours {
+                    continue;
+                }
+                if let Some(ct) = psbt.input_derivation_coin_type(i) {
+                    coin_types.insert(ct);
+                }
+            }
+            let mut network_warn: Option<String> = None;
+            if let [only] = coin_types.iter().collect::<Vec<_>>()[..] {
+                let derived_mainnet = *only == 0;
+                let device_mainnet = network == Network::Mainnet;
+                if derived_mainnet != device_mainnet {
+                    let derived_label = if derived_mainnet { "mainnet" } else { "a test network" };
+                    network_warn = Some(format!(
+                        "this transaction's key derivation indicates {derived_label}, but the device is set to {device_network_label} - addresses below use the derived network's encoding"
+                    ));
+                    network = if derived_mainnet { Network::Mainnet } else { Network::Testnet4 };
+                }
+            }
 
             let mut prevouts: BTreeMap<String, notes_core::confirm::PrevoutInfo> = BTreeMap::new();
             for (i, txin) in psbt.unsigned_tx.inputs.iter().enumerate() {
@@ -3831,6 +3955,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
 
             match show_confirm_screen(&ui, "psbt", &raw_hex, &cctx, "External funding tx".to_string(), "Sign & export") {
                 Ok(()) => {
+                    if let Some(msg) = &network_warn {
+                        log::info!("cb: confirm network-mismatch derived={}", network.as_str());
+                        let cs = ui.global::<ConfirmSign>();
+                        let existing = cs.get_warn().to_string();
+                        cs.set_warn(
+                            if existing.is_empty() { msg.clone().into() } else { format!("{existing}; {msg}").into() },
+                        );
+                    }
                     *psbt_pending.borrow_mut() = Some(psbt);
                 }
                 Err(e) => {

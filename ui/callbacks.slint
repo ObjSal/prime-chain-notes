@@ -96,6 +96,13 @@ export global ConfirmSign {
     in-out property <string> fee-line;
     // "" = no warning banner.
     in-out property <string> warn;
+    // Honest-fee-label (2026-07-19): "<N> sats" when the builder folded a
+    // sub-dust leftover into the fee instead of a change output (see
+    // notes-core's `fold` module) — "" hides the row. Kept separate from
+    // `warn` (its own key:value row, not merged into the general banner
+    // text) since it's a specific, always-present-when-relevant fact
+    // about the fee, not an advisory.
+    in-out property <string> fold;
     // "compose" | "sweep" | "consolidate" | "psbt" — which sign body
     // `confirm-sign` dispatches to, and where `confirm-cancel` returns.
     in-out property <string> kind;

@@ -25,6 +25,18 @@ const PSBT_GLOBAL_UNSIGNED_TX: u8 = 0x00;
 const PSBT_IN_WITNESS_UTXO: u8 = 0x01;
 const PSBT_IN_TAP_KEY_SIG: u8 = 0x13;
 const PSBT_IN_TAP_INTERNAL_KEY: u8 = 0x17;
+/// BIP-174 legacy per-input BIP32 derivation (value: 4-byte fingerprint +
+/// path, u32-LE per level). Never emitted for a key-path-only taproot
+/// input by any producer in this ecosystem, but a non-taproot-aware tool
+/// could attach it instead of the BIP-371 field below — read as a
+/// fallback by [`input_derivation_coin_type`], never written by
+/// `serialize`.
+const PSBT_IN_BIP32_DERIVATION: u8 = 0x06;
+/// BIP-371 per-input taproot BIP32 derivation (value: compact-size leaf-hash
+/// count + that many 32-byte leaf hashes + 4-byte fingerprint + path).
+/// Read-only, display-only (see [`input_derivation_coin_type`]) — this
+/// crate never writes the field itself.
+const PSBT_IN_TAP_BIP32_DERIVATION: u8 = 0x16;
 /// The note-tx convention: every input signals RBF. Our `Transaction` model
 /// hard-codes this sequence, so we require it on parse (the desktop builds
 /// funding PSBTs the same way).
@@ -249,6 +261,18 @@ impl Psbt {
         crate::address::p2tr_x_of_spk(spk)
     }
 
+    /// DISPLAY-ONLY, best-effort: the hardened coin-type level (BIP32 path
+    /// index 1, e.g. the `1'` in `m/86'/1'/0'/0/0`) of input `index`'s own
+    /// BIP32 derivation, if a producer attached one. Never touches
+    /// signing/validation — a confirm-screen display helper only (see
+    /// `confirm.rs`'s doc on never trusting caller intent for anything
+    /// that affects the fee/amounts; this is display metadata, not an
+    /// amount). Reads [`PsbtInput::unknown`] without removing anything
+    /// from it, so round-trip fidelity (`serialize`) is unaffected.
+    pub fn input_derivation_coin_type(&self, index: usize) -> Option<u32> {
+        input_derivation_coin_type(self.inputs.get(index)?)
+    }
+
     /// Sign every input whose spent output is OUR P2TR key-path address
     /// (`output_x`) with `tweaked_seckey`, leaving foreign inputs untouched.
     /// This is the external-signer entry point (the Prime app): recognise our
@@ -316,6 +340,55 @@ fn serialize_txout(o: &TxOut) -> Vec<u8> {
     write_varint(&mut v, o.script_pubkey.len() as u64);
     v.extend_from_slice(&o.script_pubkey);
     v
+}
+
+/// Free-function core of [`Psbt::input_derivation_coin_type`] — scans
+/// `inp.unknown` for a BIP-371 `PSBT_IN_TAP_BIP32_DERIVATION` (preferred)
+/// or legacy `PSBT_IN_BIP32_DERIVATION` key-value pair and extracts its
+/// path's coin-type level (index 1: `m / purpose' / coin_type' / ...`).
+/// Bounds-checked throughout (`Reader` never panics on truncated/malformed
+/// bytes) and best-effort: any parse failure or a level-1 value that
+/// isn't marked hardened (the coin-type level always is, in every BIP44/
+/// 84/86-family path) is simply skipped, never treated as an error — a
+/// foreign tool that encodes something else under these key types must
+/// never crash or mislead the confirm screen, just contribute no signal.
+/// Returns the FIRST matching field found; a PSBT with conflicting
+/// derivations across multiple inputs is a caller-level concern (see
+/// `on_sign_psbt`'s doc in `src/main.rs`), not something this function
+/// resolves.
+fn input_derivation_coin_type(inp: &PsbtInput) -> Option<u32> {
+    for (key, val) in &inp.unknown {
+        let Some(&kind) = key.first() else { continue };
+        if kind != PSBT_IN_TAP_BIP32_DERIVATION && kind != PSBT_IN_BIP32_DERIVATION {
+            continue;
+        }
+        let mut r = Reader::new(val);
+        if kind == PSBT_IN_TAP_BIP32_DERIVATION {
+            let Ok(n) = r.varint() else { continue };
+            let Ok(n) = usize::try_from(n) else { continue };
+            let mut ok = true;
+            for _ in 0..n {
+                if r.take(32).is_err() {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+        }
+        let Ok(_fingerprint) = r.take(4) else { continue };
+        let Ok(_purpose) = r.take(4) else { continue }; // path level 0
+        let Ok(coin_type_bytes) = r.take(4) else { continue }; // path level 1
+        let raw = u32::from_le_bytes(coin_type_bytes.try_into().expect("take(4) yields 4 bytes"));
+        if raw & 0x8000_0000 != 0 {
+            return Some(raw & 0x7fff_ffff);
+        }
+        // Not hardened where the coin-type level always is — doesn't look
+        // like this field after all; keep scanning `unknown` in case
+        // another entry matches.
+    }
+    None
 }
 
 fn parse_txout(bytes: &[u8]) -> Result<TxOut, Error> {

@@ -176,3 +176,66 @@ fn rust_bitcoin_psbt_parses_in_our_codec() {
     }
     assert_eq!(hex::encode(ours.extract_final_tx().unwrap().serialize_segwit()), note.raw_hex);
 }
+
+/// Port B (network-display fix, 2026-07-19): `input_derivation_coin_type`
+/// reads a real BIP-371 `tap_key_origins` entry the way an external tool
+/// (Sparrow, a funding-wallet manager, anything that imported our
+/// `export.rs` account descriptor) would actually attach it — built here
+/// with rust-bitcoin itself, exactly like `rust_bitcoin_psbt_parses_in_our_codec`
+/// exercises real interop rather than a hand-rolled byte string.
+#[test]
+fn input_derivation_coin_type_reads_real_tap_key_origin() {
+    use bitcoin::bip32::{ChildNumber, Fingerprint, KeySource};
+    use bitcoin::secp256k1::XOnlyPublicKey;
+    use bitcoin::TapLeafHash;
+
+    let id = id();
+    let (psbt, _note, _) = unsigned_psbt(&id);
+    let bytes = psbt.serialize();
+    let mut bpsbt = bitcoin::Psbt::deserialize(&bytes).unwrap();
+
+    let internal = XOnlyPublicKey::from_slice(&id.internal_x).unwrap();
+    let fp = Fingerprint::from([0xaa, 0xbb, 0xcc, 0xdd]);
+    // m/86'/1'/0'/0/0 — coin_type' = 1 (every non-mainnet network in this
+    // ecosystem's own `seeds::coin_type`).
+    let path: Vec<ChildNumber> = vec![
+        ChildNumber::from_hardened_idx(86).unwrap(),
+        ChildNumber::from_hardened_idx(1).unwrap(),
+        ChildNumber::from_hardened_idx(0).unwrap(),
+        ChildNumber::from_normal_idx(0).unwrap(),
+        ChildNumber::from_normal_idx(0).unwrap(),
+    ];
+    let source: KeySource = (fp, path.into());
+    bpsbt.inputs[0].tap_key_origins.insert(internal, (Vec::<TapLeafHash>::new(), source));
+
+    let reserialized = bpsbt.serialize();
+    let ours = Psbt::deserialize(&reserialized).unwrap();
+    assert_eq!(ours.input_derivation_coin_type(0), Some(1));
+    // Input 1 never got an origin attached — no signal, not a crash.
+    assert_eq!(ours.input_derivation_coin_type(1), None);
+
+    // Round-trip through OUR serializer preserves the unknown field
+    // byte-for-byte (lossless fidelity, psbt.rs's own doc promise), so the
+    // signal survives us re-emitting the PSBT too.
+    let ours_bytes = ours.serialize();
+    let ours_again = Psbt::deserialize(&ours_bytes).unwrap();
+    assert_eq!(ours_again.input_derivation_coin_type(0), Some(1));
+}
+
+/// Absence and malformed data must both yield `None`, never panic or
+/// misread — this function backs a display-only confirm-screen decision,
+/// never signing/validation.
+#[test]
+fn input_derivation_coin_type_is_none_when_absent_or_malformed() {
+    let id = id();
+    let (psbt, _note, _) = unsigned_psbt(&id);
+    // No BIP32 fields attached at all (unsigned_psbt never sets any).
+    assert_eq!(psbt.input_derivation_coin_type(0), None);
+    assert_eq!(psbt.input_derivation_coin_type(99), None); // out of range
+
+    // A same-type-byte field that's too short to contain a coin-type level
+    // must not panic and must not fabricate a value.
+    let mut broken = psbt.clone();
+    broken.inputs[0].unknown.push((vec![0x16], vec![0x00, 0x01, 0x02])); // n=0 hashes, 3 leftover bytes only
+    assert_eq!(broken.input_derivation_coin_type(0), None);
+}

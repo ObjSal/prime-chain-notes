@@ -1090,6 +1090,41 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+
+                    // Honest-fee-label (2026-07-19): the fee row above is
+                    // ALREADY the real network fee at this rate — this row
+                    // names the separate sub-dust leftover riding on top of
+                    // it (folded into the fee because it's too small to be
+                    // its own change output), so the total never reads as
+                    // an unexplained/inflated fee. Warn-tinted like the
+                    // banner above, but its own key:value row (a specific
+                    // fact, not a general advisory).
+                    if ConfirmSign.fold != "": Rectangle {
+                        background: Theme.palette-surface;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: #eab308;
+                        VerticalLayout {
+                            padding: 12px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: "Leftover (dust rule)";
+                                    color: #eab308;
+                                    font-family: "Montserrat";
+                                    font-size: 13px;
+                                    horizontal-stretch: 1;
+                                }
+                                Text {
+                                    text: ConfirmSign.fold;
+                                    color: #eab308;
+                                    font-family: "SourceCodePro";
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
