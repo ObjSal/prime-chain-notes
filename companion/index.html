@@ -326,6 +326,17 @@ $("buildBtn").addEventListener("click", async () => {
         const inputPrevoutSpks = t.vin
           .map((i) => i.prevout && i.prevout.scriptpubkey)
           .filter(Boolean);
+        // Addresses of EVERY non-OP_RETURN output, ascending vout order
+        // (multi-recipient directed notes, FLAG_MULTI: recipients precede
+        // change by construction, so notes-core's decoder slices
+        // output_addrs[0..count] as the recipient list). Not filtered
+        // against `address` — mirrors notes-core's OnchainTx.output_addrs
+        // exactly. An output with no address (shouldn't happen for a
+        // non-OP_RETURN output) is skipped, keeping the order of the rest.
+        const outputAddrs = t.vout
+          .filter((o) => o.scriptpubkey_type !== "op_return")
+          .map((o) => o.scriptpubkey_address)
+          .filter(Boolean);
         return {
           txid: t.txid,
           height: t.status.confirmed ? t.status.block_height : null,
@@ -336,6 +347,7 @@ $("buildBtn").addEventListener("click", async () => {
           author_candidates: authorCandidates,
           recipient,
           input_prevout_spks: inputPrevoutSpks,
+          output_addrs: outputAddrs,
           payloads,
         };
       })

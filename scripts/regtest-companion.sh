@@ -98,7 +98,12 @@ bundle)
         else
             height=null; blocktime=null
         fi
-        notes_onchain="$(jq --argjson tx "{\"txid\":\"$txid\",\"height\":$height,\"blocktime\":$blocktime,\"spends_from_self\":$self,\"payloads\":$payloads}" '. + [$tx]' <<<"$notes_onchain")"
+        # Addresses of every non-OP_RETURN ("nulldata") output, ascending
+        # vout order — mirrors notes-core's OnchainTx.output_addrs /
+        # companion/index.html's output_addrs (FLAG_MULTI recipient-list
+        # decode: recipients are output_addrs[0..count], preceding change).
+        output_addrs="$(jq '[.vout[] | select(.scriptPubKey.type != "nulldata") | .scriptPubKey.address] | map(select(. != null))' <<<"$raw")"
+        notes_onchain="$(jq --argjson tx "{\"txid\":\"$txid\",\"height\":$height,\"blocktime\":$blocktime,\"spends_from_self\":$self,\"payloads\":$payloads,\"output_addrs\":$output_addrs}" '. + [$tx]' <<<"$notes_onchain")"
     done
     jq -n --argjson utxos "$utxos" --argjson notes "$notes_onchain" --argjson tip "$tip" --argjson owner_used "$owner_used" '{
         network: "regtest", full: true, tip_height: $tip,

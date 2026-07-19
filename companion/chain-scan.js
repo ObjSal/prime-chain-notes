@@ -15,6 +15,15 @@ const API = {
 
 const FLAG_PRIVATE = 0x01;
 const FLAG_DIRECTED = 0x02;
+// Multi-recipient directed note (notes-core/src/envelope.rs FLAG_MULTI,
+// 2026-07-19): only ever set together with FLAG_DIRECTED. Body framing:
+// public  (FLAG_PRIVATE clear): `count(u8) || utf8 text`
+// private (FLAG_PRIVATE set):   `count(u8) || count × wrap(72B) || sealed_body`
+// The browser has no decryption key for the wraps/sealed_body — a private
+// multi note renders the same encrypted placeholder as any other private
+// note. `count` is liberal: 1..=255 accepted, 0 (or a body too short to
+// even carry the count byte) is undecodable, never a throw.
+const FLAG_MULTI = 0x04;
 const P2TR_RE = /^(bc|tb|bcrt)1p/;
 
 const shortAddr = (a) => (a && a.length > 17 ? `${a.slice(0, 8)}…${a.slice(-6)}` : a || "unknown");
@@ -165,6 +174,15 @@ async function scanAddress(base, address, onPage, myAddresses, notebookAddresses
     }
     const txHeight = t.status.confirmed ? t.status.block_height : null;
     const txTime = t.status.confirmed ? t.status.block_time : null;
+    // Every NON-OP_RETURN output's address, ascending vout order — the
+    // FLAG_MULTI recipient list is `outputAddrs[0..count]` (recipients
+    // precede change by construction; mirrors notes-core's OnchainTx.
+    // output_addrs). Not filtered against `address`: the spec is "the
+    // first count non-OP_RETURN outputs", full stop.
+    const outputAddrs = t.vout
+      .filter((o) => o.scriptpubkey_type !== "op_return")
+      .map((o) => o.scriptpubkey_address)
+      .filter(Boolean);
     for (const payloadHex of payloads) {
       const chunk = decodeEnvelope(hexToBytes(payloadHex));
       if (!chunk) { nonPnte++; continue; }
@@ -187,7 +205,7 @@ async function scanAddress(base, address, onPage, myAddresses, notebookAddresses
         }
         entry = { noteId: chunk.noteId, chunks: [], txids: [], height: null,
                   blocktime: null, received: originKey !== "own", from, to: null,
-                  notebookAnchor };
+                  outputAddrs: null, notebookAnchor };
         byId.set(key, entry);
       }
       // Drop exact duplicates (same chunk seen in overlapping txs).
@@ -195,6 +213,7 @@ async function scanAddress(base, address, onPage, myAddresses, notebookAddresses
       entry.chunks.push(chunk);
       if (!entry.txids.includes(t.txid)) entry.txids.push(t.txid);
       if (!entry.to) entry.to = to;
+      if (!entry.outputAddrs) entry.outputAddrs = outputAddrs;
       // A note's height is its FIRST confirmation.
       if (txHeight != null && (entry.height == null || txHeight < entry.height)) {
         entry.height = txHeight;
@@ -215,8 +234,27 @@ async function scanAddress(base, address, onPage, myAddresses, notebookAddresses
     const flags = entry.chunks[0].flags;
     const priv = (flags & FLAG_PRIVATE) !== 0;
     const directed = (flags & FLAG_DIRECTED) !== 0;
+    const multi = (flags & FLAG_MULTI) !== 0;
     let text = null;
-    if (asm.body && !priv) {
+    // Multi-recipient (FLAG_MULTI): body = count(u8) || rest. `count`
+    // liberal decode — 1..=255 accepted, 0 (or an empty/missing body)
+    // undecodable. Recipients = the first `count` non-OP_RETURN outputs
+    // of the tx (populated whenever count > 0, own AND received alike —
+    // mirrors notes-core's bundle.rs). Private bodies stay sealed (no key
+    // in the browser) — text stays null, same placeholder the card
+    // renderer already shows for any other private note.
+    let recipients = [];
+    if (multi) {
+      const count = asm.body && asm.body.length ? asm.body[0] : 0;
+      if (count > 0) {
+        recipients = (entry.outputAddrs || []).slice(0, count);
+        if (!priv) {
+          const rest = asm.body.slice(1);
+          try { text = new TextDecoder("utf-8", { fatal: true }).decode(rest); }
+          catch { text = null; }
+        }
+      }
+    } else if (asm.body && !priv) {
       try { text = new TextDecoder("utf-8", { fatal: true }).decode(asm.body); }
       catch { text = null; }
     }
@@ -224,9 +262,11 @@ async function scanAddress(base, address, onPage, myAddresses, notebookAddresses
       noteId: entry.noteId,
       private: priv,
       directed,
+      multi,
       received: entry.received,
       from: entry.received ? entry.from : null,
-      to: entry.received ? null : (directed ? entry.to : null),
+      to: entry.received ? null : (directed && !multi ? entry.to : null),
+      recipients,
       partial: asm.partial || null,
       bodyLen: asm.body ? asm.body.length : null,
       text,
@@ -261,6 +301,7 @@ function buildNoteCard(n, explorer, permalinkHref) {
   };
   pill(n.private ? "private" : "public");
   if (n.received) pill(`from ${shortAddr(n.from)}`);
+  else if (n.multi && n.recipients.length) pill(`to ${n.recipients.length} recipients`);
   else if (n.directed && n.to) pill(`to ${shortAddr(n.to)}`);
   if (n.height == null) pill("unconfirmed");
   if (n.partial) pill(`partial ${n.partial.have}/${n.partial.total}`);
@@ -272,6 +313,16 @@ function buildNoteCard(n, explorer, permalinkHref) {
     head.appendChild(a);
   }
   card.appendChild(head);
+
+  // Full recipient list for an own multi-recipient note — the "to N
+  // recipients" pill names the count, this line names them (consistent
+  // with a single directed note's "to <addr>" pill, just plural).
+  if (!n.received && n.multi && n.recipients.length) {
+    const rec = document.createElement("div");
+    rec.className = "note-meta";
+    rec.textContent = "to: " + n.recipients.map(shortAddr).join(", ");
+    card.appendChild(rec);
+  }
 
   const body = document.createElement("div");
   body.className = "note-body";
