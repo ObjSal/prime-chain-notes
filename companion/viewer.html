@@ -88,6 +88,12 @@ let serverMode = false;
 // to additional funding-source addresses via chain-scan.js's myAddresses
 // param — the notebook owner's link to disclose, default omits it (no
 // disclosure; PLAN-chain-notes-funding-unification.md open question 1).
+// The P2TR-looking entries in that same list double as chain-scan.js's
+// `notebookAddresses` (DISPLAY-OWNER dedup, 2026-07-18): if `&mine=` lists
+// a SIBLING notebook address (as opposed to a non-taproot funding-wallet
+// address), a tx spending from both this page's address and that sibling
+// would otherwise render on both notebooks' pages — dedup keeps it only on
+// whichever is the first-notebook-input owner.
 let mineAddresses = [];
 
 const $ = (id) => document.getElementById(id);
@@ -149,8 +155,9 @@ async function loadNotes() {
   $("notesHeader").textContent = "Loading…";
   try {
     log(logEl, `Scanning ${address} on ${net()}…`);
+    const notebookAddresses = mineAddresses.filter((a) => P2TR_RE.test(a));
     const scan = await scanAddress(API[net()].base, address,
-      (n) => log(logEl, `  …paged ${n} more confirmed txs`), mineAddresses);
+      (n) => log(logEl, `  …paged ${n} more confirmed txs`), mineAddresses, notebookAddresses);
 
     render(scan.notes, address);
     const bits = [`${scan.notes.length} note(s)`, `${scan.noteTxs} note tx(s)`];

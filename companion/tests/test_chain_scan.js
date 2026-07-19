@@ -8,6 +8,12 @@
 // Also covers the funding-unification myAddresses extension (mirrors
 // notes-core's extract_notes_multi self-spk-SET rule): additive-only, old
 // 2-arg callers byte-identical, an unrelated address never falsely OWNs.
+// And the 2026-07-18 DISPLAY-OWNER dedup (`notebookAddresses`, mirrors
+// notes-core's extract_notes_multi_deduped): first-notebook-input-in-tx-
+// order wins, order-flip flips the owner, a non-notebook input earlier in
+// the tx never steals the anchor, dedup is opt-in (omitted/empty arg is a
+// byte-identical no-op), and a note with no notebook input at all is
+// unaffected.
 //
 // No network, no browser: chain-scan.js runs in a vm context against a
 // fetch stub serving synthetic esplora JSON.  Run: node tests/test_chain_scan.js
@@ -22,6 +28,7 @@ const ADDR = "bcrt1ptestaddress";           // the scanned address (taproot-ish 
 const PEER = "bcrt1ppeeraddress";           // a taproot counterparty
 const V0 = "bcrt1qsomeoneelse";             // a non-taproot address
 const FUNDER = "bcrt1qfunderfunderfunder";  // a P2WPKH funding-wallet address (not taproot)
+const NB2 = "bcrt1pnotebooktwoaddress";     // a SIBLING notebook address (also taproot)
 const FLAG_PRIVATE = 0x01;
 const FLAG_DIRECTED = 0x02;
 
@@ -33,14 +40,16 @@ function chunkSpk(noteId, seq, total, flags, dataUtf8) {
   return "6a" + (payload.length / 2).toString(16).padStart(2, "0") + payload;
 }
 
-// A tx carrying `spks` OP_RETURNs. opts: vinAddr (prevout address),
-// voutAddrs (non-OP_RETURN payment outputs, in order).
+// A tx carrying `spks` OP_RETURNs. opts: vinAddr (single prevout address),
+// vinAddrs (MULTIPLE prevout addresses, in tx order — overrides vinAddr;
+// for the DISPLAY-OWNER dedup tests), voutAddrs (non-OP_RETURN payment
+// outputs, in order).
 function tx(txid, spks, height, opts = {}) {
-  const vinAddr = opts.vinAddr ?? ADDR;
+  const vinAddrs = opts.vinAddrs ?? [opts.vinAddr ?? ADDR];
   const voutAddrs = opts.voutAddrs ?? [ADDR];
   return {
     txid,
-    vin: [{ prevout: { scriptpubkey_address: vinAddr } }],
+    vin: vinAddrs.map((a) => (a == null ? {} : { prevout: { scriptpubkey_address: a } })),
     vout: [
       ...spks.map((spk) => ({ scriptpubkey_type: "op_return", scriptpubkey: spk })),
       ...voutAddrs.map((a) => ({
@@ -103,6 +112,34 @@ const HISTORIES = {
   funded: [
     tx("tx_funded", [chunkSpk("f0f1f2f3", 0, 1, 0, "funded by external wallet")], 401,
        { vinAddr: FUNDER, voutAddrs: [ADDR] }),
+  ],
+  // DISPLAY-OWNER dedup (2026-07-18): a tx spending from TWO notebook
+  // addresses, ADDR first then NB2. The stub `fetch` ignores which address
+  // was actually requested (keyed by scenario name only), so scanning this
+  // SAME history as both ADDR and NB2 mirrors two independent notebooks
+  // scanning the identical tx.
+  dual: [
+    tx("tx_dual", [chunkSpk("d0d0d0d0", 0, 1, 0, "owned by two notebooks")], 500,
+       { vinAddrs: [ADDR, NB2], voutAddrs: [ADDR] }),
+  ],
+  // Same shape, notebook inputs reversed (NB2 first) — the owner must flip.
+  dualFlipped: [
+    tx("tx_dual_flip", [chunkSpk("d1d1d1d1", 0, 1, 0, "owned by two notebooks, reversed")], 501,
+       { vinAddrs: [NB2, ADDR], voutAddrs: [ADDR] }),
+  ],
+  // A non-notebook (funding-wallet) input at position 0, the notebook
+  // (ADDR) input at position 1 — the refinement: FUNDER must not steal the
+  // anchor away from ADDR.
+  dualWpkhFirst: [
+    tx("tx_dual_wpkh", [chunkSpk("d2d2d2d2", 0, 1, 0, "wallet-funded but notebook-anchored")],
+       502, { vinAddrs: [FUNDER, ADDR], voutAddrs: [ADDR] }),
+  ],
+  // One input has no `prevout` data at all (esplora sometimes omits it) —
+  // the anchor search must skip it without crashing, still finding the
+  // real notebook input that follows.
+  dualMissingPrevout: [
+    tx("tx_dual_missing", [chunkSpk("d3d3d3d3", 0, 1, 0, "missing prevout data on input 0")],
+       503, { vinAddrs: [null, ADDR], voutAddrs: [ADDR] }),
   ],
 };
 
@@ -212,6 +249,67 @@ vm.runInContext(`
          "funded (myAddresses=[unrelated PEER]): must stay received: " +
          JSON.stringify(fundedUnrelated.notes[0]));
   console.log("PASS unrelated myAddresses entry does not falsely mark a note OWN");
+
+  // --- DISPLAY-OWNER dedup (2026-07-18, mirrors extract_notes_multi_deduped) ---
+
+  // (a) A tx spending from ADDR then NB2: scanning the SAME history as
+  // both notebooks independently, exactly one keeps the note — the
+  // first-notebook-input owner, ADDR. Never-zero across both scans.
+  const dualAsAddr = await scanAddress("stub:dual", ${JSON.stringify(ADDR)}, undefined, [],
+                                        [${JSON.stringify(NB2)}]);
+  const dualAsNb2 = await scanAddress("stub:dual", ${JSON.stringify(NB2)}, undefined, [],
+                                       [${JSON.stringify(ADDR)}]);
+  assert(dualAsAddr.notes.length === 1, "dual: ADDR (first notebook input) must keep the note");
+  assert(dualAsNb2.notes.length === 0, "dual: NB2 must not also display it");
+  assert(dualAsAddr.notes.length + dualAsNb2.notes.length === 1,
+         "dual: never-zero — exactly one scan keeps the note");
+  console.log("PASS DISPLAY-OWNER dedup: first-notebook-input (in tx order) wins, never-zero");
+
+  // (b) Same shape, inputs reversed — the owner flips to NB2.
+  const flipAsAddr = await scanAddress("stub:dualFlipped", ${JSON.stringify(ADDR)}, undefined,
+                                        [], [${JSON.stringify(NB2)}]);
+  const flipAsNb2 = await scanAddress("stub:dualFlipped", ${JSON.stringify(NB2)}, undefined,
+                                       [], [${JSON.stringify(ADDR)}]);
+  assert(flipAsAddr.notes.length === 0, "dualFlipped: ADDR is no longer first, must not keep");
+  assert(flipAsNb2.notes.length === 1, "dualFlipped: NB2 (now first) must keep the note");
+  console.log("PASS DISPLAY-OWNER dedup: owner flips with input order");
+
+  // (c) A funding-wallet (non-notebook) input at position 0 must not steal
+  // the anchor from the real notebook input that follows.
+  const wpkhFirst = await scanAddress("stub:dualWpkhFirst", ${JSON.stringify(ADDR)}, undefined,
+                                       [], [${JSON.stringify(NB2)}]);
+  assert(wpkhFirst.notes.length === 1 && !wpkhFirst.notes[0].received,
+         "dualWpkhFirst: notebook input still anchors despite a non-notebook input first: " +
+         JSON.stringify(wpkhFirst.notes[0]));
+  console.log("PASS DISPLAY-OWNER dedup: non-notebook input at position 0 does not steal the anchor");
+
+  // (d) A note with NO notebook input at all (pure funding-wallet shape,
+  // reusing the "funded" fixture) is unaffected by dedup being enabled —
+  // the anchor search finds nothing, so it's kept exactly as before.
+  const fundedDeduped = await scanAddress("stub:funded", ${JSON.stringify(ADDR)}, undefined,
+                                           [${JSON.stringify(FUNDER)}], [${JSON.stringify(NB2)}]);
+  assert(!fundedDeduped.notes[0].received,
+         "funded + notebookAddresses set: no notebook input present, must stay kept/OWN: " +
+         JSON.stringify(fundedDeduped.notes[0]));
+  console.log("PASS DISPLAY-OWNER dedup: no-op when the tx has no notebook input at all");
+
+  // (e) notebookAddresses omitted (old 2/4-arg calls) and an explicit empty
+  // array must be byte-identical to each other — dedup is strictly opt-in.
+  const dualOld = await scanAddress("stub:dual", ${JSON.stringify(ADDR)});
+  const dualEmptyArr = await scanAddress("stub:dual", ${JSON.stringify(ADDR)}, undefined, [], []);
+  assert(dualOld.notes.length === 1 && dualEmptyArr.notes.length === 1,
+         "dual: omitted/empty notebookAddresses must both keep the note (dedup off)");
+  console.log("PASS DISPLAY-OWNER dedup: omitted/empty notebookAddresses is a byte-identical no-op");
+
+  // (f) A missing "prevout" field on one input (esplora sometimes omits
+  // it) must not crash the anchor search — it's skipped, and the real
+  // notebook input that follows still anchors correctly.
+  const missingPrevout = await scanAddress("stub:dualMissingPrevout", ${JSON.stringify(ADDR)},
+                                            undefined, [], [${JSON.stringify(NB2)}]);
+  assert(missingPrevout.notes.length === 1 && !missingPrevout.notes[0].received,
+         "dualMissingPrevout: a prevout-less input must not crash or block the real anchor: " +
+         JSON.stringify(missingPrevout.notes[0]));
+  console.log("PASS DISPLAY-OWNER dedup: a missing-prevout input is skipped, not fatal");
 
   console.log("CHAIN-SCAN UNIT TESTS PASSED");
 })().catch((e) => { console.error("FAIL " + e.message); process.exit(1); });

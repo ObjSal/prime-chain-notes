@@ -105,9 +105,27 @@ function reassemble(chunks) {
 // `myAddresses` defaults to just [address], so every existing caller's
 // behavior is byte-identical — this is a pure extension, never a narrowing,
 // mirroring the Rust self-spk-SET rule exactly (OR, not replace).
+//
+// Optional `notebookAddresses` (5th arg): mirrors notes-core's
+// `extract_notes_multi_deduped` DISPLAY-OWNER rule (2026-07-18 design
+// decision — a protocol DISPLAY rule, not an ownership change). When a tx
+// spends from MULTIPLE notebook addresses, scanning each independently
+// would otherwise show the same own note on every one of their pages. When
+// `notebookAddresses` is given (a non-empty list of ALL of a wallet's
+// notebook addresses — NOT the full `myAddresses` set, so a funding-wallet
+// input never steals the anchor), an own note is kept only when the FIRST
+// input (in tx order) whose prevout address is in
+// `{address, ...notebookAddresses}` equals `address` itself — i.e. this
+// scan is the first-notebook-input owner. Omitting `notebookAddresses`
+// (undefined/empty, the default) disables dedup entirely — byte-identical
+// to today's behavior, so every existing caller (including old calls in
+// this same file's tests) is unaffected.
 // Returns { notes (newest-first), noteTxs, receivedTxs, txsScanned, foreign, nonPnte }.
-async function scanAddress(base, address, onPage, myAddresses) {
+async function scanAddress(base, address, onPage, myAddresses, notebookAddresses) {
   const mine = new Set([address, ...(myAddresses || [])]);
+  const notebookSet = notebookAddresses && notebookAddresses.length
+    ? new Set([address, ...notebookAddresses])
+    : null;
   const txs = await fullHistory(base, address, onPage);
 
   const byId = new Map();
@@ -154,8 +172,22 @@ async function scanAddress(base, address, onPage, myAddresses) {
       const key = `${chunk.noteId}|${originKey}`;
       let entry = byId.get(key);
       if (!entry) {
+        // DISPLAY-OWNER anchor, computed once from the FIRST tx that
+        // introduces this note+origin (later txs carrying more chunks of
+        // the same note don't move it) — the first input (in tx order)
+        // whose prevout address is a notebook address, or null when dedup
+        // is disabled (`notebookSet` null) or no notebook input matches
+        // (the dust-anchored spending/external-funded shape — unchanged).
+        let notebookAnchor = null;
+        if (originKey === "own" && notebookSet) {
+          const hit = t.vin.find(
+            (i) => i.prevout && notebookSet.has(i.prevout.scriptpubkey_address)
+          );
+          notebookAnchor = hit ? hit.prevout.scriptpubkey_address : null;
+        }
         entry = { noteId: chunk.noteId, chunks: [], txids: [], height: null,
-                  blocktime: null, received: originKey !== "own", from, to: null };
+                  blocktime: null, received: originKey !== "own", from, to: null,
+                  notebookAnchor };
         byId.set(key, entry);
       }
       // Drop exact duplicates (same chunk seen in overlapping txs).
@@ -173,6 +205,12 @@ async function scanAddress(base, address, onPage, myAddresses) {
 
   const notes = [];
   for (const entry of byId.values()) {
+    // DISPLAY-OWNER dedup: an own note anchored to a DIFFERENT notebook
+    // address is displayed only by that notebook's scan, not this one. A
+    // null anchor (no notebook input, or dedup disabled) always keeps —
+    // never a narrowing of OWN-ness itself, only of which single scan
+    // renders it.
+    if (!entry.received && entry.notebookAnchor && entry.notebookAnchor !== address) continue;
     const asm = reassemble(entry.chunks);
     const flags = entry.chunks[0].flags;
     const priv = (flags & FLAG_PRIVATE) !== 0;
