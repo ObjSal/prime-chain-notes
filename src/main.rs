@@ -10,7 +10,7 @@ use std::time::Duration;
 use notes_core::address::Recipient;
 use notes_core::bundle::{
     compose_directed_note_exact_amount, compose_directed_note_with_change_amount,
-    compose_note_exact, decode_scanned, estimate_note_cost, extract_notes_multi,
+    compose_note_exact, decode_scanned, estimate_note_cost, extract_notes_multi_deduped,
     sealed_note_payloads, Identity, SyncBundle,
 };
 use notes_core::address::p2tr_script_pubkey;
@@ -887,6 +887,27 @@ fn change_spk_len_preview(
 // notes-core's `confirm::summarize_signed_tx`; these helpers only gather
 // the LOOKUPS `ConfirmCtx` needs, never a verdict.)
 
+/// Every VISIBLE (non-archived) notebook's own P2TR scriptPubKey in
+/// wallet context (`seed`, `bip_account`), in notebook index order
+/// (`NotebookIndex::visible` iterates `notebooks` sorted by `account`,
+/// filtered to `!archived`). This is the `notebook_spks` anchor set for
+/// `extract_notes_multi_deduped`'s DISPLAY-OWNER dedup (device
+/// CLAUDE.md) — an archived notebook is excluded so its input can never
+/// suppress a note display in an active one. Derives one identity per
+/// visible notebook, so callers should compute this ONCE per bundle
+/// import (or confirm-screen build), never per tx/chunk.
+fn wallet_notebook_spks(
+    ix: &notebooks::NotebookIndex,
+    app_seed: &Option<[u8; 32]>,
+    net: &str,
+    ctx: (u32, u32),
+) -> Vec<Vec<u8>> {
+    ix.visible(ctx.0, ctx.1)
+        .filter_map(|m| derive_identity(app_seed, m, net))
+        .map(|id| p2tr_script_pubkey(&id.output_x))
+        .collect()
+}
+
 /// Every scriptPubKey this wallet controls in context (`seed`, `bip_account`)
 /// — every VISIBLE notebook's own P2TR spk (so consolidate-to-self and
 /// cross-notebook outputs classify correctly) plus the spending wallet's
@@ -898,11 +919,7 @@ fn confirm_self_spks(
     net: &str,
     ctx: (u32, u32),
 ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-    let notebook_spks: Vec<Vec<u8>> = ix
-        .visible(ctx.0, ctx.1)
-        .filter_map(|m| derive_identity(app_seed, m, net))
-        .map(|id| p2tr_script_pubkey(&id.output_x))
-        .collect();
+    let notebook_spks = wallet_notebook_spks(ix, app_seed, net, ctx);
     let spending_spks: Vec<Vec<u8>> =
         ix.spending(net, ctx.0, ctx.1).map(|s| s.self_spks()).unwrap_or_default();
     let mut self_spks = notebook_spks;
@@ -3352,6 +3369,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
         let seed_idx = seed_idx.clone();
         let bip_account = bip_account.clone();
         let active = active.clone();
+        let app_seed = app_seed.clone();
         Rc::new(move |json: &str, src: &str| -> Result<String, String> {
             let id_guard = identity.borrow();
             let id = id_guard.as_ref().ok_or("identity unavailable")?;
@@ -3369,13 +3387,22 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // Spending-unification: the self-spk SET is the notebook's
                 // own spk plus every address the spending wallet has issued
                 // (`SpendingSection.self_spks`) — extends OWN detection to
-                // funded/mixed-source notes (extract_notes_multi ORs with
-                // the producer's spends_from_self, never narrows).
+                // funded/mixed-source notes (extract_notes_multi_deduped ORs
+                // with the producer's spends_from_self, never narrows).
                 let ix = notebooks.borrow();
                 let ctx = notebook_ctx(&ix, *active.borrow())
                     .unwrap_or((*seed_idx.borrow(), *bip_account.borrow()));
                 let net_s = net.borrow().clone();
                 let section = ix.spending(&net_s, ctx.0, ctx.1).cloned();
+                // DISPLAY-OWNER dedup anchor set (device CLAUDE.md): every
+                // VISIBLE (non-archived) notebook's own spk in the active
+                // wallet context, derived ONCE per import — never per tx —
+                // by reusing the same per-notebook identity derivation
+                // `confirm_self_spks` already does for the confirm screen.
+                // Archived notebooks are excluded by `visible()`, so an
+                // archived notebook's input can never suppress a note in an
+                // active one.
+                let notebook_spks = wallet_notebook_spks(&ix, &app_seed, &net_s, ctx);
                 drop(ix);
                 let notebook_addr = id.address(st.network());
                 let self_spks: Vec<Vec<u8>> = {
@@ -3386,7 +3413,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     v
                 };
 
-                let recovered = extract_notes_multi(&bundle, id, st.network(), &self_spks);
+                let recovered = extract_notes_multi_deduped(
+                    &bundle,
+                    id,
+                    st.network(),
+                    &self_spks,
+                    &notebook_spks,
+                );
                 let mut new_notes = 0usize;
                 let mut received_notes = 0usize;
                 for r in &recovered {
