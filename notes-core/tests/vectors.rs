@@ -126,3 +126,162 @@ fn dm_derivation_vector() {
     );
 }
 
+/// FROZEN multi-recipient AAD layout (dm.rs): `multi_body_aad` = sender_x(32)
+/// || note_id(4), 36 bytes — pinned so a byte-layout regression is caught
+/// even though `seal_multi`/`seal_aad` use a random nonce internally (see
+/// `multi_seal_open_vector` below for a full round-trip pin).
+#[test]
+fn multi_body_aad_layout_vector() {
+    use notes_core::dm::multi_body_aad;
+    let sender_x = [0x11u8; 32];
+    let note_id = [0xAA, 0xBB, 0xCC, 0xDD];
+    let aad = multi_body_aad(&sender_x, &note_id);
+    assert_eq!(aad.len(), 36);
+    assert_eq!(&aad[..32], &sender_x);
+    assert_eq!(&aad[32..], &note_id);
+}
+
+/// Full `seal_multi`/open round-trip with FIXED identities and a fixed
+/// note_id: pins the wrap length (`dm::WRAP_LEN` == 72 bytes, always), that
+/// the recipient side (`open_received_multi`, own-index-first and
+/// fallback-to-any-wrap) and the sender side (`open_sent_multi`,
+/// index-0-first) both recover the SAME plaintext via the shared content
+/// key, and that authentication fails for a stranger, under a wrong
+/// note_id, and against a tampered wrap or a tampered sealed body (the
+/// AEAD-level protection that actually secures the content — a tampered
+/// *count* byte is a framing-layer concern, covered by the decode-liberal
+/// tests in `multi_recipient.rs`, not an AEAD failure here).
+#[test]
+fn multi_seal_open_vector() {
+    use notes_core::bundle::Identity;
+    use notes_core::dm;
+
+    let a = Identity::from_app_seed(&[7u8; 32]).unwrap(); // sender
+    let b = Identity::from_app_seed(&[9u8; 32]).unwrap(); // recipient 0
+    let c = Identity::from_app_seed(&[11u8; 32]).unwrap(); // recipient 1
+    let note_id = [1, 2, 3, 4];
+    let content_key = [0x55u8; 32];
+    let plaintext = b"shared secret for B and C";
+
+    let (wraps, sealed_body) = dm::seal_multi(
+        &a.tweaked_seckey,
+        &a.output_x,
+        &[b.output_x, c.output_x],
+        &note_id,
+        &content_key,
+        plaintext,
+    )
+    .unwrap();
+    assert_eq!(wraps.len(), 2);
+    assert_eq!(dm::WRAP_LEN, 72);
+    for w in &wraps {
+        assert_eq!(w.len(), dm::WRAP_LEN);
+    }
+
+    // Recipient B: own index (0) first.
+    let opened_b = dm::open_received_multi(
+        &b.tweaked_seckey,
+        &b.output_x,
+        &a.output_x,
+        &note_id,
+        &wraps,
+        &sealed_body,
+        Some(0),
+    )
+    .unwrap();
+    assert_eq!(opened_b, plaintext);
+
+    // Recipient C: own index (1) first.
+    let opened_c = dm::open_received_multi(
+        &c.tweaked_seckey,
+        &c.output_x,
+        &a.output_x,
+        &note_id,
+        &wraps,
+        &sealed_body,
+        Some(1),
+    )
+    .unwrap();
+    assert_eq!(opened_c, plaintext);
+
+    // Recipient B WITHOUT knowing its own index: fallback tries every wrap.
+    let opened_b_fallback = dm::open_received_multi(
+        &b.tweaked_seckey,
+        &b.output_x,
+        &a.output_x,
+        &note_id,
+        &wraps,
+        &sealed_body,
+        None,
+    )
+    .unwrap();
+    assert_eq!(opened_b_fallback, plaintext);
+
+    // Sender re-read: recovers K via recipient index 0 (B) and opens the body.
+    let opened_a = dm::open_sent_multi(
+        &a.tweaked_seckey,
+        &a.output_x,
+        &[b.output_x, c.output_x],
+        &note_id,
+        &wraps,
+        &sealed_body,
+    )
+    .unwrap();
+    assert_eq!(opened_a, plaintext);
+
+    // Wrong recipient (not a wrap holder) cannot open any wrap.
+    let stranger = Identity::from_app_seed(&[13u8; 32]).unwrap();
+    assert!(dm::open_received_multi(
+        &stranger.tweaked_seckey,
+        &stranger.output_x,
+        &a.output_x,
+        &note_id,
+        &wraps,
+        &sealed_body,
+        None,
+    )
+    .is_err());
+
+    // Wrong note_id: the wrap's AAD no longer matches.
+    let wrong_id = [9, 9, 9, 9];
+    assert!(dm::open_received_multi(
+        &b.tweaked_seckey,
+        &b.output_x,
+        &a.output_x,
+        &wrong_id,
+        &wraps,
+        &sealed_body,
+        Some(0),
+    )
+    .is_err());
+
+    // Tampered wrap byte -> AEAD auth failure.
+    let mut tampered_wraps = wraps.clone();
+    tampered_wraps[0][10] ^= 1;
+    assert!(dm::open_received_multi(
+        &b.tweaked_seckey,
+        &b.output_x,
+        &a.output_x,
+        &note_id,
+        &tampered_wraps,
+        &sealed_body,
+        Some(0),
+    )
+    .is_err());
+
+    // Tampered sealed-body byte -> AEAD auth failure even with a valid wrap.
+    let mut tampered_body = sealed_body.clone();
+    let last = tampered_body.len() - 1;
+    tampered_body[last] ^= 1;
+    assert!(dm::open_received_multi(
+        &b.tweaked_seckey,
+        &b.output_x,
+        &a.output_x,
+        &note_id,
+        &wraps,
+        &tampered_body,
+        Some(0),
+    )
+    .is_err());
+}
+

@@ -9,7 +9,10 @@
 use std::io::Read;
 
 use notes_core::address::Recipient;
-use notes_core::bundle::{compose_directed_note, compose_note, extract_notes, Identity, SyncBundle};
+use notes_core::bundle::{
+    compose_directed_note, compose_directed_note_multi_with_change, compose_note, extract_notes,
+    Identity, SyncBundle,
+};
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::Network;
 
@@ -231,6 +234,83 @@ fn main() {
                 })
             );
         }
+        Some("send-multi") => {
+            // send-multi <bundle.json|-> <public|private> <fee_rate> <max_or> <text> <addr:amt,addr:amt,...> [content_key_hex]
+            let bundle = read_bundle(&args[2]);
+            let network = Network::from_str_opt(&bundle.network).expect("bundle network");
+            let private = match args[3].as_str() {
+                "private" => true,
+                "public" => false,
+                other => panic!("visibility must be public|private, got {other}"),
+            };
+            let fee_rate: f64 = args[4].parse().unwrap();
+            let max_or: usize = args[5].parse().unwrap();
+            let text = &args[6];
+            let recipients: Vec<(Recipient, u64)> = args[7]
+                .split(',')
+                .map(|pair| {
+                    let (addr, amount) =
+                        pair.split_once(':').expect("recipient must be addr:amount");
+                    let recipient = Recipient::parse(network, addr).unwrap();
+                    let amount: u64 = amount.parse().expect("amount");
+                    (recipient, amount)
+                })
+                .collect();
+            // content_key: caller-supplied hex, else generated from the OS
+            // RNG here in the CLI only (notes-core itself never generates
+            // it — see dm.rs's module docs).
+            let content_key: [u8; 32] = if let Some(hex_key) = args.get(8) {
+                let mut k = [0u8; 32];
+                hex::decode_to_slice(hex_key, &mut k).expect("content_key: 64 hex chars");
+                k
+            } else {
+                let mut k = [0u8; 32];
+                getrandom::getrandom(&mut k).expect("OS rng");
+                k
+            };
+            let taken: std::collections::BTreeSet<[u8; 4]> = bundle
+                .notes_onchain
+                .iter()
+                .flat_map(|t| t.payloads.iter())
+                .filter_map(|p| hex::decode(p).ok())
+                .filter_map(|p| notes_core::envelope::decode(&p))
+                .map(|c| c.note_id)
+                .collect();
+            let note_id =
+                pick_unique_note_id(generate_note_id, |id| taken.contains(id)).unwrap();
+            let note = compose_directed_note_multi_with_change(
+                &identity,
+                &bundle.utxos(),
+                text,
+                private,
+                note_id,
+                &recipients,
+                content_key,
+                None,
+                max_or,
+                fee_rate,
+                || generate_aux_rand(),
+            )
+            .unwrap();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "note_id": hex::encode(note_id),
+                    "txid": note.txid_hex,
+                    "raw_hex": note.raw_hex,
+                    "fee": note.fee,
+                    "vsize": note.vsize,
+                    "change": note.change,
+                    "sent": note.sent,
+                    "recipients": recipients.iter().map(|(r, a)| serde_json::json!({
+                        "address": r.address,
+                        "amount": a,
+                    })).collect::<Vec<_>>(),
+                    "op_returns": note.tx.outputs.iter()
+                        .filter(|o| o.script_pubkey.first() == Some(&0x6a)).count(),
+                })
+            );
+        }
         Some("sweep") => {
             // sweep <bundle.json|-> <network> <dest_address> <fee_rate>
             let bundle = read_bundle(&args[2]);
@@ -275,6 +355,7 @@ fn main() {
                         "received": n.received,
                         "from": n.sender,
                         "to": n.recipient,
+                        "recipients": n.recipients,
                         "text": n.text,
                     })
                 })
@@ -282,7 +363,7 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
         }
         _ => {
-            eprintln!("usage: notes_cli address <network> | compose <bundle> <public|private> <fee_rate> <max_or> <text> | send <bundle> <recipient_addr> <public|private> <fee_rate> <max_or> <text> | scan <bundle> | sweep <bundle> <network> <dest_address> <fee_rate> | spending-address <network> <seed> <account> <chain> <index> | spending-sweep <network> <seed> <account> <chain> <index> <txid> <vout> <value> <dest_address> <fee_rate>");
+            eprintln!("usage: notes_cli address <network> | compose <bundle> <public|private> <fee_rate> <max_or> <text> | send <bundle> <recipient_addr> <public|private> <fee_rate> <max_or> <text> | send-multi <bundle> <public|private> <fee_rate> <max_or> <text> <addr:amt,addr:amt,...> [content_key_hex] | scan <bundle> | sweep <bundle> <network> <dest_address> <fee_rate> | spending-address <network> <seed> <account> <chain> <index> | spending-sweep <network> <seed> <account> <chain> <index> <txid> <vout> <value> <dest_address> <fee_rate>");
             std::process::exit(2);
         }
     }

@@ -66,7 +66,7 @@ build_bundle() { # $1 = output path, $2 = address (default $ADDR), $3 = wallet (
     txids="$(W listtransactions '*' 1000 | jq -r '[.[].txid] | unique | .[]')"
     notes_onchain="[]"
     for txid in $txids; do
-        local raw payloads self sender pays_self recipient height blocktime
+        local raw payloads self sender pays_self recipient output_addrs height blocktime
         raw="$(CLI getrawtransaction "$txid" 2 2>/dev/null || CLI -rpcwallet="$wallet" gettransaction "$txid" true true | jq .decoded)"
         # asm for nulldata is "OP_RETURN <payload-hex>"; take the data token.
         payloads="$(jq '[.vout[] | select(.scriptPubKey.type=="nulldata") | .scriptPubKey.asm | split(" ") | .[-1]]' <<<"$raw")"
@@ -83,6 +83,10 @@ build_bundle() { # $1 = output path, $2 = address (default $ADDR), $3 = wallet (
         # sender attributes them, recipient records who an own note paid.
         pays_self="$(jq --arg a "$addr" '[.vout[] | select(.scriptPubKey.address == $a)] | length > 0' <<<"$raw")"
         recipient="$(jq --arg a "$addr" -r '[.vout[] | select(.scriptPubKey.type != "nulldata") | .scriptPubKey.address // empty | select(. != $a and . != "")] | (map(select(startswith("bcrt1p"))) + .) | .[0] // empty' <<<"$raw")"
+        # Multi-recipient decode (FLAG_MULTI): every non-OP_RETURN output's
+        # address, in ascending vout order (recipients precede change by
+        # construction — bundle.rs slices output_addrs[0..count]).
+        output_addrs="$(jq '[.vout[] | select(.scriptPubKey.type != "nulldata") | .scriptPubKey.address] | map(select(. != null))' <<<"$raw")"
         local conf
         conf="$(W gettransaction "$txid" true | jq .confirmations)"
         if (( conf > 0 )); then
@@ -94,7 +98,7 @@ build_bundle() { # $1 = output path, $2 = address (default $ADDR), $3 = wallet (
         local sender_json recipient_json
         sender_json="$([[ -n "$sender" ]] && echo "\"$sender\"" || echo null)"
         recipient_json="$([[ -n "$recipient" ]] && echo "\"$recipient\"" || echo null)"
-        notes_onchain="$(jq --argjson tx "{\"txid\":\"$txid\",\"height\":$height,\"blocktime\":$blocktime,\"spends_from_self\":$self,\"pays_self\":$pays_self,\"sender\":$sender_json,\"recipient\":$recipient_json,\"payloads\":$payloads}" '. + [$tx]' <<<"$notes_onchain")"
+        notes_onchain="$(jq --argjson tx "{\"txid\":\"$txid\",\"height\":$height,\"blocktime\":$blocktime,\"spends_from_self\":$self,\"pays_self\":$pays_self,\"sender\":$sender_json,\"recipient\":$recipient_json,\"payloads\":$payloads,\"output_addrs\":$output_addrs}" '. + [$tx]' <<<"$notes_onchain")"
     done
     jq -n --argjson utxos "$utxos" --argjson notes "$notes_onchain" --argjson tip "$tip" '{
         network: "regtest", full: true, tip_height: $tip,
@@ -211,6 +215,59 @@ jq -e --arg b "$ADDR_B" '[.[] | select(.directed and (.received | not) and .to =
     || fail "A's directed notes must carry to=B"
 grep -q 'sealed for B alone' <<<"$SCANA" || fail "A cannot re-read its own sent private directed note"
 pass "A re-derived the DM key from the dust output and read its sent note"
+
+echo "== multi-recipient directed notes: A sends private to {B,C} and public to {B,C,D} =="
+SEED_C="$(printf '10%.0s' {1..32})"
+ADDR_C="$(NOTES_APP_SEED=$SEED_C "$NOTES" address regtest)"
+CLI createwallet watch_c true true >/dev/null
+DESC_C="$(CLI getdescriptorinfo "addr($ADDR_C)" | jq -r .descriptor)"
+CLI -rpcwallet=watch_c importdescriptors "[{\"desc\":\"$DESC_C\",\"timestamp\":0}]" >/dev/null
+
+SEED_D="$(printf '11%.0s' {1..32})"
+ADDR_D="$(NOTES_APP_SEED=$SEED_D "$NOTES" address regtest)"
+CLI createwallet watch_d true true >/dev/null
+DESC_D="$(CLI getdescriptorinfo "addr($ADDR_D)" | jq -r .descriptor)"
+CLI -rpcwallet=watch_d importdescriptors "[{\"desc\":\"$DESC_D\",\"timestamp\":0}]" >/dev/null
+
+build_bundle "$WORK/multi1.json"
+DM1="$("$NOTES" send-multi "$WORK/multi1.json" private 2 100000 'private multi: sealed for B and C only' "$ADDR_B:400,$ADDR_C:500")"
+jq -e '.recipients | length == 2' <<<"$DM1" >/dev/null || fail "expected 2 recipients in private multi compose"
+TDM1="$(broadcast "$DM1")"
+MINER generatetoaddress 1 "$(MINER getnewaddress)" >/dev/null
+
+build_bundle "$WORK/multi2.json"
+DM2="$("$NOTES" send-multi "$WORK/multi2.json" public 2 100000 'public multi: postcard to B, C, and D' "$ADDR_B:330,$ADDR_C:330,$ADDR_D:330")"
+jq -e '.recipients | length == 3' <<<"$DM2" >/dev/null || fail "expected 3 recipients in public multi compose"
+TDM2="$(broadcast "$DM2")"
+MINER generatetoaddress 1 "$(MINER getnewaddress)" >/dev/null
+pass "A sent private-multi(B,C) and public-multi(B,C,D) ($TDM1, $TDM2)"
+
+echo "== B and C both decrypt the private multi note =="
+build_bundle "$WORK/multiB.json" "$ADDR_B" watch_b
+SCAN_MB="$(NOTES_APP_SEED=$SEED_B "$NOTES" scan "$WORK/multiB.json")"
+grep -q 'sealed for B and C only' <<<"$SCAN_MB" || fail "B failed to decrypt the multi-recipient private note"
+jq -e '[.[] | select(.text == "private multi: sealed for B and C only")] | .[0].recipients | length == 2' >/dev/null <<<"$SCAN_MB" \
+    || fail "B's recovered multi note should list both recipients"
+build_bundle "$WORK/multiC.json" "$ADDR_C" watch_c
+SCAN_MC="$(NOTES_APP_SEED=$SEED_C "$NOTES" scan "$WORK/multiC.json")"
+grep -q 'sealed for B and C only' <<<"$SCAN_MC" || fail "C failed to decrypt the multi-recipient private note"
+pass "both B and C independently decrypted the shared content key"
+
+echo "== B, C, D all see the public multi note text =="
+build_bundle "$WORK/multiD.json" "$ADDR_D" watch_d
+SCAN_MD="$(NOTES_APP_SEED=$SEED_D "$NOTES" scan "$WORK/multiD.json")"
+grep -q 'postcard to B, C, and D' <<<"$SCAN_MB" || fail "B cannot read public multi text"
+grep -q 'postcard to B, C, and D' <<<"$SCAN_MC" || fail "C cannot read public multi text"
+grep -q 'postcard to B, C, and D' <<<"$SCAN_MD" || fail "D cannot read public multi text"
+pass "B, C, D all read the public multi-recipient note"
+
+echo "== A re-reads its own private multi note from a fresh state (wipe recovery: seed + bundle only) =="
+build_bundle "$WORK/restoreA_multi.json"
+SCANA_MULTI="$("$NOTES" scan "$WORK/restoreA_multi.json")"
+grep -q 'sealed for B and C only' <<<"$SCANA_MULTI" || fail "A failed to re-read its own multi-recipient private note after a wipe"
+jq -e '[.[] | select(.text == "private multi: sealed for B and C only")] | .[0].recipients | length == 2' >/dev/null <<<"$SCANA_MULTI" \
+    || fail "A's recovered multi note should list both recipients"
+pass "A re-derived the multi-recipient DM key from a recipient output key and read its sent note; recipients recorded"
 
 echo "== companion server.py: unknown-txid 404 vs found-txid 200 =="
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"

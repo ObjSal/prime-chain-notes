@@ -18,6 +18,20 @@ pub const FLAG_PRIVATE: u8 = 0x01;
 /// a dust output; private bodies sealed under the dm.rs ECDH key, not the
 /// self enc_key). Additive to the FROZEN v1 layout.
 pub const FLAG_DIRECTED: u8 = 0x02;
+/// flags bit 2: 1 = multi-recipient directed note (2..=255 recipients).
+/// Valid only together with FLAG_DIRECTED — a single-recipient directed
+/// note NEVER sets this bit (composers only emit it for count >= 2), so
+/// every pre-existing directed-note wire byte is unchanged. FROZEN body
+/// framing once this bit is set (see dm.rs for the multi-recipient crypto
+/// that fills it in):
+///   public  (FLAG_PRIVATE clear): `count(u8) || utf8 text`
+///   private (FLAG_PRIVATE set):   `count(u8) || count × wrap(72B each) || sealed_body`
+/// `count` is the number of recipients (the tx's recipient outputs,
+/// `output_addrs[0..count]`, precede change by construction). Decoders are
+/// LIBERAL: any count 1..=255 is accepted; count 0, or a body too short
+/// for the declared framing, is undecodable (not a crash) — see
+/// `bundle.rs`'s scanner.
+pub const FLAG_MULTI: u8 = 0x04;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
@@ -35,6 +49,10 @@ impl Chunk {
 
     pub fn is_directed(&self) -> bool {
         self.flags & FLAG_DIRECTED != 0
+    }
+
+    pub fn is_multi(&self) -> bool {
+        self.flags & FLAG_MULTI != 0
     }
 }
 

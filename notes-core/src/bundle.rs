@@ -6,10 +6,13 @@ use serde::{Deserialize, Serialize};
 use crate::address::{p2tr_script_pubkey, p2tr_x_of_address, taproot_address, Recipient};
 use crate::crypt;
 use crate::dm;
-use crate::envelope::{self, Chunk, FLAG_DIRECTED, FLAG_PRIVATE};
+use crate::envelope::{self, Chunk, FLAG_DIRECTED, FLAG_MULTI, FLAG_PRIVATE};
 use crate::keys::{derive_encryption_key, derive_identity_key, xonly_pubkey};
 use crate::taproot::{taproot_tweak_pubkey, taproot_tweak_seckey};
-use crate::tx::{build_note_tx_exact, build_note_tx_with_change, NoteTx, Utxo};
+use crate::tx::{
+    build_note_tx_exact, build_note_tx_multi_exact, build_note_tx_multi_with_change,
+    build_note_tx_with_change, NoteTx, Utxo,
+};
 use crate::{Error, Network};
 
 /// Everything derived from the app seed that the app needs at runtime.
@@ -142,6 +145,15 @@ pub struct OnchainTx {
     /// — old callers and old bundles are unaffected.
     #[serde(default)]
     pub input_prevout_spks: Vec<String>,
+    /// Addresses of every NON-OP_RETURN output, in ascending vout order
+    /// (multi-recipient directed notes, FLAG_MULTI: recipients precede
+    /// change by construction, so `output_addrs[0..count]` are the
+    /// recipients). Empty (serde default) on old bundles/producers that
+    /// don't fill it in — degrades gracefully: a FLAG_MULTI note simply
+    /// can't recover its recipient list or decode (same as any other
+    /// too-short-body case), never a crash.
+    #[serde(default)]
+    pub output_addrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,10 +257,47 @@ pub struct RecoveredNote {
     pub received: bool,
     /// Author address of a received note (first taproot input prevout).
     pub sender: Option<String>,
-    /// Recipient address of our own directed note.
+    /// Recipient address of our own directed note. Kept populated (first
+    /// recipient) for compatibility with single-recipient callers even on
+    /// a multi-recipient note — see `recipients` for the full list.
     pub recipient: Option<String>,
+    /// Full recipient list of a multi-recipient directed note (FLAG_MULTI,
+    /// `output_addrs[0..count]`), in output order. Empty for a
+    /// single-recipient directed note (use `recipient` instead) or a
+    /// self-note. Unlike `recipient` this is populated for BOTH own and
+    /// received notes — "who else was on this note" is meaningful either
+    /// way (see `reply_set`).
+    pub recipients: Vec<String>,
     /// None = private note that did not decrypt under our key (foreign).
     pub text: Option<String>,
+}
+
+/// `{sender} ∪ recipients` minus `my_address`, deduped, sender first then
+/// recipients in vout order — "who else was on this note", for a reply
+/// picker. Falls back to the legacy singular `recipient` field when
+/// `recipients` is empty (a single-recipient directed note, which never
+/// populates the plural field). A self-note (no sender, no recipients)
+/// returns an empty list.
+pub fn reply_set(note: &RecoveredNote, my_address: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |addr: &str, out: &mut Vec<String>| {
+        if addr != my_address && !out.iter().any(|a| a == addr) {
+            out.push(addr.to_string());
+        }
+    };
+    if let Some(s) = &note.sender {
+        push(s, &mut out);
+    }
+    if note.recipients.is_empty() {
+        if let Some(r) = &note.recipient {
+            push(r, &mut out);
+        }
+    } else {
+        for r in &note.recipients {
+            push(r, &mut out);
+        }
+    }
+    out
 }
 
 /// Scan a bundle's on-chain txs into notes.
@@ -421,6 +470,12 @@ fn extract_notes_inner(
         /// dust-anchored shape) or not applicable (received notes, or
         /// `notebook_spks` empty — dedup disabled).
         notebook_anchor: Option<Vec<u8>>,
+        /// Non-OP_RETURN output addresses of the FIRST tx that introduced
+        /// this note, ascending vout order — multi-recipient decode
+        /// (FLAG_MULTI) slices `output_addrs[0..count]` as the recipient
+        /// list. Empty for old bundles (serde default) or non-multi notes,
+        /// which never read this field.
+        output_addrs: Vec<String>,
     }
     let mut by_id: Vec<([u8; 4], Pending)> = Vec::new();
 
@@ -473,6 +528,7 @@ fn extract_notes_inner(
                             recipient: None,
                             author_candidates: Vec::new(),
                             notebook_anchor,
+                            output_addrs: tx.output_addrs.clone(),
                         },
                     ));
                     &mut by_id.last_mut().expect("just pushed").1
@@ -522,6 +578,7 @@ fn extract_notes_inner(
         let flags = pending.chunks[0].flags;
         let private = flags & FLAG_PRIVATE != 0;
         let directed = flags & FLAG_DIRECTED != 0;
+        let multi = flags & FLAG_MULTI != 0;
         let mut received = matches!(pending.origin, Origin::Received(_));
         // `sender` starts as the first-input address (display default); it and
         // `recipient`/`received` are corrected below once a directed-private
@@ -536,7 +593,125 @@ fn extract_notes_inner(
         let mut recipient =
             if received || !directed { None } else { pending.recipient.clone() };
 
-        let plaintext = if !private {
+        // Multi-recipient (FLAG_MULTI): the body's first byte is `count`;
+        // `output_addrs[0..count]` are the recipients (they precede change
+        // by construction). Populated whenever `count` parses as non-zero,
+        // for BOTH own and received notes (unlike the legacy singular
+        // `recipient` above) — see `reply_set`. `count == 0` or a body too
+        // short to even carry the count byte leaves this empty and
+        // `plaintext` (below) None — liberal decoding, not a crash.
+        let mut recipients: Vec<String> = Vec::new();
+        let multi_count: Option<usize> =
+            if multi { body.first().map(|&c| c as usize).filter(|&c| c > 0) } else { None };
+        if let Some(count) = multi_count {
+            recipients = pending.output_addrs.iter().take(count).cloned().collect();
+        }
+
+        let plaintext = if multi {
+            match multi_count {
+                // count == 0, or empty body: undecodable, not a crash.
+                None => None,
+                Some(count) => {
+                    let rest = &body[1..];
+                    if !private {
+                        Some(rest.to_vec())
+                    } else if keys.is_none() {
+                        None // watch-only: no decryption key on this device
+                    } else if !directed {
+                        // FLAG_MULTI without FLAG_DIRECTED never comes from any
+                        // composer (see envelope.rs) — no recipient keys to
+                        // even attempt against; liberal decode = undecodable.
+                        None
+                    } else {
+                        let identity = keys.expect("gated above");
+                        let wrap_total = count * dm::WRAP_LEN;
+                        if rest.len() < wrap_total {
+                            None // truncated wraps: undecodable, not a crash
+                        } else {
+                            let wraps: Vec<Vec<u8>> =
+                                rest[..wrap_total].chunks(dm::WRAP_LEN).map(<[u8]>::to_vec).collect();
+                            let sealed_body = &rest[wrap_total..];
+                            if received {
+                                // Received multi-recipient-private. Same
+                                // candidate search as the single-recipient
+                                // case (author = first-input sender, or any
+                                // taproot address seen in the tx), then the
+                                // same externally-funded-own-note fallback.
+                                let mut candidates: Vec<[u8; 32]> = Vec::new();
+                                let push_cand = |addr: &str, out: &mut Vec<[u8; 32]>| {
+                                    if let Some(x) = p2tr_x_of_address(network, addr) {
+                                        if x != identity.output_x && !out.contains(&x) {
+                                            out.push(x);
+                                        }
+                                    }
+                                };
+                                if let Some(s) = sender.as_deref() {
+                                    push_cand(s, &mut candidates);
+                                }
+                                for addr in &pending.author_candidates {
+                                    push_cand(addr, &mut candidates);
+                                }
+                                let my_index = recipients.iter().position(|a| {
+                                    p2tr_x_of_address(network, a) == Some(identity.output_x)
+                                });
+                                let mut recovered = None;
+                                for cand in &candidates {
+                                    if let Ok(pt) = dm::open_received_multi(
+                                        &identity.tweaked_seckey,
+                                        &identity.output_x,
+                                        cand,
+                                        &note_id,
+                                        &wraps,
+                                        sealed_body,
+                                        my_index,
+                                    ) {
+                                        sender = Some(taproot_address(network, cand));
+                                        recovered = Some(pt);
+                                        break;
+                                    }
+                                }
+                                if recovered.is_none() {
+                                    let recipients_x: Vec<[u8; 32]> = recipients
+                                        .iter()
+                                        .filter_map(|a| p2tr_x_of_address(network, a))
+                                        .collect();
+                                    if let Ok(pt) = dm::open_sent_multi(
+                                        &identity.tweaked_seckey,
+                                        &identity.output_x,
+                                        &recipients_x,
+                                        &note_id,
+                                        &wraps,
+                                        sealed_body,
+                                    ) {
+                                        // Our own externally-funded multi note.
+                                        received = false;
+                                        sender = None;
+                                        recovered = Some(pt);
+                                    }
+                                }
+                                recovered
+                            } else {
+                                // Own sent multi-recipient-private (self-funded):
+                                // re-derive via any recipient's output key.
+                                let recipients_x: Vec<[u8; 32]> = recipients
+                                    .iter()
+                                    .filter_map(|a| p2tr_x_of_address(network, a))
+                                    .collect();
+                                dm::open_sent_multi(
+                                    &identity.tweaked_seckey,
+                                    &identity.output_x,
+                                    &recipients_x,
+                                    &note_id,
+                                    &wraps,
+                                    sealed_body,
+                                )
+                                .ok()
+                            }
+                        }
+                    }
+                }
+            }
+        } else if !private {
             Some(body)
         } else if keys.is_none() {
             None // watch-only: no decryption key on this device
@@ -620,6 +795,14 @@ fn extract_notes_inner(
                     .ok()
                 })
         };
+        // Legacy singular `recipient` field, kept populated with the FIRST
+        // recipient for compatibility with single-recipient callers — same
+        // own-only gating as the single-recipient path above (`received` is
+        // now settled to its final value, including the externally-funded
+        // fallback that can flip it inside the match above).
+        if multi && !received && directed {
+            recipient = recipients.first().cloned();
+        }
         let text = plaintext.and_then(|pt| String::from_utf8(pt).ok());
 
         notes.push(RecoveredNote {
@@ -632,6 +815,7 @@ fn extract_notes_inner(
             received,
             sender,
             recipient,
+            recipients,
             text,
         });
     }
@@ -927,6 +1111,182 @@ pub fn compose_directed_note_exact_amount(
         &payloads,
         Some(&recipient.spk),
         recipient_amount,
+        change_spk,
+        fee_rate,
+        &identity.tweaked_seckey,
+        aux,
+    )
+}
+
+// ---------------------------------------------------------------------
+// Multi-recipient directed compose (FLAG_MULTI, 2..=255 recipients) — the
+// content-key hybrid scheme (dm.rs). Additive: none of the single-
+// recipient compose functions above are touched.
+// ---------------------------------------------------------------------
+
+/// Dedupe `recipients` by address (first occurrence wins, order otherwise
+/// preserved) and validate the resulting count is 1..=255 — shared by both
+/// multi-recipient compose entry points below.
+fn dedupe_recipients(recipients: &[(Recipient, u64)]) -> Result<Vec<&(Recipient, u64)>, Error> {
+    let mut deduped: Vec<&(Recipient, u64)> = Vec::new();
+    for r in recipients {
+        if !deduped.iter().any(|(existing, _)| existing.address == r.0.address) {
+            deduped.push(r);
+        }
+    }
+    if deduped.is_empty() || deduped.len() > 255 {
+        return Err(Error::Envelope("recipients: 1..=255"));
+    }
+    Ok(deduped)
+}
+
+/// Build the FLAG_MULTI body: `count(u8) || utf8 text` (public) or
+/// `count(u8) || count × wrap(72B) || sealed_body` (private, via
+/// `dm::seal_multi`). Shared by both compose entry points below.
+fn multi_body(
+    identity: &Identity,
+    text: &str,
+    private: bool,
+    note_id: [u8; 4],
+    deduped: &[&(Recipient, u64)],
+    content_key: [u8; 32],
+) -> Result<Vec<u8>, Error> {
+    if private {
+        let recipients_x: Vec<[u8; 32]> = deduped
+            .iter()
+            .map(|(r, _)| r.p2tr_x.ok_or(Error::RecipientNotTaproot))
+            .collect::<Result<_, _>>()?;
+        let (wraps, sealed_body) = dm::seal_multi(
+            &identity.tweaked_seckey,
+            &identity.output_x,
+            &recipients_x,
+            &note_id,
+            &content_key,
+            text.as_bytes(),
+        )?;
+        let mut body = Vec::with_capacity(1 + wraps.len() * dm::WRAP_LEN + sealed_body.len());
+        body.push(deduped.len() as u8);
+        for w in &wraps {
+            body.extend_from_slice(w);
+        }
+        body.extend_from_slice(&sealed_body);
+        Ok(body)
+    } else {
+        let mut body = Vec::with_capacity(1 + text.len());
+        body.push(deduped.len() as u8);
+        body.extend_from_slice(text.as_bytes());
+        Ok(body)
+    }
+}
+
+/// Multi-recipient directed compose: like `compose_directed_note_with_change_amount`
+/// but for MANY recipients, each with its own gift amount (>= DUST_LIMIT).
+/// Private bodies are sealed ONCE under a caller-supplied `content_key`
+/// (never stored — same convention as `note_id`; TRNG'd by the app) and
+/// wrapped once per recipient under the usual pairwise ECDH key — see
+/// dm.rs's module docs for the full scheme. Private therefore requires
+/// every recipient to be taproot (`RecipientNotTaproot` otherwise); public
+/// allows any segwit address, same policy as the single-recipient path.
+///
+/// `recipients` is deduped by address (first occurrence wins) BEFORE
+/// anything else, so a call that collapses to exactly one UNIQUE address —
+/// whether it started with one entry or several duplicates of the same
+/// address — delegates to `compose_directed_note_with_change_amount` and
+/// is therefore byte-identical to today's single-recipient wire format (no
+/// FLAG_MULTI, no count byte, no wraps, `content_key` unused).
+#[allow(clippy::too_many_arguments)]
+pub fn compose_directed_note_multi_with_change(
+    identity: &Identity,
+    utxos: &[Utxo],
+    text: &str,
+    private: bool,
+    note_id: [u8; 4],
+    recipients: &[(Recipient, u64)],
+    content_key: [u8; 32],
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let deduped = dedupe_recipients(recipients)?;
+    if deduped.len() == 1 {
+        let (recipient, amount) = deduped[0];
+        return compose_directed_note_with_change_amount(
+            identity,
+            utxos,
+            text,
+            private,
+            note_id,
+            recipient,
+            *amount,
+            change_spk,
+            max_op_return_bytes,
+            fee_rate,
+            aux,
+        );
+    }
+    let body = multi_body(identity, text, private, note_id, &deduped, content_key)?;
+    let flags = FLAG_DIRECTED | FLAG_MULTI | if private { FLAG_PRIVATE } else { 0 };
+    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    let recipient_pairs: Vec<(Vec<u8>, u64)> =
+        deduped.iter().map(|(r, amount)| (r.spk.clone(), *amount)).collect();
+    build_note_tx_multi_with_change(
+        utxos,
+        &identity.output_x,
+        &payloads,
+        &recipient_pairs,
+        change_spk,
+        fee_rate,
+        &identity.tweaked_seckey,
+        aux,
+    )
+}
+
+/// Coin-control (`_exact`) analog of [`compose_directed_note_multi_with_change`]:
+/// spend EXACTLY `inputs`. Same dedup/1-entry-delegation rule (delegates to
+/// `compose_directed_note_exact_amount`, byte-identical for a single
+/// unique address).
+#[allow(clippy::too_many_arguments)]
+pub fn compose_directed_note_multi_exact(
+    identity: &Identity,
+    inputs: &[Utxo],
+    text: &str,
+    private: bool,
+    note_id: [u8; 4],
+    recipients: &[(Recipient, u64)],
+    content_key: [u8; 32],
+    change_spk: Option<&[u8]>,
+    max_op_return_bytes: usize,
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    let deduped = dedupe_recipients(recipients)?;
+    if deduped.len() == 1 {
+        let (recipient, amount) = deduped[0];
+        return compose_directed_note_exact_amount(
+            identity,
+            inputs,
+            text,
+            private,
+            note_id,
+            recipient,
+            *amount,
+            change_spk,
+            max_op_return_bytes,
+            fee_rate,
+            aux,
+        );
+    }
+    let body = multi_body(identity, text, private, note_id, &deduped, content_key)?;
+    let flags = FLAG_DIRECTED | FLAG_MULTI | if private { FLAG_PRIVATE } else { 0 };
+    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    let recipient_pairs: Vec<(Vec<u8>, u64)> =
+        deduped.iter().map(|(r, amount)| (r.spk.clone(), *amount)).collect();
+    build_note_tx_multi_exact(
+        inputs,
+        &identity.output_x,
+        &payloads,
+        &recipient_pairs,
         change_spk,
         fee_rate,
         &identity.tweaked_seckey,

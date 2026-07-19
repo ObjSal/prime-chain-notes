@@ -4,14 +4,14 @@
 
 use notes_core::address::Recipient;
 use notes_core::bundle::{
-    compose_directed_note, compose_note, compose_note_exact, compose_note_with_change,
-    estimate_note_cost,
+    compose_directed_note, compose_directed_note_multi_with_change, compose_note,
+    compose_note_exact, compose_note_with_change, estimate_note_cost,
     extract_notes, extract_notes_multi, extract_notes_multi_deduped, extract_notes_watch,
     Identity, OnchainTx, SyncBundle,
 };
 use notes_core::crypt::{self, SEAL_OVERHEAD};
 use notes_core::envelope;
-use notes_core::tx::{op_return_payload, Utxo};
+use notes_core::tx::{estimate_vsize_multi, op_return_payload, Utxo};
 use notes_core::Network;
 
 const APP_SEED: [u8; 32] = [7u8; 32];
@@ -170,6 +170,52 @@ fn cost_estimator_is_exact() {
         .unwrap();
         assert_eq!(est_vsize, note.vsize, "directed text_len={text_len} private={private}");
     }
+
+    // Multi-recipient directed notes (FLAG_MULTI, 2..=255 recipients):
+    // `estimate_vsize_multi` generalizes to N recipient output lengths.
+    // Lengths are pulled from the ACTUALLY built tx (not hand-computed)
+    // so this stays byte-exact regardless of chunking/wrap-length details.
+    let big_utxos = vec![Utxo { txid: [9u8; 32], vout: 0, value: 20_000_000 }];
+    for n in [2usize, 3, 255] {
+        for private in [false, true] {
+            let recipients: Vec<(Recipient, u64)> = (0..n)
+                .map(|i| {
+                    let peer = Identity::from_app_seed(&[(i as u8).wrapping_add(100); 32]).unwrap();
+                    (Recipient::parse(NET, &peer.address(NET)).unwrap(), notes_core::DUST_LIMIT)
+                })
+                .collect();
+            let note = compose_directed_note_multi_with_change(
+                &id,
+                &big_utxos,
+                "multi shape check",
+                private,
+                [4, 4, 4, 4],
+                &recipients,
+                [0x66; 32],
+                None,
+                100_000, // single OP_RETURN, avoids chunk-count limits at n=255
+                2.0,
+                || Ok(AUX),
+            )
+            .unwrap();
+            assert!(note.change > 0, "fixture should produce change for n={n} private={private}");
+            let op_return_lens: Vec<usize> = note
+                .tx
+                .outputs
+                .iter()
+                .filter_map(|o| op_return_payload(&o.script_pubkey))
+                .map(<[u8]>::len)
+                .collect();
+            let recipient_lens: Vec<usize> = recipients.iter().map(|(r, _)| r.spk.len()).collect();
+            let est_vsize = estimate_vsize_multi(
+                note.tx.inputs.len(),
+                &op_return_lens,
+                &recipient_lens,
+                true,
+            );
+            assert_eq!(est_vsize, note.vsize, "multi n={n} private={private}");
+        }
+    }
 }
 
 #[test]
@@ -210,6 +256,7 @@ fn bundle_from_txs(txs: &[(&notes_core::tx::NoteTx, bool, Option<u64>)]) -> Sync
                 author_candidates: Vec::new(),
                 recipient: None,
                 input_prevout_spks: Vec::new(),
+                output_addrs: Vec::new(),
             })
             .collect(),
         ..Default::default()
@@ -1086,6 +1133,7 @@ fn self_spk_set_marks_p2wpkh_funded_note_own() {
         author_candidates: Vec::new(),
         recipient: None,
         input_prevout_spks: vec![hex::encode(&funding_spk)],
+        output_addrs: Vec::new(),
     };
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
@@ -1129,6 +1177,7 @@ fn self_spk_set_leaves_non_matching_spk_scan_unchanged() {
         author_candidates: Vec::new(),
         recipient: None,
         input_prevout_spks: vec![hex::encode(&funding_spk)],
+        output_addrs: Vec::new(),
     };
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
@@ -1176,6 +1225,7 @@ fn self_spk_set_own_received_buckets_stay_separate() {
         author_candidates: Vec::new(),
         recipient: None,
         input_prevout_spks: vec![hex::encode(&funding_spk)],
+        output_addrs: Vec::new(),
     };
     let received_tx = OnchainTx {
         txid: attack.txid_hex.clone(),
@@ -1194,6 +1244,7 @@ fn self_spk_set_own_received_buckets_stay_separate() {
         author_candidates: Vec::new(),
         recipient: None,
         input_prevout_spks: Vec::new(), // no raw spk data -> falls back to spends_from_self=false
+        output_addrs: Vec::new(),
     };
     let bundle = SyncBundle {
         network: "regtest".into(),
@@ -1240,6 +1291,7 @@ fn self_spk_set_extends_spends_from_self_never_replaces() {
         input_prevout_spks: vec![hex::encode(notes_core::address::p2tr_script_pubkey(
             &id.output_x,
         ))],
+        output_addrs: Vec::new(),
     };
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
@@ -1296,6 +1348,7 @@ fn funded_directed_private_own_note_recovers_text_and_recipient() {
         author_candidates: Vec::new(),
         recipient,
         input_prevout_spks: vec![hex::encode(&funding_spk)],
+        output_addrs: Vec::new(),
     };
     let bundle = SyncBundle {
         network: "regtest".into(),
@@ -1370,6 +1423,7 @@ fn display_owner_dedup_first_notebook_input_wins() {
         recipient: None,
         // Crafted: spends from BOTH notebooks, A's input first.
         input_prevout_spks: vec![hex::encode(&spk_a), hex::encode(&spk_b)],
+        output_addrs: Vec::new(),
     };
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
@@ -1420,6 +1474,7 @@ fn display_owner_dedup_flips_with_input_order() {
         recipient: None,
         // Reversed: B's input first this time.
         input_prevout_spks: vec![hex::encode(&spk_b), hex::encode(&spk_a)],
+        output_addrs: Vec::new(),
     };
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
@@ -1468,6 +1523,7 @@ fn display_owner_dedup_ignores_non_notebook_input_at_position_zero() {
         recipient: None,
         // Spending-wallet input FIRST, notebook A's input SECOND.
         input_prevout_spks: vec![hex::encode(&funding_spk), hex::encode(&spk_a)],
+        output_addrs: Vec::new(),
     };
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
@@ -1514,6 +1570,7 @@ fn display_owner_dedup_noop_when_no_notebook_input() {
         author_candidates: Vec::new(),
         recipient: None,
         input_prevout_spks: vec![hex::encode(&funding_spk)], // no notebook input present
+        output_addrs: Vec::new(),
     };
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
@@ -1555,6 +1612,7 @@ fn display_owner_dedup_empty_notebook_spks_matches_undeduped() {
         author_candidates: Vec::new(),
         recipient: None,
         input_prevout_spks: vec![hex::encode(&spk_a), hex::encode(&spk_b)],
+        output_addrs: Vec::new(),
     };
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
@@ -1595,6 +1653,7 @@ fn display_owner_dedup_noop_on_legacy_empty_input_prevout_spks() {
         author_candidates: Vec::new(),
         recipient: None,
         input_prevout_spks: Vec::new(), // legacy: no raw spk data at all
+        output_addrs: Vec::new(),
     };
     let bundle =
         SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };

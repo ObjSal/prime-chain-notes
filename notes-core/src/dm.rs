@@ -17,6 +17,32 @@
 //! AAD binds direction and note identity: `sender_x || recipient_x ||
 //! note_id` — a sealed body replayed from a different sender address, to a
 //! different recipient, or under another note_id fails authentication.
+//!
+//! ---
+//!
+//! Multi-recipient directed notes (envelope `FLAG_MULTI`, 2..=255
+//! recipients) — FROZEN alongside everything above. A single 32-byte
+//! content key `K` (caller-supplied — see
+//! `bundle::compose_directed_note_multi_with_change`/`_exact`; NEVER
+//! generated, stored, or returned by this module, same convention as
+//! `note_id`) seals the note body ONCE, under
+//! `multi_body_aad(sender_x, note_id)` (36 bytes: sender_x(32) ||
+//! note_id(4) — no recipient binding, since the sealed body is identical
+//! for every recipient). `K` itself is then wrapped once PER RECIPIENT
+//! under that recipient's ordinary pairwise `dm_key`/`dm_aad` from above
+//! (`wrap_i`), each wrap exactly [`WRAP_LEN`] = 72 bytes
+//! (`crypt::SEAL_OVERHEAD` + 32) regardless of note length. Wrap order is
+//! recipient OUTPUT order (envelope.rs / tx.rs).
+//!
+//! Recipient: derive the ONE pairwise key with the sender (unchanged from
+//! the single-recipient case above), try the wrap at your own
+//! recipient-output index first, then fall back to every other wrap (a
+//! robustness fallback, not a protocol requirement — see
+//! [`open_received_multi`]); on success, open the shared sealed body with
+//! the recovered `K`. Sender re-read (wipe recovery, the `open_sent`
+//! analog): derive the pairwise key with ANY recipient's output key
+//! (index 0 preferred, else the first available — [`open_sent_multi`]),
+//! unwrap, open the body.
 
 use hkdf::Hkdf;
 use k256::elliptic_curve::group::prime::PrimeCurveAffine;
@@ -101,4 +127,109 @@ pub fn open_sent(
 ) -> Result<Vec<u8>, Error> {
     let key = key_for(my_tweaked_seckey, recipient_x)?;
     crypt::open_aad(&key, &dm_aad(my_output_x, recipient_x, note_id), blob)
+}
+
+// ---------------------------------------------------------------------
+// Multi-recipient (FLAG_MULTI) — see the module doc's "---" section above
+// for the full scheme. FROZEN once shipped, same as everything above it.
+// ---------------------------------------------------------------------
+
+/// Fixed size of one [`seal_multi`] wrap: `crypt::SEAL_OVERHEAD` (24-byte
+/// nonce + 16-byte tag) around a 32-byte content key — always 72 bytes,
+/// regardless of note text length.
+pub const WRAP_LEN: usize = crypt::SEAL_OVERHEAD + 32;
+
+/// FROZEN AAD for the shared sealed body: `sender_output_x(32) ||
+/// note_id(4)` — no recipient binding (the body is identical for every
+/// recipient; per-recipient binding lives in each wrap's `dm_aad`).
+pub fn multi_body_aad(sender_x: &[u8; 32], note_id: &[u8; 4]) -> [u8; 36] {
+    let mut aad = [0u8; 36];
+    aad[..32].copy_from_slice(sender_x);
+    aad[32..].copy_from_slice(note_id);
+    aad
+}
+
+/// Sender side: seal a multi-recipient private body. `content_key` is
+/// caller-supplied (see the module doc) — used once to seal `plaintext`
+/// under [`multi_body_aad`], then wrapped once per recipient (in
+/// `recipients_x` order == output order) under each recipient's ordinary
+/// pairwise `dm_key`. Returns `(wraps, sealed_body)`.
+pub fn seal_multi(
+    my_tweaked_seckey: &[u8; 32],
+    my_output_x: &[u8; 32],
+    recipients_x: &[[u8; 32]],
+    note_id: &[u8; 4],
+    content_key: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), Error> {
+    let sealed_body =
+        crypt::seal_aad(content_key, &multi_body_aad(my_output_x, note_id), plaintext)?;
+    let mut wraps = Vec::with_capacity(recipients_x.len());
+    for r in recipients_x {
+        let k_i = key_for(my_tweaked_seckey, r)?;
+        wraps.push(crypt::seal_aad(&k_i, &dm_aad(my_output_x, r, note_id), content_key)?);
+    }
+    Ok((wraps, sealed_body))
+}
+
+/// Recipient side: open a multi-recipient body sent to me by `sender_x`.
+/// `my_index`, when known, is tried first (my own recipient-output
+/// position in `wraps`); every other wrap is tried as a fallback (e.g. the
+/// caller isn't sure which output is "mine" from the bundle alone) — NOT
+/// a protocol requirement, just robustness, since only one wrap can ever
+/// open under my pairwise key with `sender_x`.
+pub fn open_received_multi(
+    my_tweaked_seckey: &[u8; 32],
+    my_output_x: &[u8; 32],
+    sender_x: &[u8; 32],
+    note_id: &[u8; 4],
+    wraps: &[Vec<u8>],
+    sealed_body: &[u8],
+    my_index: Option<usize>,
+) -> Result<Vec<u8>, Error> {
+    let key = key_for(my_tweaked_seckey, sender_x)?;
+    let aad = dm_aad(sender_x, my_output_x, note_id);
+    let mut order: Vec<usize> = Vec::with_capacity(wraps.len());
+    if let Some(i) = my_index {
+        if i < wraps.len() {
+            order.push(i);
+        }
+    }
+    order.extend((0..wraps.len()).filter(|i| Some(*i) != my_index));
+    for i in order {
+        let Ok(k_bytes) = crypt::open_aad(&key, &aad, &wraps[i]) else { continue };
+        let Ok(content_key) = <[u8; 32]>::try_from(k_bytes.as_slice()) else { continue };
+        if let Ok(pt) = crypt::open_aad(&content_key, &multi_body_aad(sender_x, note_id), sealed_body)
+        {
+            return Ok(pt);
+        }
+    }
+    Err(Error::DecryptFailed)
+}
+
+/// Sender re-reading their own sent multi-recipient note (wipe recovery):
+/// derive the pairwise key with ANY recipient output key — tried in
+/// `recipients_x`/`wraps` order (index 0 preferred, else the first
+/// available), matching [`open_sent`]'s single-recipient behavior.
+pub fn open_sent_multi(
+    my_tweaked_seckey: &[u8; 32],
+    my_output_x: &[u8; 32],
+    recipients_x: &[[u8; 32]],
+    note_id: &[u8; 4],
+    wraps: &[Vec<u8>],
+    sealed_body: &[u8],
+) -> Result<Vec<u8>, Error> {
+    for (i, r) in recipients_x.iter().enumerate() {
+        let Some(wrap) = wraps.get(i) else { continue };
+        let Ok(key) = key_for(my_tweaked_seckey, r) else { continue };
+        let aad = dm_aad(my_output_x, r, note_id);
+        let Ok(k_bytes) = crypt::open_aad(&key, &aad, wrap) else { continue };
+        let Ok(content_key) = <[u8; 32]>::try_from(k_bytes.as_slice()) else { continue };
+        if let Ok(pt) =
+            crypt::open_aad(&content_key, &multi_body_aad(my_output_x, note_id), sealed_body)
+        {
+            return Ok(pt);
+        }
+    }
+    Err(Error::DecryptFailed)
 }
