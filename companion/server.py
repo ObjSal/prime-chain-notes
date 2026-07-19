@@ -43,13 +43,24 @@ _managed_proc = None  # bitcoind process if we started it
 _watch_imported = set()
 
 
+class TxNotFound(RuntimeError):
+    """A DEFINITIVELY unknown txid — bitcoind RPC error code -5. Esplora
+    answers this with a plain 404, not a 400; chain-notes-app's dropped-tx
+    detection (TxLookupStatus::NotFound) depends on the real status code,
+    so this must never fire for a transport/other error (those keep
+    raising a plain RuntimeError -> 400, unchanged)."""
+
+
 def cli(*args):
     out = subprocess.run(
         ["bitcoin-cli", "-regtest", f"-datadir={_datadir}", *args],
         capture_output=True, text=True, timeout=60,
     )
     if out.returncode != 0:
-        raise RuntimeError(out.stderr.strip() or out.stdout.strip())
+        err = out.stderr.strip() or out.stdout.strip()
+        if "error code: -5" in err:
+            raise TxNotFound(err)
+        raise RuntimeError(err)
     return out.stdout.strip()
 
 
@@ -287,6 +298,12 @@ class Handler(SimpleHTTPRequestHandler):
             body = self.rfile.read(length)
         try:
             result = handle_api(self, method, parsed.path, parse_qs(parsed.query), body)
+        except TxNotFound:
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Transaction not found")
+            return
         except Exception as e:  # surface RPC errors like mempool.space does
             self.send_response(400)
             self.send_header("Content-Type", "text/plain")

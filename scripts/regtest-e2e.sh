@@ -22,8 +22,9 @@ CLI() { bitcoin-cli -regtest -datadir="$DATADIR" "$@"; }
 WATCH() { CLI -rpcwallet=watch "$@"; }
 MINER() { CLI -rpcwallet=miner "$@"; }
 NOTES="$WORK/notes_cli"
+SRV_PID=""
 
-cleanup() { CLI stop >/dev/null 2>&1 || true; sleep 1; }
+cleanup() { CLI stop >/dev/null 2>&1 || true; sleep 1; kill "${SRV_PID:-}" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 echo "== build notes_cli (host) =="
@@ -210,6 +211,23 @@ jq -e --arg b "$ADDR_B" '[.[] | select(.directed and (.received | not) and .to =
     || fail "A's directed notes must carry to=B"
 grep -q 'sealed for B alone' <<<"$SCANA" || fail "A cannot re-read its own sent private directed note"
 pass "A re-derived the DM key from the dust output and read its sent note"
+
+echo "== companion server.py: unknown-txid 404 vs found-txid 200 =="
+PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+python3 "$REPO/companion/server.py" "$PORT" --datadir "$DATADIR" >/dev/null 2>&1 &
+SRV_PID=$!
+for _ in $(seq 1 20); do
+    curl -s "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && break
+    sleep 0.3
+done
+UNKNOWN_TXID="$(printf 'ff%.0s' $(seq 1 32))"
+STATUS="$(curl -s -o "$WORK/body_unknown.txt" -w '%{http_code}' "http://127.0.0.1:$PORT/regtest/api/tx/$UNKNOWN_TXID")"
+[[ "$STATUS" == "404" ]] || fail "expected 404 for unknown txid, got $STATUS: $(cat "$WORK/body_unknown.txt")"
+pass "unknown txid -> HTTP 404 (dropped-tx detection sees a real 404, not a 400)"
+STATUS="$(curl -s -o "$WORK/body_found.txt" -w '%{http_code}' "http://127.0.0.1:$PORT/regtest/api/tx/$T4")"
+[[ "$STATUS" == "200" ]] || fail "expected 200 for known txid $T4, got $STATUS: $(cat "$WORK/body_found.txt")"
+pass "known txid ($T4) -> HTTP 200, found-tx path unaffected"
+kill "$SRV_PID" >/dev/null 2>&1 || true
 
 echo
 echo "${GRN}ALL E2E CHECKS PASSED${NC}  (workdir: $WORK)"

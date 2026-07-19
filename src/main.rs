@@ -3552,10 +3552,28 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // entry routes to the spending ledger (tagged with its
                 // chain/index so signing can re-derive the key). A coin at
                 // an owner address the device hasn't recorded as used yet
-                // is dropped — see the Settings spending card / DEVELOPMENT
-                // notes for the sync-flow limitation this implies.
+                // is GAP-ADOPTED below (funding-unification device-port
+                // fix, 2026-07-19) rather than dropped.
+                //
+                // Gap-adoption: the device has no chain access to probe
+                // blindly like chain-notes-app's discover_spending() does,
+                // so instead it derives the bounded candidate set — both
+                // chains, `next_receive`/`next_change` .. +SPENDING_ADOPT_GAP
+                // (= 20, same constant the app's gap scan uses) — and
+                // compares each candidate's address against the coin's own
+                // owner_address. A match is exactly the kind of address the
+                // device would have marked `used` had it ever revealed or
+                // spent it, so it's ADOPTED: `mark_used` (idempotent,
+                // advances the index past it) and the coin is kept instead
+                // of dropped. Cheap and exact — each index's address is
+                // unique, so no false positives are possible.
+                const SPENDING_ADOPT_GAP: u32 = 20;
+                let net_v = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
                 let mut nb_utxos: Vec<UtxoRec> = Vec::new();
                 let mut sp_utxos: Vec<spending::SpendingUtxo> = Vec::new();
+                let mut newly_used: Vec<spending::SpendingAddress> = Vec::new();
+                let mut next_recv = section.as_ref().map(|s| s.next_receive).unwrap_or(0);
+                let mut next_chg = section.as_ref().map(|s| s.next_change).unwrap_or(0);
                 for u in &bundle.utxos {
                     match &u.owner_address {
                         None => {
@@ -3565,24 +3583,76 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             nb_utxos.push(UtxoRec { txid: u.txid.clone(), vout: u.vout, value: u.value })
                         }
                         Some(a) => {
-                            if let Some(used) =
-                                section.as_ref().and_then(|s| s.used.iter().find(|x| &x.address == a))
-                            {
+                            // `section` is a pre-loop clone, so an address
+                            // adopted earlier in THIS import must be found
+                            // via `newly_used` — otherwise a second coin at
+                            // the same fresh address would miss the (now
+                            // advanced) gap window and be dropped.
+                            let already_known = section
+                                .as_ref()
+                                .and_then(|s| s.used.iter().find(|x| &x.address == a).cloned())
+                                .or_else(|| {
+                                    newly_used.iter().find(|x| &x.address == a).cloned()
+                                });
+                            let resolved = if let Some(addr) = already_known {
+                                Some(addr)
+                            } else if let Some(seed) = app_seed.as_ref() {
+                                let mut found_addr: Option<spending::SpendingAddress> = None;
+                                'gap: for chain in [0u32, 1u32] {
+                                    let base = if chain == 0 { next_recv } else { next_chg };
+                                    for index in base..base.saturating_add(SPENDING_ADOPT_GAP) {
+                                        if let Ok(key) = notes_core::seeds::derive_spending_key(
+                                            seed, ctx.0, net_v, ctx.1, chain, index,
+                                        ) {
+                                            if &key.address == a {
+                                                found_addr = Some(spending::SpendingAddress {
+                                                    chain,
+                                                    index,
+                                                    address: key.address.clone(),
+                                                    spk_hex: hex::encode(&key.script_pubkey),
+                                                });
+                                                break 'gap;
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(addr) = &found_addr {
+                                    log::info!(
+                                        "cb: spending-adopt chain={} index={}",
+                                        addr.chain, addr.index
+                                    );
+                                    if addr.chain == 0 {
+                                        next_recv = next_recv.max(addr.index + 1);
+                                    } else {
+                                        next_chg = next_chg.max(addr.index + 1);
+                                    }
+                                    newly_used.push(addr.clone());
+                                }
+                                found_addr
+                            } else {
+                                None
+                            };
+                            if let Some(addr) = resolved {
                                 sp_utxos.push(spending::SpendingUtxo {
                                     txid: u.txid.clone(),
                                     vout: u.vout,
                                     value: u.value,
-                                    chain: used.chain,
-                                    index: used.index,
+                                    chain: addr.chain,
+                                    index: addr.index,
                                 });
                             }
+                            // else: still unknown beyond the gap — dropped, unchanged.
                         }
                     }
                 }
                 st.utxos = nb_utxos;
-                if section.is_some() {
+                if section.is_some() || !newly_used.is_empty() {
                     let mut ix = notebooks.borrow_mut();
-                    ix.spending_mut(&net_s, ctx.0, ctx.1).set_utxos(sp_utxos);
+                    let sec = ix.spending_mut(&net_s, ctx.0, ctx.1);
+                    for addr in newly_used {
+                        sec.mark_used(addr);
+                    }
+                    sec.set_utxos(sp_utxos);
                     save_notebooks(&fs, &ix);
                 }
                 st.tip_height = Some(bundle.tip_height);
