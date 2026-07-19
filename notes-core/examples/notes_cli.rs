@@ -58,6 +58,31 @@ fn main() {
             let id = Identity::from_bip86(&app_seed(), seed, network, account, index).unwrap();
             println!("{}", id.address(network));
         }
+        // Spending wallet (funding-unification, device port): stateless
+        // BIP-84 leaf derivation, mirroring chain-notes-app's `cli
+        // spending-derive`/`spending-address` (same arg order as
+        // `seed-address` above: network first). Prints
+        // "<address> <spk_hex>" so a bash caller can seed
+        // notebooks.json's spending[].used entry with both fields
+        // (`ui-automation/tests/chain-notes.sh`'s mixed-compose leg).
+        Some("spending-address") => {
+            // spending-address <network> <seed_index> <account> <chain> <index>
+            let network = Network::from_str_opt(&args[2]).expect("network");
+            let seed: u32 = args[3].parse().expect("seed index");
+            let account: u32 = args[4].parse().expect("account");
+            let chain: u32 = args[5].parse().expect("chain (0=receive,1=change)");
+            let index: u32 = args[6].parse().expect("index");
+            let key = notes_core::seeds::derive_spending_key(
+                &app_seed(),
+                seed,
+                network,
+                account,
+                chain,
+                index,
+            )
+            .unwrap();
+            println!("{} {}", key.address, hex::encode(&key.script_pubkey));
+        }
         Some("compose") => {
             // compose <bundle.json|-> <public|private> <fee_rate> <max_or> <text>
             let bundle = read_bundle(&args[2]);

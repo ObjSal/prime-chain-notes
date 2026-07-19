@@ -3,8 +3,15 @@
 # regtest e2e and the simulator UI test. The DATADIR node must already run
 # (bitcoind -regtest -datadir=$DATADIR -txindex=1 -fallbackfee=0.0001).
 #
-#   regtest-companion.sh setup <notes_address>   # miner+watch wallets, fund 0.001, mine
-#   regtest-companion.sh bundle <out.json>       # sync bundle from watch wallet
+#   regtest-companion.sh setup <notes_address>            # miner+watch wallets, fund 0.001, mine
+#   regtest-companion.sh bundle <out.json> [owner_addr ...]  # sync bundle from watch wallet,
+#                                                          # + owner_address-tagged coins for
+#                                                          # each extra address (spending wallet;
+#                                                          # mirrors companion/index.html's
+#                                                          # "Spending wallet addresses" merge —
+#                                                          # scanned via scantxoutset, no wallet
+#                                                          # import needed since these addresses
+#                                                          # are never mined-to/spent-from here)
 #   regtest-companion.sh broadcast <file.hex>    # sendrawtransaction
 #   regtest-companion.sh mine [n]                # confirm
 set -euo pipefail
@@ -30,9 +37,19 @@ setup)
     ;;
 bundle)
     OUT="${2:?output path}"
+    shift 2
     ADDR="$(cat "$ADDR_FILE")"
     tip="$(CLI getblockcount)"
     utxos="$(WATCH listunspent 0 9999999 | jq '[.[] | {txid, vout, value: (.amount*1e8|round), height: (if .confirmations > 0 then '"$tip"' - .confirmations + 1 else null end)}]')"
+    # Extra owner-tagged addresses (funding-unification spending wallet):
+    # scanned directly via scantxoutset (node-level, no wallet import
+    # needed — these addresses are only ever funded/observed, never
+    # mined-to or spent-from by this script).
+    for OWNER in "$@"; do
+        owner_utxos="$(CLI scantxoutset start "[\"addr($OWNER)\"]" \
+            | jq --arg a "$OWNER" '[.unspents[] | {txid, vout, value: (.amount*1e8|round), height: (if .height > 0 then .height else null end), owner_address: $a}]')"
+        utxos="$(jq -c --argjson extra "$owner_utxos" '. + $extra' <<<"$utxos")"
+    done
     notes_onchain="[]"
     for txid in $(WATCH listtransactions '*' 1000 | jq -r '[.[].txid] | unique | .[]'); do
         raw="$(CLI getrawtransaction "$txid" 2)"
