@@ -6,8 +6,11 @@
 // 10 = sweep/consolidate (compose-like, shared via Sweep.kind),
 // 20 = notebook list (the MAIN screen — boot lands here; a notebook =
 //      an indexed identity, tapping a row opens its home = screen 0),
-// 21 = recovery words (24 BIP-39 words / SeedQR for the active seed —
-//      re-derived on reveal, cleared on close, never persisted).
+// 21 = accounts (wallet-context switcher), 22 = recovery words reveal,
+// 23 = public-keys export, 24 = private-keys export (see Recovery below),
+// 25 = Pay-from (funding-unification: notebook / spending-wallet coin
+//      picker, reached from a compose nav row), 26 = Change (destination
+//      picker for the compose in progress).
 
 export global Ui {
     in-out property <int> screen: 0;
@@ -56,10 +59,47 @@ export global Compose {
     in-out property <bool> show-oversize: false;
     in-out property <bool> oversize-offer-bump: false; // true → offer Standard
     in-out property <string> oversize-message: "";
+
+    // Pay-from (funding-unification, screen 25): compact nav row summary,
+    // Rust-formatted from the current per-coin selection.
+    in-out property <string> pay-from-label: "Notebook";     // "Notebook" | "Spending wallet" | "Mixed"
+    in-out property <string> pay-from-balance: "";            // "12,340 sats · 3 coin(s)"
+    // Change (screen 26): compact nav row summary.
+    in-out property <string> change-label: "back to you";
 }
 
 export global Confirm {
     in-out property <string> summary: "";
+}
+
+// Universal "Confirm & sign" gate (screen 4) — one row per input/output,
+// decoded from the ACTUAL signed (or, for an external PSBT pre-sign,
+// unsigned) tx bytes by notes-core's `confirm::summarize_signed_tx`.
+// `kind` mirrors title/subtitle/amount/kind row-for-row against
+// `notes_core::confirm::SummaryRow`.
+export struct ConfirmRow {
+    title: string,
+    subtitle: string,
+    amount: string,
+    kind: string,     // inputs: "input"; outputs: "note" | "recipient" | "self" | "change" | "other"
+}
+
+export global ConfirmSign {
+    in-out property <[ConfirmRow]> inputs;
+    in-out property <[ConfirmRow]> outputs;
+    // Short caption above the txid, e.g. "Directed note · testnet4" or
+    // "Sweep · mainnet - spends coins from 2 notebooks...".
+    in-out property <string> context;
+    in-out property <string> txid;
+    // Public-note preview / "Private note (encrypted)" — "" hides the block.
+    in-out property <string> note;
+    in-out property <string> fee-line;
+    // "" = no warning banner.
+    in-out property <string> warn;
+    // "compose" | "sweep" | "consolidate" | "psbt" — which sign body
+    // `confirm-sign` dispatches to, and where `confirm-cancel` returns.
+    in-out property <string> kind;
+    in-out property <string> sign-label: "Sign & export";
 }
 
 export struct NoteRow {
@@ -179,9 +219,6 @@ export global Sweep {
     in-out property <string> inputs-line: ""; // "Inputs · 3 coins · 45000 sats (all)"
     in-out property <string> cost-line: "";
     in-out property <bool> can-continue: false;
-    // Confirm dialog (modal over screen 10): summary + Sign & export.
-    in-out property <bool> show-confirm: false;
-    in-out property <string> confirm-summary: "";
 }
 
 export global Settings {
@@ -194,6 +231,54 @@ export global Settings {
     // Inline validation error for the chunk field ("" = valid) — shown in
     // the section label so the on-screen keyboard can't hide it.
     in-out property <string> chunk-error: "";
+
+    // Spending wallet (funding-unification): "Separate spending wallet"
+    // toggle + card, scoped to the active (network, seed, account) context.
+    in-out property <bool> spending-enabled: false;
+    in-out property <string> spending-balance-line: "";   // "5,000 sats · 1 coin"
+    in-out property <string> spending-address: "";         // next unused receive address
+    in-out property <image> spending-qr;
+    // Every used address, one per line "chain/index  address" — copy this
+    // into the companion's "Spending wallet addresses" field so it can
+    // include the spending wallet's coins in the next sync bundle (the
+    // companion otherwise only scans the notebook address).
+    in-out property <string> spending-addresses-text: "";
+}
+
+// One coin on the Pay-from screen (screen 25) — a notebook OR spending-
+// wallet UTXO with a stable key for the toggle callback.
+export struct FundingCoinRow {
+    key: string,      // "notebook:<txid>:<vout>" | "spending:<txid>:<vout>"
+    label: string,    // "12,345 sats"
+    meta: string,     // "txid ab12…9f · output 0" (+ " · idx 3" for spending)
+    selected: bool,
+}
+
+// Screen 25 — Pay-from: two expandable coin lists (notebook / spending
+// wallet), independent per-coin selection; a mixed selection (coins from
+// both) is allowed (`wpkh::sign_mixed_inputs`) and shown a linkage warning.
+export global Funding {
+    in-out property <[FundingCoinRow]> notebook-coins;
+    in-out property <[FundingCoinRow]> spending-coins;
+    in-out property <string> notebook-summary;   // "3 coin(s) · 12,340 sats"
+    in-out property <string> spending-summary;   // "1 coin · 5,000 sats" | "Off" | "No coins"
+    in-out property <bool> spending-enabled;
+    in-out property <bool> notebook-expanded: true;
+    in-out property <bool> spending-expanded: false;
+    // Non-empty = at least one coin from each source is selected — shown
+    // as a linkage warning line under the lists.
+    in-out property <string> warning: "";
+}
+
+// Screen 26 — Change: single-select destination for the compose in
+// progress. "auto" resolves in Rust to a fresh spending address (when the
+// current Pay-from selection includes a spending coin) or the notebook
+// address otherwise; "custom" reveals the address field.
+export global ChangePick {
+    in-out property <string> choice: "auto";      // "auto" | "notebook" | "custom"
+    in-out property <string> auto-label: "";       // "Fresh spending-wallet address" | "Notebook address"
+    in-out property <string> custom-address: "";
+    in-out property <string> custom-error: "";
 }
 
 // Recovery seeds (screen 21 + the Settings wallet-context section).
@@ -290,7 +375,12 @@ export global Callbacks {
     callback compose-changed();     // every keystroke / toggle / tier change
     callback compose-continue();    // build + sign, then screen 4
     callback oversize-bump();       // raise chunk size to Standard from the dialog
-    callback confirm-sign();        // persist + export, then note view
+    // Universal Confirm & sign gate (screen 4), dispatched on ConfirmSign.kind:
+    // "compose" persists + exports then note view; "sweep"/"consolidate"
+    // persists the wallet ledger + exports then screen 8; "psbt" signs the
+    // stashed external PSBT then screen 8.
+    callback confirm-sign();
+    callback confirm-cancel();      // Back from screen 4 — discard + return to the origin screen
     callback refresh-notes();
     callback toggle-sender(string, bool);  // exclude/include a sender key
     callback open-note(string);     // note id (hex)
@@ -310,8 +400,7 @@ export global Callbacks {
     callback refresh-coins();       // rebuild Coins.rows from the UTXO ledger
     callback consolidate-open();    // Coins → sweep screen with kind=consolidate
     callback sweep-changed();       // tier pill / custom rate edited → reprice
-    callback sweep-continue();      // build + sign, then the confirm dialog
-    callback sweep-sign();          // persist ledger + export + QR → screen 8
+    callback sweep-continue();      // build + sign, then the universal confirm screen (4)
     callback reveal-seed();         // derive the active seed's words → screen 21
     callback reveal-close();        // clear the words + QR, back to settings
     callback set-context();         // commit Recovery.seed-text/account-text
@@ -320,4 +409,14 @@ export global Callbacks {
     callback export-close();        // clear the exports, back to settings
     callback export-select(int);    // switch shown format (0 xpub · 1 desc · 2 hex · 3 wif)
     callback export-pick-notebook(int);  // hex/WIF: pick which receive index to export
+
+    // Spending wallet (funding-unification).
+    callback set-spending-enabled(bool);  // Settings toggle
+    callback funding-open();              // compose's "Pay from" row → screen 25
+    callback funding-toggle-coin(string); // coin key (source:txid:vout)
+    callback funding-done();              // Back from screen 25 → recompute + screen 3
+    callback change-open();               // compose's "Change" row → screen 26
+    callback change-pick(string);         // "auto" | "notebook" | "custom"
+    callback change-address-changed();    // custom-address field edited
+    callback change-done();               // Back from screen 26 → recompute + screen 3
 }

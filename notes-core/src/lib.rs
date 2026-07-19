@@ -12,7 +12,9 @@ pub mod address;
 pub mod bip32;
 pub mod bip39;
 pub mod bundle;
+pub mod confirm;
 pub mod crypt;
+pub mod decode;
 pub mod dm;
 pub mod envelope;
 pub mod export;
@@ -23,6 +25,7 @@ pub mod sighash;
 pub mod sign;
 pub mod taproot;
 pub mod tx;
+pub mod wpkh;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -38,6 +41,11 @@ pub enum Error {
     RecipientNotTaproot,
     Psbt(&'static str),
     Derivation(&'static str),
+    /// P2WPKH (BIP143) signing failures — `wpkh.rs`.
+    Signing(&'static str),
+    /// Raw-tx deserialization failures — `decode.rs` — and the confirm
+    /// summarizer's own hex/shape checks (`confirm.rs`).
+    Decode(&'static str),
 }
 
 impl core::fmt::Display for Error {
@@ -57,6 +65,8 @@ impl core::fmt::Display for Error {
             }
             Error::Psbt(m) => write!(f, "psbt: {m}"),
             Error::Derivation(m) => write!(f, "derivation: {m}"),
+            Error::Signing(m) => write!(f, "signing: {m}"),
+            Error::Decode(m) => write!(f, "decode: {m}"),
         }
     }
 }

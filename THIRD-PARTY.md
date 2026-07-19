@@ -6,7 +6,7 @@ Direct dependencies of this app, its `notes-core` library, and the companion web
 
 | Library | Version | License | Used for |
 |---|---|---|---|
-| [k256](https://crates.io/crates/k256) | 0.13 | Apache-2.0 OR MIT | secp256k1 math: BIP341 taproot tweak, BIP340 Schnorr signing, ECDH |
+| [k256](https://crates.io/crates/k256) | 0.13 | Apache-2.0 OR MIT | secp256k1 math: BIP341 taproot tweak, BIP340 Schnorr signing, ECDH, and (`ecdsa` feature) RFC6979 deterministic ECDSA for BIP143 P2WPKH spending-wallet signing |
 | [sha2](https://crates.io/crates/sha2) | 0.10 | MIT OR Apache-2.0 | SHA-256 (sighashes, tagged hashes) |
 | [hkdf](https://crates.io/crates/hkdf) | 0.12 | MIT OR Apache-2.0 | Key derivation (identity, encryption, directed-note keys) |
 | [hmac](https://crates.io/crates/hmac) | 0.12 | MIT OR Apache-2.0 | HMAC for derivation |

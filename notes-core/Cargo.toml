@@ -10,7 +10,10 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-k256 = { version = "0.13", default-features = false, features = ["arithmetic", "std"] }
+# "ecdsa" adds RFC6979 deterministic ECDSA + DER encoding + low-S
+# normalization (pure Rust, no C) — the spending wallet's P2WPKH signer
+# (wpkh.rs) leans on it rather than hand-rolling RFC6979.
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "std"] }
 sha2 = "0.10"
 hkdf = "0.12"
 hmac = { version = "0.12", default-features = false }

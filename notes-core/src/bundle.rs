@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::address::{p2tr_x_of_address, taproot_address, Recipient};
+use crate::address::{p2tr_script_pubkey, p2tr_x_of_address, taproot_address, Recipient};
 use crate::crypt;
 use crate::dm;
 use crate::envelope::{self, Chunk, FLAG_DIRECTED, FLAG_PRIVATE};
@@ -92,6 +92,16 @@ pub struct BundleUtxo {
     pub value: u64,
     #[serde(default)]
     pub height: Option<u64>,
+    /// The address this coin actually belongs to, when it is NOT the bundle's
+    /// scanned notebook address (funding-unification: a Prime device's
+    /// spending-wallet coins). Empty/absent (serde default) = the scanned
+    /// address, i.e. today's behavior for every existing bundle producer —
+    /// additive, never a narrowing. A companion that also probes the
+    /// spending wallet's known addresses (device-exported list; see
+    /// companion/index.html) sets this so the device can route the coin into
+    /// the right ledger instead of guessing from scriptPubKey shape alone.
+    #[serde(default)]
+    pub owner_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +135,13 @@ pub struct OnchainTx {
     /// own directed note (lets the sender re-derive the DM key after a wipe).
     #[serde(default)]
     pub recipient: Option<String>,
+    /// Raw scriptPubKeys (hex) of every input's prevout — enables the
+    /// self-spk-SET ownership rule (`extract_notes_multi`/`_watch_multi`,
+    /// PLAN-chain-notes-funding-unification.md). Empty (the serde default)
+    /// falls back to `spends_from_self` for bundles that don't populate it
+    /// — old callers and old bundles are unaffected.
+    #[serde(default)]
+    pub input_prevout_spks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,7 +249,73 @@ pub fn extract_notes(
     identity: &Identity,
     network: Network,
 ) -> Vec<RecoveredNote> {
-    extract_notes_inner(bundle, Some(identity), network)
+    let self_spk = p2tr_script_pubkey(&identity.output_x);
+    extract_notes_multi(bundle, identity, network, &[self_spk])
+}
+
+/// [`extract_notes`] generalized to a SET of "my" scriptPubKeys — OWN iff a
+/// tx's input prevout spk is in `self_spks` (funding-unification PLAN,
+/// "Attribution & scanner changes"): the notebook spk alone today, plus the
+/// spending wallet's P2WPKH spks once that ships. `extract_notes` delegates
+/// here with a singleton `[notebook spk]`, so behavior is identical to
+/// before for every existing caller. The set rule ORs with the producer's
+/// `spends_from_self` bool, so it extends the old rule and never narrows
+/// it (legacy bundles with an empty `input_prevout_spks` behave exactly
+/// as before).
+pub fn extract_notes_multi(
+    bundle: &SyncBundle,
+    identity: &Identity,
+    network: Network,
+    self_spks: &[Vec<u8>],
+) -> Vec<RecoveredNote> {
+    extract_notes_inner(bundle, Some(identity), network, self_spks, &[], &[])
+}
+
+/// [`extract_notes_multi`] plus the DISPLAY-OWNER dedup rule for multi-
+/// notebook own notes (2026-07-18 design decision — a protocol DISPLAY
+/// rule, not an ownership change; unreachable from our own composers
+/// today, which only ever spend from one notebook, but craftable by a
+/// foreign wallet spending from several of a wallet's notebook
+/// addresses in one tx): without this, every notebook whose address the
+/// tx spends from would independently scan the note as its own, showing
+/// a duplicate in each. New rule: an OWN note is kept by THIS scan only
+/// if the FIRST input (in tx order) whose prevout scriptPubKey is in
+/// `notebook_spks` is either absent (no notebook input at all — the
+/// dust-anchored spending/external-funded shape, unchanged) or equal to
+/// `identity`'s own notebook scriptPubKey. This mirrors the FROZEN
+/// first-taproot-input sender rule used for received notes. It is a
+/// strict DISPLAY narrowing only — decryption/`text` is untouched, and
+/// since the anchor (when one exists) is always some notebook's own
+/// spk, exactly one notebook's scan of the same tx ever matches: never
+/// zero, matching the never-narrowing OWN-detection invariant, and the
+/// sealing-key alignment note below.
+///
+/// `notebook_spks` must be the SET of NOTEBOOK scriptPubKeys only — never
+/// the full `self_spks` set, which may also contain spending-wallet
+/// (P2WPKH) or other non-notebook spks. Passing the full set would let a
+/// spending-wallet input at position 0 "steal" the anchor and hide the
+/// note from every notebook, which would violate never-zero-display. An
+/// EMPTY `notebook_spks` is a strict no-op (identical output to
+/// [`extract_notes_multi`]) — used by that function's own delegation, so
+/// dedup is opt-in. Because the anchor search reads
+/// `OnchainTx::input_prevout_spks`, a bundle that leaves that field empty
+/// (old producers, serde-default) can never match any notebook spk
+/// either, so dedup is *also* a no-op there regardless of
+/// `notebook_spks` — old bundles keep every own note, never dropped.
+///
+/// Sealing-key alignment: in every tx our own apps produce, the
+/// composing notebook's input is the (and typically the only) notebook
+/// input, so display-owner and decrypt-owner always coincide — this rule
+/// only ever disambiguates foreign-crafted multi-notebook-input txs.
+pub fn extract_notes_multi_deduped(
+    bundle: &SyncBundle,
+    identity: &Identity,
+    network: Network,
+    self_spks: &[Vec<u8>],
+    notebook_spks: &[Vec<u8>],
+) -> Vec<RecoveredNote> {
+    let own_spk = p2tr_script_pubkey(&identity.output_x);
+    extract_notes_inner(bundle, Some(identity), network, self_spks, notebook_spks, &own_spk)
 }
 
 /// Watch-only [`extract_notes`]: everything a public observer of the address
@@ -241,13 +324,66 @@ pub fn extract_notes(
 /// including own self-notes, and received directed-private notes keep their
 /// display-default sender (no candidate-key authentication is possible).
 pub fn extract_notes_watch(bundle: &SyncBundle, network: Network) -> Vec<RecoveredNote> {
-    extract_notes_inner(bundle, None, network)
+    extract_notes_watch_multi(bundle, network, &[])
+}
+
+/// [`extract_notes_watch`] generalized to a self-spk SET — see
+/// [`extract_notes_multi`]. Watch mode has no identity key, so (unlike
+/// `extract_notes`) the caller supplies whatever spks it is observing (an
+/// empty set adds nothing, leaving `spends_from_self` to decide alone —
+/// today's watch-only behavior, even on bundles that populate
+/// `input_prevout_spks`).
+pub fn extract_notes_watch_multi(
+    bundle: &SyncBundle,
+    network: Network,
+    self_spks: &[Vec<u8>],
+) -> Vec<RecoveredNote> {
+    extract_notes_inner(bundle, None, network, self_spks, &[], &[])
+}
+
+/// [`extract_notes_watch_multi`] plus the DISPLAY-OWNER dedup rule — see
+/// [`extract_notes_multi_deduped`] for the full rule and the
+/// never-zero/sealing-key-alignment reasoning, which applies identically
+/// here. Watch mode has no `Identity` to read "this scan's own notebook
+/// spk" from, so the caller supplies it explicitly as
+/// `scanned_notebook_spk` (the scriptPubKey of the address being
+/// watched). As with the keyed variant, an empty `notebook_spks` is a
+/// strict no-op.
+pub fn extract_notes_watch_multi_deduped(
+    bundle: &SyncBundle,
+    network: Network,
+    self_spks: &[Vec<u8>],
+    notebook_spks: &[Vec<u8>],
+    scanned_notebook_spk: &[u8],
+) -> Vec<RecoveredNote> {
+    extract_notes_inner(bundle, None, network, self_spks, notebook_spks, scanned_notebook_spk)
+}
+
+/// First input (in tx order) whose prevout scriptPubKey is in
+/// `notebook_spks`; `None` when no input matches (including the legacy
+/// case where `input_prevout_spks` is empty) — the DISPLAY-OWNER anchor
+/// for [`extract_notes_multi_deduped`]/[`extract_notes_watch_multi_deduped`].
+fn tx_notebook_anchor(tx: &OnchainTx, notebook_spks: &[Vec<u8>]) -> Option<Vec<u8>> {
+    if notebook_spks.is_empty() {
+        return None;
+    }
+    tx.input_prevout_spks.iter().find_map(|spk_hex| {
+        let spk = hex::decode(spk_hex).ok()?;
+        if notebook_spks.iter().any(|s| *s == spk) {
+            Some(spk)
+        } else {
+            None
+        }
+    })
 }
 
 fn extract_notes_inner(
     bundle: &SyncBundle,
     keys: Option<&Identity>,
     network: Network,
+    self_spks: &[Vec<u8>],
+    notebook_spks: &[Vec<u8>],
+    own_notebook_spk: &[u8],
 ) -> Vec<RecoveredNote> {
     #[derive(PartialEq, Eq, Clone)]
     enum Origin {
@@ -264,11 +400,30 @@ fn extract_notes_inner(
         /// Union of taproot addresses seen in the carrying tx(s) — candidate
         /// authors for a received directed-private note (external funding).
         author_candidates: Vec<String>,
+        /// DISPLAY-OWNER anchor (own notes only): the first-notebook-input
+        /// spk of the FIRST tx that introduced this note, per
+        /// `tx_notebook_anchor`. `None` = no notebook input found (keep,
+        /// dust-anchored shape) or not applicable (received notes, or
+        /// `notebook_spks` empty — dedup disabled).
+        notebook_anchor: Option<Vec<u8>>,
     }
     let mut by_id: Vec<([u8; 4], Pending)> = Vec::new();
 
     for tx in &bundle.notes_onchain {
-        let origin = if tx.spends_from_self {
+        // Self-spk-SET ownership rule: the producer's `spends_from_self`
+        // bool (spends from the notebook address) OR any input prevout spk
+        // in `self_spks`. An OR, deliberately — a pure extension, never a
+        // narrowing, of the old rule: a caller passing an empty set (e.g.
+        // `extract_notes_watch`) keeps full OWN detection even on bundles
+        // that populate `input_prevout_spks`, and spoof resistance is
+        // unchanged (a stranger's tx matches neither side).
+        let is_own = tx.spends_from_self
+            || tx.input_prevout_spks.iter().any(|spk_hex| {
+                hex::decode(spk_hex)
+                    .map(|spk| self_spks.iter().any(|s| *s == spk))
+                    .unwrap_or(false)
+            });
+        let origin = if is_own {
             Origin::Own
         } else if tx.pays_self {
             Origin::Received(tx.sender.clone())
@@ -284,6 +439,14 @@ fn extract_notes_inner(
             {
                 Some((_, p)) => p,
                 None => {
+                    // Computed once, from the FIRST tx that introduces this
+                    // note — later txs carrying more chunks of the same
+                    // note_id/origin don't move the anchor.
+                    let notebook_anchor = if origin == Origin::Own {
+                        tx_notebook_anchor(tx, notebook_spks)
+                    } else {
+                        None
+                    };
                     by_id.push((
                         chunk.note_id,
                         Pending {
@@ -294,6 +457,7 @@ fn extract_notes_inner(
                             blocktime: None,
                             recipient: None,
                             author_candidates: Vec::new(),
+                            notebook_anchor,
                         },
                     ));
                     &mut by_id.last_mut().expect("just pushed").1
@@ -327,6 +491,18 @@ fn extract_notes_inner(
 
     let mut notes = Vec::new();
     for (note_id, pending) in by_id {
+        // DISPLAY-OWNER dedup: an own note anchored to a DIFFERENT notebook's
+        // input is displayed only by that notebook's scan, not this one. A
+        // `None` anchor (no notebook input, or dedup disabled via an empty
+        // `notebook_spks`) always keeps — never a narrowing of OWN-ness
+        // itself, only of which single scan renders it.
+        if pending.origin == Origin::Own {
+            if let Some(anchor) = &pending.notebook_anchor {
+                if anchor.as_slice() != own_notebook_spk {
+                    continue;
+                }
+            }
+        }
         let Ok(body) = envelope::reassemble(&pending.chunks) else { continue };
         let flags = pending.chunks[0].flags;
         let private = flags & FLAG_PRIVATE != 0;
@@ -339,7 +515,11 @@ fn extract_notes_inner(
             Origin::Received(s) => s.clone(),
             Origin::Own => None,
         };
-        let mut recipient = if received { None } else { pending.recipient.clone() };
+        // Only a DIRECTED note has a recipient (the envelope flag knows;
+        // the bundle field is just "first non-self output", which for a
+        // funded or custom-change SELF-note would be the change address).
+        let mut recipient =
+            if received || !directed { None } else { pending.recipient.clone() };
 
         let plaintext = if !private {
             Some(body)

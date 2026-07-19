@@ -6,7 +6,8 @@ use notes_core::address::Recipient;
 use notes_core::bundle::{
     compose_directed_note, compose_note, compose_note_exact, compose_note_with_change,
     estimate_note_cost,
-    extract_notes, extract_notes_watch, Identity, OnchainTx, SyncBundle,
+    extract_notes, extract_notes_multi, extract_notes_multi_deduped, extract_notes_watch,
+    Identity, OnchainTx, SyncBundle,
 };
 use notes_core::crypt::{self, SEAL_OVERHEAD};
 use notes_core::envelope;
@@ -208,6 +209,7 @@ fn bundle_from_txs(txs: &[(&notes_core::tx::NoteTx, bool, Option<u64>)]) -> Sync
                 sender: None,
                 author_candidates: Vec::new(),
                 recipient: None,
+                input_prevout_spks: Vec::new(),
             })
             .collect(),
         ..Default::default()
@@ -1035,4 +1037,568 @@ fn sweep_multi_source_cross_check() {
     )
     .unwrap();
     assert_eq!(single.raw_hex, single_multi.raw_hex);
+}
+
+// ---------------------------------------------------------------------
+// Self-spk-SET ownership rule (PLAN-chain-notes-funding-unification.md M0):
+// `extract_notes_multi`/`_watch_multi` generalize OWN from "spends from the
+// notebook address" to "spends from any of MY scriptPubKeys", via the new
+// `OnchainTx::input_prevout_spks` field. `extract_notes`/`extract_notes_watch`
+// delegate to the multi variant with a singleton set, so every test above
+// (which never sets `input_prevout_spks`) is the byte-for-byte proof that
+// delegation changes nothing.
+// ---------------------------------------------------------------------
+
+fn wpkh_spk(fill: u8) -> Vec<u8> {
+    let mut s = vec![0x00, 0x14];
+    s.extend_from_slice(&[fill; 20]);
+    s
+}
+
+/// (a) A funded note: the input spends a P2WPKH scriptPubKey that IS in the
+/// self-spk set (the spending wallet's own address) — outputs are the
+/// OP_RETURN chunk(s) plus DUST_LIMIT to the notebook, same shape a real
+/// funded self-note produces. Must scan OWN even though the legacy
+/// `spends_from_self` bool (computed only against the notebook's own P2TR
+/// address) says false.
+#[test]
+fn self_spk_set_marks_p2wpkh_funded_note_own() {
+    let id = identity();
+    let note = compose_note(
+        &id, &utxos(), "funded from the spending wallet", false, [1, 1, 2, 2], 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+    let funding_spk = wpkh_spk(0xab);
+    let onchain = OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(200),
+        blocktime: Some(1_700_000_200),
+        spends_from_self: false, // NOT the notebook's own P2TR address
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: true, // DUST_LIMIT to the notebook, same as any self-funded note
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        input_prevout_spks: vec![hex::encode(&funding_spk)],
+    };
+    let bundle =
+        SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
+
+    let notes = extract_notes_multi(&bundle, &id, NET, &[funding_spk]);
+    assert_eq!(notes.len(), 1);
+    assert!(!notes[0].received, "spending-wallet-funded note must scan OWN");
+    assert_eq!(notes[0].text.as_deref(), Some("funded from the spending wallet"));
+}
+
+/// (b) The identical tx shape from (a), scanned via the OLD single-address
+/// entry point — whose implicit self-spk set is just the notebook's own
+/// P2TR spk, never this funding P2WPKH spk. Unaffected by
+/// `input_prevout_spks` being populated: falls through to the existing
+/// pays-self + PNTE → RECEIVED rule, exactly as before this change (assert
+/// the current behavior; don't change it).
+#[test]
+fn self_spk_set_leaves_non_matching_spk_scan_unchanged() {
+    let id = identity();
+    let sender_id = identity_b();
+    let note = compose_note(
+        &sender_id, &utxos(), "funded by someone else's wallet", false, [3, 3, 4, 4], 80, 1.0,
+        || Ok(AUX),
+    )
+    .unwrap();
+    let funding_spk = wpkh_spk(0xcd);
+    let onchain = OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(201),
+        blocktime: Some(1_700_000_201),
+        spends_from_self: false,
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: true,
+        sender: Some(sender_id.address(NET)),
+        author_candidates: Vec::new(),
+        recipient: None,
+        input_prevout_spks: vec![hex::encode(&funding_spk)],
+    };
+    let bundle =
+        SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
+
+    let notes = extract_notes(&bundle, &id, NET);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].received, "must scan received, exactly as before this change");
+    assert_eq!(notes[0].sender.as_deref(), Some(sender_id.address(NET).as_str()));
+}
+
+/// (c) Own vs received dedup buckets stay separate under the self-spk-SET
+/// rule too: reusing the same note_id in an spk-matched OWN tx and a
+/// pays-self RECEIVED tx must not merge them (mirrors
+/// `received_note_id_collision_does_not_contaminate`, through the multi
+/// entry point).
+#[test]
+fn self_spk_set_own_received_buckets_stay_separate() {
+    let id = identity();
+    let attacker = identity_b();
+    let shared_id = [9, 9, 9, 9];
+    let funding_spk = wpkh_spk(0xee);
+
+    let mine =
+        compose_note(&id, &utxos(), "my funded words", false, shared_id, 80, 1.0, || Ok(AUX))
+            .unwrap();
+    let attack = compose_note(
+        &attacker, &utxos(), "gotcha via wpkh?", false, shared_id, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+
+    let own_tx = OnchainTx {
+        txid: mine.txid_hex.clone(),
+        height: Some(300),
+        blocktime: Some(1_700_000_300),
+        spends_from_self: false,
+        payloads: mine
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: true,
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        input_prevout_spks: vec![hex::encode(&funding_spk)],
+    };
+    let received_tx = OnchainTx {
+        txid: attack.txid_hex.clone(),
+        height: Some(301),
+        blocktime: Some(1_700_000_301),
+        spends_from_self: false,
+        payloads: attack
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: true,
+        sender: Some(attacker.address(NET)),
+        author_candidates: Vec::new(),
+        recipient: None,
+        input_prevout_spks: Vec::new(), // no raw spk data -> falls back to spends_from_self=false
+    };
+    let bundle = SyncBundle {
+        network: "regtest".into(),
+        notes_onchain: vec![own_tx, received_tx],
+        ..Default::default()
+    };
+
+    let notes = extract_notes_multi(&bundle, &id, NET, &[funding_spk]);
+    assert_eq!(notes.len(), 2, "own and received buckets must stay separate");
+    let own = notes.iter().find(|n| !n.received).unwrap();
+    assert_eq!(own.text.as_deref(), Some("my funded words"));
+    let recv = notes.iter().find(|n| n.received).unwrap();
+    assert_eq!(recv.text.as_deref(), Some("gotcha via wpkh?"));
+}
+
+/// (d) Regression: the set rule EXTENDS `spends_from_self`, never replaces
+/// it. A new-style bundle (populated `input_prevout_spks`) whose tx DOES
+/// spend from the notebook must stay OWN for callers that pass no set
+/// (`extract_notes_watch`'s empty set) or a non-matching set — i.e. the
+/// producer's bool always still counts.
+#[test]
+fn self_spk_set_extends_spends_from_self_never_replaces() {
+    let id = identity();
+    let note =
+        compose_note(&id, &utxos(), "plain self note", false, [5, 5, 6, 6], 80, 1.0, || Ok(AUX))
+            .unwrap();
+    let onchain = OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(400),
+        blocktime: Some(1_700_000_400),
+        spends_from_self: true, // the producer's verdict: spends from the notebook
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: true,
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        // New-style bundle: raw prevout spks present (the notebook's P2TR).
+        input_prevout_spks: vec![hex::encode(notes_core::address::p2tr_script_pubkey(
+            &id.output_x,
+        ))],
+    };
+    let bundle =
+        SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
+
+    // Watch scan (empty self-spk set) on the NEW bundle format.
+    let watch = extract_notes_watch(&bundle, NET);
+    assert_eq!(watch.len(), 1);
+    assert!(!watch[0].received, "watch scan must keep OWN detection on new-style bundles");
+
+    // A caller whose set doesn't include the notebook spk (e.g. only a
+    // spending-wallet spk): spends_from_self still wins via the OR.
+    let notes = extract_notes_multi(&bundle, &id, NET, &[wpkh_spk(0x01)]);
+    assert_eq!(notes.len(), 1);
+    assert!(!notes[0].received, "spends_from_self must always still count");
+}
+
+/// (e) An OWN funded directed-private note recovers its text + recipient:
+/// the tx spends the SPENDING wallet (spends_from_self=false, ownership
+/// via the spk set), and the sender re-derives the DM key from the
+/// bundle's `recipient` field — which must therefore be populated by the
+/// producer regardless of the old spends-from-self test. Conversely a
+/// funded SELF-note's `recipient` field (which a producer computing
+/// "first non-self output" would fill with the change address) must NOT
+/// surface — only directed notes have recipients.
+#[test]
+fn funded_directed_private_own_note_recovers_text_and_recipient() {
+    let a = identity();
+    let b = identity_b();
+    let to_b = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let funding_spk = wpkh_spk(0x77);
+
+    let sent = compose_directed_note(
+        &a, &utxos(), "funded, for bob", true, [8, 0, 0, 8], &to_b, 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+    let self_note =
+        compose_note(&a, &utxos(), "funded self", false, [9, 0, 0, 9], 80, 1.0, || Ok(AUX))
+            .unwrap();
+
+    let mk = |note: &notes_core::tx::NoteTx, recipient: Option<String>, h: u64| OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(h),
+        blocktime: Some(1_700_000_000 + h),
+        spends_from_self: false, // funded: inputs are the spending wallet's
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: true, // dust-to-self keeps it discoverable
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient,
+        input_prevout_spks: vec![hex::encode(&funding_spk)],
+    };
+    let bundle = SyncBundle {
+        network: "regtest".into(),
+        notes_onchain: vec![
+            mk(&sent, Some(b.address(NET)), 500),
+            // Producer naively fills "first non-self output" = the bc1q
+            // change address; the directed gate must drop it.
+            mk(&self_note, Some("bcrt1qchangechangechange".into()), 501),
+        ],
+        ..Default::default()
+    };
+
+    let notes = extract_notes_multi(&bundle, &a, NET, &[funding_spk]);
+    assert_eq!(notes.len(), 2);
+    let sent_n = notes.iter().find(|n| n.note_id == [8, 0, 0, 8]).unwrap();
+    assert!(!sent_n.received, "funded directed note is OWN via the spk set");
+    assert_eq!(sent_n.recipient.as_deref(), Some(b.address(NET).as_str()));
+    assert_eq!(sent_n.text.as_deref(), Some("funded, for bob"), "sender re-reads own sent note");
+    let self_n = notes.iter().find(|n| n.note_id == [9, 0, 0, 9]).unwrap();
+    assert!(!self_n.received);
+    assert_eq!(self_n.recipient, None, "self-note must not surface the change address");
+}
+
+// ---------------------------------------------------------------------
+// DISPLAY-OWNER dedup for multi-notebook own notes (2026-07-18 design
+// decision, a protocol DISPLAY rule — NOT an ownership change): when a
+// tx spends from MULTIPLE notebook addresses, every notebook scanning it
+// independently would otherwise each keep a copy of the same own note.
+// `extract_notes_multi_deduped`/`extract_notes_watch_multi_deduped` keep
+// it only in the scan of the notebook whose spk is the FIRST notebook
+// input in tx order (mirrors the frozen first-taproot-input sender
+// rule). Unreachable from our own composers (which only ever spend from
+// one notebook), but craftable by a foreign wallet. See bundle.rs's doc
+// comments on `extract_notes_multi_deduped` for the full rule.
+// ---------------------------------------------------------------------
+
+fn notebook_spk_of(id: &Identity) -> Vec<u8> {
+    notes_core::address::p2tr_script_pubkey(&id.output_x)
+}
+
+/// (a) A tx spending from TWO notebook addresses (A then B, in that input
+/// order) is scanned independently as both notebooks. Deduped: exactly
+/// one keeps it — the first-input notebook, A. Never-zero: A + B totals
+/// to exactly 1 kept note across both scans.
+#[test]
+fn display_owner_dedup_first_notebook_input_wins() {
+    let a = identity();
+    let b = identity_b();
+    let spk_a = notebook_spk_of(&a);
+    let spk_b = notebook_spk_of(&b);
+    let notebook_spks = vec![spk_a.clone(), spk_b.clone()];
+
+    let note = compose_note(
+        &a, &utxos(), "owned by two notebooks", false, [1, 2, 3, 4], 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+    let onchain = OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(600),
+        blocktime: Some(1_700_000_600),
+        spends_from_self: false,
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: false,
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        // Crafted: spends from BOTH notebooks, A's input first.
+        input_prevout_spks: vec![hex::encode(&spk_a), hex::encode(&spk_b)],
+    };
+    let bundle =
+        SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
+
+    let as_a = extract_notes_multi_deduped(&bundle, &a, NET, &[spk_a.clone()], &notebook_spks);
+    let as_b = extract_notes_multi_deduped(&bundle, &b, NET, &[spk_b.clone()], &notebook_spks);
+
+    assert_eq!(as_a.len(), 1, "first-notebook-input (A) keeps the note");
+    assert_eq!(as_b.len(), 0, "second notebook (B) must not also display it");
+    assert_eq!(
+        as_a.len() + as_b.len(),
+        1,
+        "never-zero: across all scanned notebooks, exactly one keeps the note"
+    );
+}
+
+/// (b) Same shape as (a) but the notebook inputs are reversed (B then A)
+/// — the owner flips to B, proving the rule follows tx order, not
+/// identity or notebook_spks list order.
+#[test]
+fn display_owner_dedup_flips_with_input_order() {
+    let a = identity();
+    let b = identity_b();
+    let spk_a = notebook_spk_of(&a);
+    let spk_b = notebook_spk_of(&b);
+    let notebook_spks = vec![spk_a.clone(), spk_b.clone()];
+
+    let note = compose_note(
+        &a, &utxos(), "owned by two notebooks, reversed", false, [1, 1, 1, 2], 80, 1.0,
+        || Ok(AUX),
+    )
+    .unwrap();
+    let onchain = OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(601),
+        blocktime: Some(1_700_000_601),
+        spends_from_self: false,
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: false,
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        // Reversed: B's input first this time.
+        input_prevout_spks: vec![hex::encode(&spk_b), hex::encode(&spk_a)],
+    };
+    let bundle =
+        SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
+
+    let as_a = extract_notes_multi_deduped(&bundle, &a, NET, &[spk_a.clone()], &notebook_spks);
+    let as_b = extract_notes_multi_deduped(&bundle, &b, NET, &[spk_b.clone()], &notebook_spks);
+
+    assert_eq!(as_a.len(), 0, "A is no longer the first notebook input");
+    assert_eq!(as_b.len(), 1, "owner flips to B, the new first-notebook-input");
+    assert_eq!(as_a.len() + as_b.len(), 1, "never-zero holds under reversal too");
+}
+
+/// (c) The refinement: a spending-wallet P2WPKH input sits at position 0,
+/// a notebook (A) input comes later. The wpkh input must NOT steal the
+/// anchor — A still owns the note, because the anchor search is scoped
+/// to `notebook_spks` only, never the full self-spk set.
+#[test]
+fn display_owner_dedup_ignores_non_notebook_input_at_position_zero() {
+    let a = identity();
+    let b = identity_b();
+    let spk_a = notebook_spk_of(&a);
+    let spk_b = notebook_spk_of(&b);
+    let funding_spk = wpkh_spk(0x55);
+    let notebook_spks = vec![spk_a.clone(), spk_b.clone()]; // NOT the wpkh spk
+
+    let note = compose_note(
+        &a, &utxos(), "wallet-funded but notebook-anchored", false, [5, 5, 5, 5], 80, 1.0,
+        || Ok(AUX),
+    )
+    .unwrap();
+    let onchain = OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(602),
+        blocktime: Some(1_700_000_602),
+        spends_from_self: false,
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: true,
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        // Spending-wallet input FIRST, notebook A's input SECOND.
+        input_prevout_spks: vec![hex::encode(&funding_spk), hex::encode(&spk_a)],
+    };
+    let bundle =
+        SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
+
+    // is_own via the spending-wallet spk being in self_spks (funded shape).
+    let as_a = extract_notes_multi_deduped(
+        &bundle, &a, NET, &[funding_spk.clone(), spk_a.clone()], &notebook_spks,
+    );
+    assert_eq!(
+        as_a.len(),
+        1,
+        "notebook A still anchors the note even though a non-notebook input comes first"
+    );
+}
+
+/// (d) A pure dust-anchored spending-wallet-funded note (no notebook
+/// input at all) is unaffected — the anchor search finds nothing, so the
+/// note is kept exactly as `extract_notes_multi` would keep it.
+#[test]
+fn display_owner_dedup_noop_when_no_notebook_input() {
+    let a = identity();
+    let funding_spk = wpkh_spk(0x66);
+    let notebook_spks = vec![notebook_spk_of(&a)];
+
+    let note = compose_note(
+        &a, &utxos(), "pure spending-wallet funded, dust anchor only", false, [6, 6, 6, 6], 80,
+        1.0, || Ok(AUX),
+    )
+    .unwrap();
+    let onchain = OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(603),
+        blocktime: Some(1_700_000_603),
+        spends_from_self: false,
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: true,
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        input_prevout_spks: vec![hex::encode(&funding_spk)], // no notebook input present
+    };
+    let bundle =
+        SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
+
+    let notes =
+        extract_notes_multi_deduped(&bundle, &a, NET, &[funding_spk], &notebook_spks);
+    assert_eq!(notes.len(), 1, "dust-anchored / no notebook input: unchanged, always kept");
+}
+
+/// (e) The old, non-deduped `extract_notes_multi` is byte-identical to
+/// `extract_notes_multi_deduped` called with an empty `notebook_spks` —
+/// on the very fixture from (a) that WOULD be deduped with a populated
+/// set, proving dedup is strictly opt-in.
+#[test]
+fn display_owner_dedup_empty_notebook_spks_matches_undeduped() {
+    let a = identity();
+    let b = identity_b();
+    let spk_a = notebook_spk_of(&a);
+    let spk_b = notebook_spk_of(&b);
+
+    let note = compose_note(
+        &a, &utxos(), "identical old vs deduped-noop", false, [7, 7, 7, 7], 80, 1.0, || Ok(AUX),
+    )
+    .unwrap();
+    let onchain = OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(604),
+        blocktime: Some(1_700_000_604),
+        spends_from_self: false,
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: false,
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        input_prevout_spks: vec![hex::encode(&spk_a), hex::encode(&spk_b)],
+    };
+    let bundle =
+        SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
+
+    let old = extract_notes_multi(&bundle, &a, NET, &[spk_a.clone()]);
+    let deduped_noop = extract_notes_multi_deduped(&bundle, &a, NET, &[spk_a.clone()], &[]);
+    assert_eq!(old, deduped_noop, "empty notebook_spks must be byte-identical to the old fn");
+    assert_eq!(old.len(), 1, "sanity: the fixture is scanned OWN and kept by both");
+}
+
+/// (f) A legacy bundle whose `input_prevout_spks` is empty (old
+/// producer, serde default) must be a dedup no-op regardless of how
+/// `notebook_spks` is populated — the never-narrowing invariant.
+#[test]
+fn display_owner_dedup_noop_on_legacy_empty_input_prevout_spks() {
+    let a = identity();
+    let notebook_spks = vec![notebook_spk_of(&a)]; // populated, but can't match anything
+
+    let note = compose_note(
+        &a, &utxos(), "legacy bundle, no raw prevout spks", false, [8, 8, 8, 8], 80, 1.0,
+        || Ok(AUX),
+    )
+    .unwrap();
+    let onchain = OnchainTx {
+        txid: note.txid_hex.clone(),
+        height: Some(605),
+        blocktime: Some(1_700_000_605),
+        spends_from_self: true, // legacy producer's own verdict
+        payloads: note
+            .tx
+            .outputs
+            .iter()
+            .filter_map(|o| op_return_payload(&o.script_pubkey))
+            .map(hex::encode)
+            .collect(),
+        pays_self: false,
+        sender: None,
+        author_candidates: Vec::new(),
+        recipient: None,
+        input_prevout_spks: Vec::new(), // legacy: no raw spk data at all
+    };
+    let bundle =
+        SyncBundle { network: "regtest".into(), notes_onchain: vec![onchain], ..Default::default() };
+
+    let notes = extract_notes_multi_deduped(&bundle, &a, NET, &[], &notebook_spks);
+    assert_eq!(notes.len(), 1, "legacy bundle with no input_prevout_spks: dedup is a no-op");
 }

@@ -99,13 +99,46 @@ def main():
 
         bundle2 = build_and_download(page, tmp)
         b2 = json.loads(bundle2.read_text())
-        assert any(t["txid"] == note["txid"] and t["spends_from_self"] for t in b2["notes_onchain"]), b2
+        b2_entry = next(t for t in b2["notes_onchain"] if t["txid"] == note["txid"])
+        assert b2_entry["spends_from_self"], b2_entry
+        # funding-unification M1: the field is always present (device-side
+        # notes-core defaults + ORs it with spends_from_self), but regtest's
+        # server.py shim carries no raw prevout scriptPubKey hex (only
+        # scriptpubkey_address — see index.html's Esplora-shape gotcha
+        # comment), so on regtest it's expected empty, never fabricated.
+        assert b2_entry["input_prevout_spks"] == [], b2_entry
         scan = json.loads(cli("scan", str(bundle2)))
         texts = [n["text"] for n in scan]
         assert NOTE_TEXT in texts, texts
         confirmed = next(n for n in scan if n["text"] == NOTE_TEXT)
         assert confirmed["height"] is not None, "auto-mine should have confirmed it"
         print(f"PASS note recovered from page-built bundle, confirmed at height {confirmed['height']}")
+
+        # ---- input_prevout_spks: prove the field faithfully threads real
+        # prevout scriptPubKey hex through when it IS present (real esplora
+        # carries it; regtest's shim doesn't — see above), by intercepting
+        # one page response to inject it, matching the shape a real
+        # mainnet/testnet4 API response would have.
+        FAKE_SPK = "5120" + "ab" * 32  # p2tr-shaped scriptPubKey hex, arbitrary test value
+
+        def inject_spk(route):
+            resp = route.fetch()
+            body = resp.json()
+            if isinstance(body, list):
+                for t in body:
+                    if t.get("txid") == note["txid"]:
+                        for v in t.get("vin", []):
+                            if v.get("prevout"):
+                                v["prevout"]["scriptpubkey"] = FAKE_SPK
+            route.fulfill(response=resp, json=body)
+
+        page.route("**/regtest/api/address/**", inject_spk)
+        bundle_spk = build_and_download(page, tmp)
+        page.unroute("**/regtest/api/address/**", inject_spk)
+        b_spk = json.loads(bundle_spk.read_text())
+        spk_entry = next(t for t in b_spk["notes_onchain"] if t["txid"] == note["txid"])
+        assert spk_entry["input_prevout_spks"] == [FAKE_SPK], spk_entry
+        print("PASS bundle threads real prevout scriptpubkey hex into input_prevout_spks when present")
 
         # ---- viewer.html: seed a PUBLIC note, then check both entry paths
         # (launcher button with URL params, and standalone manual load).
@@ -265,6 +298,29 @@ def main():
         wait_log("#note", DIRECTED_PUB_TEXT, viewer)
         viewer.close()
         print("PASS viewer at B shows received notes (from pill, sealed private, permalink)")
+
+        # ---- funding-unification: viewer's optional &mine=<addr,...> param
+        # (chain-scan.js's myAddresses) reclassifies a received tx OWN when
+        # one of its input prevouts matches — here A's own address, which is
+        # exactly the input that funded the directed note it sent B. This is
+        # the mechanism (no default UI affordance): WITHOUT the param the
+        # note still renders received-from-A (today's behavior, unchanged).
+        viewer_mine = browser.new_page()
+        viewer_mine.goto(BASE + f"/viewer.html?address={b_address}&network=regtest&mine={address}")
+        wait_log("#notes", DIRECTED_PUB_TEXT, viewer_mine)
+        notes_mine = viewer_mine.evaluate("window.__cnViewer.notes")
+        pub_mine = next(n for n in notes_mine if n["text"] == DIRECTED_PUB_TEXT)
+        assert not pub_mine["received"], f"&mine=<funder> must reclassify OWN: {pub_mine}"
+        print("PASS viewer &mine=<funder address> reclassifies a received note as OWN")
+
+        viewer_mine.goto(BASE + f"/viewer.html?address={b_address}&network=regtest")
+        wait_log("#notes", DIRECTED_PUB_TEXT, viewer_mine)
+        notes_default = viewer_mine.evaluate("window.__cnViewer.notes")
+        pub_default = next(n for n in notes_default if n["text"] == DIRECTED_PUB_TEXT)
+        assert pub_default["received"] and pub_default["from"] == address, \
+            f"without &mine=, must stay received-from-funder (today's behavior): {pub_default}"
+        print("PASS viewer WITHOUT &mine= keeps today's received-from-funder rendering")
+        viewer_mine.close()
         browser.close()
     print("COMPANION REGTEST E2E PASSED")
 

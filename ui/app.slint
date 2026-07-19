@@ -1,8 +1,8 @@
 import { Theme, UISize, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize } from "@ui/theme.slint";
-import { Callbacks, Ui, Home, Compose, Confirm, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow } from "callbacks.slint";
+import { Callbacks, Ui, Home, Compose, Confirm, ConfirmSign, ConfirmRow, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick } from "callbacks.slint";
 import { Button } from "@ui/button.slint";
 
-export { Callbacks, Ui, Home, Compose, Confirm, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
+export { Callbacks, Ui, Home, Compose, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
 
 component PrimaryAction inherits Button {
     background: Theme.palette-primary;
@@ -193,6 +193,106 @@ component NoteEntry inherits Rectangle {
     }
 }
 
+// One coin on the Pay-from screen: an ASCII [x]/[  ] checkbox row (device
+// font tofus fancy glyphs — same convention as the Notes sender filter).
+component FundingCoinEntry inherits Rectangle {
+    in property <FundingCoinRow> entry;
+    callback tapped();
+    height: 48px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.palette-border;
+    TouchArea { clicked => { root.tapped(); } }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        spacing: 8px;
+        Rectangle {
+            width: 26px;
+            Text {
+                text: root.entry.selected ? "[x]" : "[  ]";
+                color: root.entry.selected ? Theme.palette-primary : Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 15px;
+                font-weight: 700;
+                x: 0;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.entry.label;
+                color: root.entry.selected ? Theme.palette-foreground : Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 15px;
+                font-weight: 600;
+                overflow: elide;
+            }
+            Text {
+                text: root.entry.meta;
+                color: Theme.palette-muted;
+                font-family: "SourceCodePro";
+                font-size: 12px;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+// A single-select destination row on the Change screen: ASCII (x)/( )
+// radio marker, matching FundingCoinEntry's checkbox convention.
+component ChangeOptionRow inherits Rectangle {
+    in property <string> option-label;
+    in property <string> sub;
+    in property <bool> selected;
+    callback tapped();
+    height: sub == "" ? 44px : 66px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: root.selected ? Theme.palette-primary : Theme.palette-border;
+    TouchArea { clicked => { root.tapped(); } }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        spacing: 8px;
+        Rectangle {
+            width: 26px;
+            Text {
+                text: root.selected ? "(x)" : "(  )";
+                color: root.selected ? Theme.palette-primary : Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 15px;
+                font-weight: 700;
+                x: 0;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 2px;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            Text {
+                text: root.option-label;
+                color: root.selected ? Theme.palette-foreground : Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 15px;
+                font-weight: 600;
+                overflow: elide;
+            }
+            if root.sub != "": Text {
+                text: root.sub;
+                color: Theme.palette-muted;
+                font-family: "SourceCodePro";
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
 // Contact row for the send-to picker: main tap picks, the right "name"
 // zone toggles rename mode (its later-declared TouchArea wins the zone).
 component ContactEntry inherits Rectangle {
@@ -243,6 +343,49 @@ component ContactEntry inherits Rectangle {
                 height: parent.height;
             }
             rename-touch := TouchArea { clicked => { root.rename(); } }
+        }
+    }
+}
+
+// One row on the universal Confirm & sign screen (4) — an input or output
+// decoded from the actual tx bytes (`notes_core::confirm::SummaryRow`).
+// Output rows with no address (the OP_RETURN note row) show the subtitle
+// as the main line instead; an unrecognized-address output ("other") is
+// flagged in the danger color, same convention as the rest of the app.
+component ConfirmRowEntry inherits Rectangle {
+    in property <ConfirmRow> entry;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: entry.kind == "other" ? Theme.palette-danger : Theme.palette-border;
+    VerticalLayout {
+        padding: 10px;
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: entry.title != "" ? entry.title : entry.subtitle;
+                color: Theme.palette-foreground;
+                font-family: "SourceCodePro";
+                font-size: 14px;
+                font-weight: 600;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            if entry.amount != "": Text {
+                text: entry.amount + " sats";
+                color: Theme.palette-foreground;
+                font-family: "SourceCodePro";
+                font-size: 14px;
+                font-weight: 700;
+            }
+        }
+        if entry.title != "": Text {
+            text: entry.subtitle;
+            color: entry.kind == "other" ? Theme.palette-danger : Theme.palette-muted;
+            font-family: "SourceCodePro";
+            font-size: 12px;
+            overflow: elide;
+            wrap: word-wrap;
         }
     }
 }
@@ -576,6 +719,58 @@ export component AppWindow inherits Window {
                 overflow: elide;
             }
 
+            // Pay-from (funding-unification): who funds this note —
+            // notebook, spending wallet, or a mix. Compact nav row, like
+            // the gift panel's header, opening the picker (screen 25).
+            Rectangle {
+                vertical-stretch: 0;
+                height: 34px;
+                TouchArea { clicked => { Callbacks.funding-open(); Ui.screen = 25; } }
+                HorizontalLayout {
+                    Text {
+                        text: "Pay from · " + Compose.pay-from-label;
+                        color: Theme.palette-foreground;
+                        font-family: "Montserrat";
+                        font-size: 14px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: Compose.pay-from-balance + "  ›";
+                        color: Theme.palette-muted;
+                        font-family: "SourceCodePro";
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            // Change destination (screen 26).
+            Rectangle {
+                vertical-stretch: 0;
+                height: 30px;
+                TouchArea { clicked => { Callbacks.change-open(); Ui.screen = 26; } }
+                HorizontalLayout {
+                    Text {
+                        text: "Change · " + Compose.change-label;
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: "›";
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
             HorizontalLayout {
                 vertical-stretch: 0;
                 spacing: 8px;
@@ -767,7 +962,13 @@ export component AppWindow inherits Window {
             Rectangle { vertical-stretch: 1; }
         }
 
-        // ----------------------------------------- screen 4: confirm-sign
+        // ----------------------------------- screen 4: universal Confirm & sign
+        // Shared by compose/sweep/consolidate/external-PSBT: every fact shown
+        // here is decoded from the actual (un)signed tx bytes by notes-core's
+        // `confirm::summarize_signed_tx` — never from the app's own intent —
+        // so it's the last line of defense before anything hits the wire.
+        // The Flickable stretches so the Sign button stays pinned at the
+        // screen's true bottom regardless of how many rows there are.
         if Ui.screen == 4: VerticalLayout {
             width: parent.width;
             height: parent.height;
@@ -775,40 +976,137 @@ export component AppWindow inherits Window {
             padding-right: 24px;
             padding-top: 16px + UISize.control-center-status-bar-height;
             padding-bottom: 24px;
-            spacing: 14px;
+            spacing: 10px;
 
             ScreenHeader {
-                title: "Confirm";
-                back => { Ui.screen = 3; }
+                vertical-stretch: 0;
+                title: "Confirm & sign";
+                back => { Callbacks.confirm-cancel(); }
             }
 
-            Rectangle {
+            Flickable {
                 vertical-stretch: 1;
-                background: Theme.palette-surface;
-                border-radius: 16px;
-                Text {
-                    x: 16px; y: 16px;
-                    width: parent.width - 32px;
-                    text: Confirm.summary;
-                    color: Theme.palette-foreground;
-                    font-family: "SourceCodePro";
-                    font-size: 16px;
-                    wrap: word-wrap;
+                viewport-width: self.width;
+                viewport-height: confirm-content.preferred-height;
+                confirm-content := VerticalLayout {
+                    width: parent.width;
+                    spacing: 12px;
+
+                    Text {
+                        text: ConfirmSign.context;
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
+
+                    Text {
+                        text: "txid: " + ConfirmSign.txid;
+                        color: Theme.palette-muted;
+                        font-family: "SourceCodePro";
+                        font-size: 12px;
+                        wrap: char-wrap;
+                    }
+
+                    if ConfirmSign.warn != "": Rectangle {
+                        background: #332400;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: #eab308;
+                        VerticalLayout {
+                            padding: 12px;
+                            Text {
+                                text: "Heads up: " + ConfirmSign.warn;
+                                color: #eab308;
+                                font-family: "Montserrat";
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    if ConfirmSign.note != "": Rectangle {
+                        background: Theme.palette-surface;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: Theme.palette-border;
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 4px;
+                            Text {
+                                text: "NOTE";
+                                color: Theme.palette-muted;
+                                font-family: "Montserrat";
+                                font-size: 12px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: ConfirmSign.note;
+                                color: Theme.palette-foreground;
+                                font-family: "SourceCodePro";
+                                font-size: 14px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "INPUTS";
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 12px;
+                        font-weight: 700;
+                    }
+                    VerticalLayout {
+                        spacing: 6px;
+                        for row in ConfirmSign.inputs: ConfirmRowEntry { entry: row; }
+                    }
+
+                    Text {
+                        text: "OUTPUTS";
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 12px;
+                        font-weight: 700;
+                    }
+                    VerticalLayout {
+                        spacing: 6px;
+                        for row in ConfirmSign.outputs: ConfirmRowEntry { entry: row; }
+                    }
+
+                    Rectangle {
+                        background: Theme.palette-surface;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: Theme.palette-border;
+                        VerticalLayout {
+                            padding: 12px;
+                            Text {
+                                text: "Fee: " + ConfirmSign.fee-line;
+                                color: Theme.palette-foreground;
+                                font-family: "SourceCodePro";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+                        }
+                    }
                 }
             }
 
             Text {
-                text: "Signing spends real sats and writes this note to the blockchain forever.";
+                vertical-stretch: 0;
+                text: "Signing spends real sats and writes this to the blockchain forever.";
                 color: Theme.palette-muted;
                 font-family: "Montserrat";
-                font-size: 14px;
+                font-size: 13px;
                 wrap: word-wrap;
                 horizontal-alignment: center;
             }
 
             PrimaryAction {
+                vertical-stretch: 0;
                 width: 100%;
-                text: "Sign & export";
+                text: ConfirmSign.sign-label;
                 clicked => { Callbacks.confirm-sign(); }
             }
         }
@@ -1320,6 +1618,99 @@ export component AppWindow inherits Window {
                 width: 100%;
                 text: "Accounts…";
                 clicked => { Ui.screen = 21; }
+            }
+
+            // Spending wallet (funding-unification): an optional BIP-84
+            // native-segwit wallet (same seed) that holds funds instead of
+            // the notebook, scoped to the active (network, seed, account).
+            Rectangle {
+                height: 1px;
+                background: Theme.palette-border;
+            }
+            Text {
+                text: "Separate spending wallet";
+                color: Theme.palette-foreground;
+                font-family: "Montserrat";
+                font-size: 15px;
+                font-weight: 600;
+            }
+            Text {
+                text: "Fresh bc1q addresses hold your funds instead of the notebook — protects your balance and pubkey behind fresh-address hygiene. Costs a little more per note, and a shared spending pool publicly links the notes it pays for.";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                PillOption {
+                    label: "Off";
+                    selected: !Settings.spending-enabled;
+                    horizontal-stretch: 1;
+                    tapped => { Callbacks.set-spending-enabled(false); }
+                }
+                PillOption {
+                    label: "On";
+                    selected: Settings.spending-enabled;
+                    horizontal-stretch: 1;
+                    tapped => { Callbacks.set-spending-enabled(true); }
+                }
+            }
+            if Settings.spending-enabled: VerticalLayout {
+                spacing: 10px;
+                Image {
+                    source: Settings.spending-qr;
+                    width: 150px;
+                    height: 150px;
+                    image-rendering: pixelated;
+                    x: (parent.width - self.width) / 2;
+                }
+                Text {
+                    text: Settings.spending-address;
+                    color: Theme.palette-muted;
+                    font-family: "SourceCodePro";
+                    font-size: 12px;
+                    wrap: char-wrap;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: Settings.spending-balance-line;
+                    color: Theme.palette-foreground;
+                    font-family: "Montserrat";
+                    font-size: 17px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Next receive address, above. Paste every address below into the companion's \"Spending wallet addresses\" field so it can find this wallet's coins on the next sync — the companion otherwise only scans the notebook.";
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Rectangle {
+                    height: 76px;
+                    background: Theme.palette-surface;
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: Theme.palette-border;
+                    clip: true;
+                    Flickable {
+                        x: 10px;
+                        y: 8px;
+                        width: parent.width - 20px;
+                        height: parent.height - 16px;
+                        viewport-height: max(self.height, addr-text.preferred-height);
+                        addr-text := Text {
+                            width: parent.width;
+                            text: Settings.spending-addresses-text == "" ? "No addresses used yet." : Settings.spending-addresses-text;
+                            color: Theme.palette-muted;
+                            font-family: "SourceCodePro";
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
             }
 
             // ---- Dangerous area: reveal keys, grouped by risk ----
@@ -1867,6 +2258,193 @@ export component AppWindow inherits Window {
             Rectangle { vertical-stretch: 1; }
         }
 
+        // ---------------------------------- screen 25: Pay from (funding)
+        // Two expandable coin lists — notebook (taproot) and spending
+        // wallet (P2WPKH) — with independent per-coin selection. Selecting
+        // coins from both sources at once is allowed (signed in one pass
+        // via wpkh::sign_mixed_inputs) and flagged with a linkage warning.
+        if Ui.screen == 25: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 8px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 10px;
+
+            ScreenHeader {
+                vertical-stretch: 0;
+                title: "Pay from";
+                back => { Callbacks.funding-done(); Ui.screen = 3; }
+            }
+
+            if Funding.warning != "": Text {
+                vertical-stretch: 0;
+                text: Funding.warning;
+                color: Theme.palette-danger;
+                font-family: "Montserrat";
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+
+            Flickable {
+                vertical-stretch: 1;
+                viewport-width: self.width;
+                viewport-height: 44px * 2 + 60px
+                    + Funding.notebook-coins.length * 56px
+                    + Funding.spending-coins.length * 56px;
+                VerticalLayout {
+                    spacing: 10px;
+                    Rectangle {
+                        height: 44px;
+                        TouchArea { clicked => { Funding.notebook-expanded = !Funding.notebook-expanded; } }
+                        HorizontalLayout {
+                            Text {
+                                text: "Notebook";
+                                color: Theme.palette-foreground;
+                                font-family: "Montserrat";
+                                font-size: 16px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Text {
+                                text: Funding.notebook-summary + (Funding.notebook-expanded ? " ^" : " v");
+                                color: Theme.palette-muted;
+                                font-family: "Montserrat";
+                                font-size: 14px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    if Funding.notebook-expanded: VerticalLayout {
+                        spacing: 6px;
+                        for c in Funding.notebook-coins: FundingCoinEntry {
+                            entry: c;
+                            tapped => { Callbacks.funding-toggle-coin(c.key); }
+                        }
+                        if Funding.notebook-coins.length == 0: Text {
+                            text: "No spendable notebook coins.";
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 13px;
+                        }
+                    }
+                    Rectangle {
+                        height: 44px;
+                        TouchArea { clicked => { Funding.spending-expanded = !Funding.spending-expanded; } }
+                        HorizontalLayout {
+                            Text {
+                                text: "Spending wallet";
+                                color: Theme.palette-foreground;
+                                font-family: "Montserrat";
+                                font-size: 16px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Text {
+                                text: Funding.spending-summary + (Funding.spending-expanded ? " ^" : " v");
+                                color: Theme.palette-muted;
+                                font-family: "Montserrat";
+                                font-size: 14px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    if Funding.spending-expanded: VerticalLayout {
+                        spacing: 6px;
+                        for c in Funding.spending-coins: FundingCoinEntry {
+                            entry: c;
+                            tapped => { Callbacks.funding-toggle-coin(c.key); }
+                        }
+                        if Funding.spending-coins.length == 0: Text {
+                            text: Funding.spending-enabled
+                                ? "No spending-wallet coins yet — fund its address and import a sync bundle."
+                                : "Off — turn on \"Separate spending wallet\" in Settings first.";
+                            color: Theme.palette-muted;
+                            font-family: "Montserrat";
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+
+        // -------------------------------------------- screen 26: Change
+        // Single-select destination for the compose in progress.
+        if Ui.screen == 26: VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 8px + UISize.control-center-status-bar-height;
+            padding-bottom: 24px;
+            spacing: 10px;
+
+            ScreenHeader {
+                vertical-stretch: 0;
+                title: "Change";
+                back => { Callbacks.change-done(); Ui.screen = 3; }
+            }
+
+            ChangeOptionRow {
+                vertical-stretch: 0;
+                option-label: "Auto";
+                sub: ChangePick.auto-label;
+                selected: ChangePick.choice == "auto";
+                tapped => { Callbacks.change-pick("auto"); }
+            }
+            ChangeOptionRow {
+                vertical-stretch: 0;
+                option-label: "Notebook address";
+                sub: "Change returns to your notebook — the same address it goes to today.";
+                selected: ChangePick.choice == "notebook";
+                tapped => { Callbacks.change-pick("notebook"); }
+            }
+            ChangeOptionRow {
+                vertical-stretch: 0;
+                option-label: "Custom address…";
+                sub: "";
+                selected: ChangePick.choice == "custom";
+                tapped => { Callbacks.change-pick("custom"); }
+            }
+            if ChangePick.choice == "custom": VerticalLayout {
+                vertical-stretch: 0;
+                spacing: 6px;
+                Text {
+                    text: ChangePick.custom-error == "" ? "Change address" : ChangePick.custom-error;
+                    color: ChangePick.custom-error == "" ? Theme.palette-muted : Theme.palette-danger;
+                    font-family: "Montserrat";
+                    font-size: 13px;
+                }
+                Rectangle {
+                    height: 44px;
+                    background: Theme.palette-surface;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: change-addr-input.has-focus ? Theme.palette-primary : Theme.palette-border;
+                    clip: true;
+                    change-addr-input := TextInput {
+                        x: 14px;
+                        width: parent.width - 28px;
+                        height: 24px;
+                        y: (parent.height - self.height) / 2;
+                        text <=> ChangePick.custom-address;
+                        color: Theme.palette-foreground;
+                        font-family: "SourceCodePro";
+                        font-size: 16px;
+                        single-line: true;
+                        edited => { Callbacks.change-address-changed(); }
+                        accepted => { self.clear-focus(); }
+                    }
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
         // ------------------------------------ screen 7: contacts (send-to)
         // The one input slot doubles as manual address entry and, when a
         // row's "name" zone was tapped, the contact-name editor. Errors go
@@ -2049,7 +2627,7 @@ export component AppWindow inherits Window {
             SecondaryAction {
                 width: 100%;
                 text: "Settings";
-                clicked => { Callbacks.refresh-home(); Ui.screen = 6; }
+                clicked => { Callbacks.refresh-home(); Callbacks.funding-open(); Ui.screen = 6; }
             }
 
             if Ui.error != "": Text {
@@ -2383,57 +2961,6 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                             text: "Switch to Standard";
                             clicked => { Callbacks.oversize-bump(); }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sweep/consolidate confirm dialog — modal over screen 10, nested in
-        // root (sibling-app overlay gotcha). Anchored near the top like the
-        // other dialogs; the tx is already built + signed at this point.
-        if Sweep.show-confirm: Rectangle {
-            width: parent.width;
-            height: parent.height;
-            background: #00000088;
-            TouchArea { }   // swallow taps outside the panel
-            Rectangle {
-                x: 24px;
-                y: 90px + UISize.control-center-status-bar-height;
-                width: parent.width - 48px;
-                height: sweep-confirm-panel.preferred-height;
-                background: Theme.palette-surface;
-                border-radius: 16px;
-                border-width: 1px;
-                border-color: Theme.palette-border;
-                sweep-confirm-panel := VerticalLayout {
-                    padding: 16px;
-                    spacing: 12px;
-                    Text {
-                        text: Sweep.kind == "consolidate" ? "Consolidate coins?" : "Sweep funds?";
-                        color: Theme.palette-foreground;
-                        font-family: "Montserrat";
-                        font-size: 16px;
-                        font-weight: 600;
-                    }
-                    Text {
-                        text: Sweep.confirm-summary;
-                        color: Theme.palette-muted;
-                        font-family: "SourceCodePro";
-                        font-size: 14px;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: 10px;
-                        SecondaryAction {
-                            horizontal-stretch: 1;
-                            text: "Cancel";
-                            clicked => { Sweep.show-confirm = false; }
-                        }
-                        PrimaryAction {
-                            horizontal-stretch: 1;
-                            text: "Sign & export";
-                            clicked => { Callbacks.sweep-sign(); }
                         }
                     }
                 }
