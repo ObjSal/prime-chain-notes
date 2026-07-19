@@ -16,8 +16,8 @@ use notes_core::bundle::{
 use notes_core::address::p2tr_script_pubkey;
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::tx::{
-    build_note_tx_mixed_exact, build_sweep_tx_multi, estimate_sweep_vsize, estimate_vsize_mixed,
-    InputKind, MixedInput, NoteTx, SweepSource, Utxo,
+    build_note_tx_mixed_exact_anchored, build_sweep_tx_multi, estimate_sweep_vsize,
+    estimate_vsize_mixed, InputKind, MixedInput, NoteTx, SweepSource, Utxo,
 };
 use notes_core::Network;
 use serde::{Deserialize, Serialize};
@@ -279,10 +279,15 @@ struct Plan {
     /// when it went to a fresh spending address (`spending_change_addr`
     /// is Some) or an external custom address (neither Some, untracked).
     change_is_notebook: bool,
-    /// True when this tx carries the mandatory notebook-dust output
-    /// (decision 4 — present whenever the spending wallet funded any part
-    /// of it), which lands as a NEW notebook coin right after the
-    /// OP_RETURN(s)/optional recipient, before change.
+    /// True when this tx carries the notebook-dust output (decision 4,
+    /// refined by the anchored-variant skip rule 2026-07-18: present when
+    /// the spending wallet funded part of the note AND no notebook coin
+    /// was among the selected inputs — a notebook input already anchors
+    /// the tx, making the dust redundant). When true it lands as a NEW
+    /// notebook coin right after the OP_RETURN(s)/optional recipient,
+    /// before change; when false, change immediately follows the
+    /// OP_RETURN(s)/optional recipient — the ledger vout math below
+    /// derives both positions from this flag, never a hardcoded offset.
     notebook_dust: bool,
 }
 
@@ -2364,13 +2369,20 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 })
                 .unwrap_or(0);
             let in_value = nb_total + sp_total;
-            let dust_needed = if sp_participates { notes_core::DUST_LIMIT } else { 0 };
+            // Anchored condition (mirrors `build_note_tx_mixed_exact_anchored`):
+            // the notebook dust-to-self output is skipped whenever a notebook
+            // coin is among the selected inputs — that input already anchors
+            // the tx to the notebook's address history, so the discoverability
+            // dust would be pure waste. Only a pure-spending-wallet-funded
+            // build (n_notebook == 0) still needs it.
+            let dust_applies = sp_participates && n_notebook == 0;
+            let dust_needed = if dust_applies { notes_core::DUST_LIMIT } else { 0 };
 
             let mut extra_with_change: Vec<usize> = Vec::new();
             if let Some(l) = recipient_spk_len {
                 extra_with_change.push(l);
             }
-            if sp_participates {
+            if dust_applies {
                 extra_with_change.push(34); // notebook dust spk (P2TR, always 34 bytes)
             }
             extra_with_change.push(change_len);
@@ -2386,7 +2398,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     if let Some(l) = recipient_spk_len {
                         extra_no_change.push(l);
                     }
-                    if sp_participates {
+                    if dust_applies {
                         extra_no_change.push(34);
                     }
                     let vsize2 = estimate_vsize_mixed(&kinds, &payload_lens, &extra_no_change);
@@ -2411,7 +2423,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}{}",
                         sats_line(fee, st.btc_usd),
                         if directed { format!(" + {gift} sats to recipient") } else { String::new() },
-                        if sp_participates {
+                        if dust_applies {
                             format!(" + {} sats dust to notebook", notes_core::DUST_LIMIT)
                         } else {
                             String::new()
@@ -2608,12 +2620,18 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             Ok((note_id, note, Vec::new(), None, change_is_notebook, false))
                         } else {
                             // Spending-wallet participates (pure spending or
-                            // mixed with notebook coins) — mixed builder,
-                            // mandatory notebook-dust output.
+                            // mixed with notebook coins) — mixed builder. The
+                            // notebook dust-to-self anchor is emitted ONLY
+                            // when no notebook coin is among the selected
+                            // inputs (`build_note_tx_mixed_exact_anchored`'s
+                            // skip condition, funding-unification
+                            // 2026-07-18) — a notebook input already anchors
+                            // the tx to the notebook's address history.
                             let seed: &[u8; 32] =
                                 &app_seed.as_ref().ok_or("identity unavailable")?;
                             let notebook_dust_spk = p2tr_script_pubkey(&id.output_x);
                             let mut mixed_inputs: Vec<MixedInput> = Vec::new();
+                            let mut has_notebook_input = false;
                             for u in
                                 st.utxos.iter().filter(|u| pick.is_selected(false, &u.txid, u.vout))
                             {
@@ -2627,6 +2645,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     kind: InputKind::Taproot,
                                     seckey: id.tweaked_seckey,
                                 });
+                                has_notebook_input = true;
                             }
                             let sec =
                                 section.as_ref().ok_or("spending wallet not set up".to_string())?;
@@ -2680,7 +2699,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 sec.next_change,
                             )?;
                             let change_is_notebook = change_choice.choice == "notebook";
-                            let note = build_note_tx_mixed_exact(
+                            let note = build_note_tx_mixed_exact_anchored(
                                 &mixed_inputs,
                                 &payloads,
                                 recipient_spk.as_deref(),
@@ -2691,13 +2710,21 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 || generate_aux_rand(),
                             )
                             .map_err(|e| e.to_string())?;
+                            // Dust is emitted iff no notebook input anchored
+                            // the tx — mirrors the builder's own condition
+                            // exactly (`inputs.iter().any(prevout_spk ==
+                            // notebook_dust_spk)`), computed from the SAME
+                            // `has_notebook_input` used to build `mixed_inputs`
+                            // above, so this can never drift from the actual
+                            // wire shape.
+                            let notebook_dust = !has_notebook_input;
                             Ok((
                                 note_id,
                                 note,
                                 spent_spending,
                                 change_addr,
                                 change_is_notebook,
-                                true,
+                                notebook_dust,
                             ))
                         }
                     });
@@ -3105,9 +3132,12 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
 
                         // Output order: OP_RETURN(s), [directed recipient], [notebook
-                        // dust — mandatory whenever the spending wallet funded any
-                        // part of this note], [change]. `p.chunks` + the recipient
-                        // flag place the dust; +1 more when it's present places change.
+                        // dust — present unless a notebook coin already anchors the
+                        // tx, see `Plan.notebook_dust`'s doc], [change]. `p.chunks` +
+                        // the recipient flag place the dust slot; +1 more ONLY when
+                        // `p.notebook_dust` is true places change — when dust is
+                        // skipped, change lands in that same slot instead (computed
+                        // from the flag, never a hardcoded position).
                         let dust_vout = p.chunks as u32 + u32::from(p.recipient.is_some());
                         if p.notebook_dust {
                             st.utxos.push(UtxoRec {
