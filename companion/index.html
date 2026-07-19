@@ -123,6 +123,7 @@
 <script src="jsqr.js"></script>
 <script src="qrcode-gen.js"></script>
 <script src="ur.js"></script>
+<script src="owner-probe.js"></script>
 <script>
 "use strict";
 
@@ -227,12 +228,18 @@ $("buildBtn").addEventListener("click", async () => {
   // the device has no network, so — unlike the notebook address, whose
   // OWN /utxo endpoint is enough — a spending-wallet coin never shows up
   // there (it lives on a DIFFERENT, fresh bc1q address). The user pastes
-  // the device's currently-known spending addresses here; each one's
-  // /utxo is fetched too and merged into the bundle, tagged with
-  // `owner_address` so the device routes it into the right ledger. This
-  // is a manual, device-exported watch list, NOT a gap-limit discovery
-  // scan of not-yet-seen addresses — see companion/index.html's header
-  // comment / DEVELOPMENT.md for that documented limitation.
+  // the device's exported watch list here — either the addresses it has
+  // already used (Settings' addr text) or, better, the "companion watch
+  // window" (next 20 receive + 20 change, gap-discovery option (b)) so
+  // coins/history at not-yet-revealed addresses are found too. Each one
+  // is probed via `probeOwnerAddress` (owner-probe.js, shared with its
+  // node test): current UTXOs merge into the bundle tagged
+  // `owner_address` so the device routes them into the right ledger, and
+  // ANY on-chain history (funded, spent, or both) collects into the
+  // bundle's additive `owner_used` list — the device needs that even for
+  // an address with zero UTXOs left, so its own next_receive/next_change
+  // bookkeeping converges past an address it already spent instead of
+  // re-offering it as "next receive" forever.
   const spendingAddrs = $("spendingAddrs").value
     .split(/[\s,]+/)
     .map((a) => a.trim())
@@ -246,16 +253,19 @@ $("buildBtn").addEventListener("click", async () => {
       fullHistory(address, logEl),
     ]);
     let spendingUtxos = [];
+    let ownerUsed = [];
     if (spendingAddrs.length) {
       log(logEl, `Also checking ${spendingAddrs.length} spending-wallet address(es)…`);
       for (const a of spendingAddrs) {
         try {
-          const u = await apiJson(`/address/${a}/utxo`);
-          spendingUtxos.push(...u.map((x) => ({ ...x, owner_address: a })));
+          const { utxos: u, used } = await probeOwnerAddress(apiJson, a);
+          spendingUtxos.push(...u);
+          if (used) ownerUsed.push(a);
         } catch (e) {
           log(logEl, `  ${a}: ${e.message}`, "err");
         }
       }
+      log(logEl, `  ${ownerUsed.length} of ${spendingAddrs.length} address(es) have on-chain history`);
     }
     let fees = { fastestFee: 2, halfHourFee: 2, hourFee: 1, economyFee: 1, minimumFee: 1 };
     try { fees = await apiJson("/v1/fees/recommended"); }
@@ -350,6 +360,7 @@ $("buildBtn").addEventListener("click", async () => {
           owner_address: u.owner_address,
         })),
       ],
+      owner_used: ownerUsed,
       notes_onchain: notesOnchain,
     };
 

@@ -1746,6 +1746,61 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+
+                // Companion watch window (funding-unification gap-discovery,
+                // option (b), 2026-07-19): the next 20 receive + 20 change
+                // addresses, exported so the companion can probe AHEAD of
+                // what the device has revealed/spent — the piece that makes
+                // a restore (or an external deposit to a not-yet-shown
+                // address) still findable on the next sync.
+                Rectangle {
+                    height: 1px;
+                    background: Theme.palette-border;
+                }
+                Text {
+                    text: "Companion watch window";
+                    color: Theme.palette-foreground;
+                    font-family: "Montserrat";
+                    font-size: 13px;
+                    font-weight: 600;
+                }
+                Text {
+                    text: "Next 20 receive + 20 change addresses this wallet could use next. Paste the whole block below into the companion's \"Spending wallet addresses\" field (or scan the QR) so it can find coins at addresses you haven't revealed or spent yet — this is what makes a restore converge.";
+                    color: Theme.palette-muted;
+                    font-family: "Montserrat";
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Image {
+                    source: Settings.spending-window-qr;
+                    width: 150px;
+                    height: 150px;
+                    image-rendering: pixelated;
+                    x: (parent.width - self.width) / 2;
+                }
+                Rectangle {
+                    height: 76px;
+                    background: Theme.palette-surface;
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: Theme.palette-border;
+                    clip: true;
+                    Flickable {
+                        x: 10px;
+                        y: 8px;
+                        width: parent.width - 20px;
+                        height: parent.height - 16px;
+                        viewport-height: max(self.height, window-text.preferred-height);
+                        window-text := Text {
+                            width: parent.width;
+                            text: Settings.spending-window-text;
+                            color: Theme.palette-muted;
+                            font-family: "SourceCodePro";
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
             }
 
             // ---- Dangerous area: reveal keys, grouped by risk ----

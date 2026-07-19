@@ -159,6 +159,20 @@ pub struct SyncBundle {
     pub btc_usd: Option<f64>,
     pub utxos: Vec<BundleUtxo>,
     pub notes_onchain: Vec<OnchainTx>,
+    /// Companion gap-discovery, option (b) (PLAN-chain-notes-funding-
+    /// unification.md, 2026-07-19): every spending-wallet watch-window
+    /// address (the device's exported next-20-receive + next-20-change
+    /// lookahead, NOT just the addresses that currently hold a coin) the
+    /// companion found ANY on-chain history for — funded, spent, or both.
+    /// A spent-then-emptied address never appears in `utxos` (no coin
+    /// left to tag `owner_address`), but the device still needs to know
+    /// it was used so its own next_receive/next_change bookkeeping
+    /// converges past it instead of re-showing an already-spent address
+    /// as "next receive" forever. Additive/`#[serde(default)]`: absent on
+    /// every existing bundle producer and old bundle, so behavior is
+    /// unchanged until a producer opts in.
+    #[serde(default)]
+    pub owner_used: Vec<String>,
 }
 
 impl Default for SyncBundle {
@@ -174,6 +188,7 @@ impl Default for SyncBundle {
             btc_usd: None,
             utxos: Vec::new(),
             notes_onchain: Vec::new(),
+            owner_used: Vec::new(),
         }
     }
 }

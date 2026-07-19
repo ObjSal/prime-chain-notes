@@ -250,6 +250,15 @@ export global Settings {
     // include the spending wallet's coins in the next sync bundle (the
     // companion otherwise only scans the notebook address).
     in-out property <string> spending-addresses-text: "";
+    // Companion watch window (funding-unification gap-discovery, option
+    // (b)): the next 20 receive + next 20 change addresses, plain one-
+    // per-line (no chain/index prefix, unlike spending-addresses-text
+    // above) so it pastes straight into the companion's "Spending wallet
+    // addresses" field — lets the companion find funds at addresses the
+    // device hasn't revealed or spent yet (restore, or an external
+    // deposit straight to a not-yet-shown address).
+    in-out property <string> spending-window-text: "";
+    in-out property <image> spending-window-qr;
 }
 
 // One coin on the Pay-from screen (screen 25) — a notebook OR spending-

@@ -83,6 +83,54 @@ fn main() {
             .unwrap();
             println!("{} {}", key.address, hex::encode(&key.script_pubkey));
         }
+        // Host-side test helper ONLY (companion gap-discovery convergence
+        // leg, funding-unification): sign a real P2WPKH spend from ONE
+        // spending-wallet coin using the exact derived key + signer the
+        // device itself uses (`wpkh::sign_mixed_inputs` via
+        // `build_sweep_tx_mixed`, a single-input degenerate case of the
+        // same mixed-source sweep builder the device's wallet-wide sweep
+        // already exercises) — so `ui-automation/tests/chain-notes.sh` can
+        // simulate "this watch-window address was already spent to empty"
+        // without driving device UI for every leg. Prints "<txid> <raw_hex>".
+        Some("spending-sweep") => {
+            // spending-sweep <network> <seed_index> <account> <chain> <index> <txid> <vout> <value> <dest_address> <fee_rate>
+            let network = Network::from_str_opt(&args[2]).expect("network");
+            let seed: u32 = args[3].parse().expect("seed index");
+            let account: u32 = args[4].parse().expect("account");
+            let chain: u32 = args[5].parse().expect("chain (0=receive,1=change)");
+            let index: u32 = args[6].parse().expect("index");
+            let txid_hex = &args[7];
+            let vout: u32 = args[8].parse().expect("vout");
+            let value: u64 = args[9].parse().expect("value");
+            let dest_address = &args[10];
+            let fee_rate: f64 = args[11].parse().expect("fee_rate");
+
+            let key = notes_core::seeds::derive_spending_key(
+                &app_seed(),
+                seed,
+                network,
+                account,
+                chain,
+                index,
+            )
+            .unwrap();
+            let mut txid = [0u8; 32];
+            hex::decode_to_slice(txid_hex, &mut txid).expect("txid: 64 hex chars");
+            txid.reverse(); // display order -> internal order, same as SyncBundle::utxos()
+            let dest_spk =
+                notes_core::address::address_to_script_pubkey(network, dest_address).unwrap();
+            let input = notes_core::tx::MixedInput {
+                utxo: notes_core::tx::Utxo { txid, vout, value },
+                prevout_spk: key.script_pubkey.clone(),
+                kind: notes_core::tx::InputKind::P2wpkh,
+                seckey: key.seckey,
+            };
+            let swept = notes_core::tx::build_sweep_tx_mixed(&[input], dest_spk, fee_rate, || {
+                generate_aux_rand()
+            })
+            .unwrap();
+            println!("{} {}", swept.txid_hex, swept.raw_hex);
+        }
         Some("compose") => {
             // compose <bundle.json|-> <public|private> <fee_rate> <max_or> <text>
             let bundle = read_bundle(&args[2]);
@@ -234,7 +282,7 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
         }
         _ => {
-            eprintln!("usage: notes_cli address <network> | compose <bundle> <public|private> <fee_rate> <max_or> <text> | send <bundle> <recipient_addr> <public|private> <fee_rate> <max_or> <text> | scan <bundle> | sweep <bundle> <network> <dest_address> <fee_rate>");
+            eprintln!("usage: notes_cli address <network> | compose <bundle> <public|private> <fee_rate> <max_or> <text> | send <bundle> <recipient_addr> <public|private> <fee_rate> <max_or> <text> | scan <bundle> | sweep <bundle> <network> <dest_address> <fee_rate> | spending-address <network> <seed> <account> <chain> <index> | spending-sweep <network> <seed> <account> <chain> <index> <txid> <vout> <value> <dest_address> <fee_rate>");
             std::process::exit(2);
         }
     }

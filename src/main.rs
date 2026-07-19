@@ -1528,6 +1528,37 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         settings.set_spending_address(key.address.clone().into());
                         settings.set_spending_qr(qr_image(&key.address.to_uppercase()));
                     }
+                    // Companion watch window (funding-unification gap-
+                    // discovery, option (b), 2026-07-19): the next
+                    // SPENDING_WINDOW receive AND change addresses — a
+                    // lookahead the companion can probe for coins/history the
+                    // device hasn't revealed or spent yet, so a restore (or a
+                    // funding-wallet-style external deposit straight to a
+                    // not-yet-shown address) still gets found on the next
+                    // sync. Plain address lines, receive block then change
+                    // block, so the whole text pastes straight into the
+                    // companion's "Spending wallet addresses" field — no
+                    // chain/index prefix (unlike `spending-addresses-text`
+                    // above, which is for human display of what's ALREADY
+                    // used). Same derivation as everywhere else on this
+                    // screen — no new crypto.
+                    const SPENDING_WINDOW: u32 = 20;
+                    let window_lines: Vec<String> = [0u32, 1u32]
+                        .into_iter()
+                        .flat_map(|chain| {
+                            let base = if chain == 1 { s.next_change } else { s.next_receive };
+                            (base..base.saturating_add(SPENDING_WINDOW)).filter_map(move |index| {
+                                notes_core::seeds::derive_spending_key(
+                                    seed, ctx.0, net_v, ctx.1, chain, index,
+                                )
+                                .ok()
+                                .map(|k| k.address)
+                            })
+                        })
+                        .collect();
+                    let window_text = window_lines.join("\n");
+                    settings.set_spending_window_text(window_text.clone().into());
+                    settings.set_spending_window_qr(qr_image(&window_text.to_uppercase()));
                 }
                 let addr_lines: Vec<String> = s
                     .used
@@ -1545,6 +1576,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             } else {
                 settings.set_spending_balance_line("0 coin(s) · 0 sats".into());
                 settings.set_spending_addresses_text("".into());
+                settings.set_spending_window_text("".into());
             }
         }
     };
@@ -3567,6 +3599,19 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 // advances the index past it) and the coin is kept instead
                 // of dropped. Cheap and exact — each index's address is
                 // unique, so no false positives are possible.
+                //
+                // Companion gap-discovery, option (b) (2026-07-19): the
+                // device also exports a lookahead WATCH WINDOW (next 20
+                // receive + next 20 change addresses, Settings' spending
+                // card) so the companion can probe addresses it hasn't seen
+                // a coin at yet. The companion reports back every window
+                // address with ANY on-chain history — coin or not — as
+                // `bundle.owner_used`; those resolve through the exact same
+                // gap window below and get adopted even with no live coin.
+                // This is the convergence piece: a restore whose early
+                // addresses are used-but-spent-empty must still advance past
+                // them, or the device would forever re-offer an already-
+                // spent address as "next receive".
                 const SPENDING_ADOPT_GAP: u32 = 20;
                 let net_v = Network::from_str_opt(&net_s).unwrap_or(Network::Mainnet);
                 let mut nb_utxos: Vec<UtxoRec> = Vec::new();
@@ -3574,6 +3619,93 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let mut newly_used: Vec<spending::SpendingAddress> = Vec::new();
                 let mut next_recv = section.as_ref().map(|s| s.next_receive).unwrap_or(0);
                 let mut next_chg = section.as_ref().map(|s| s.next_change).unwrap_or(0);
+
+                // Shared gap derive-and-compare resolver (companion gap-
+                // discovery option (b), 2026-07-19): given ANY owner-tagged
+                // address — whether it came with a live coin or just a bare
+                // "this address has history" marker — find it among already-
+                // known `used` entries (persisted from a prior import, or
+                // adopted earlier in THIS SAME import via `newly_used`, which
+                // a pre-loop `section` clone can't see) or by deriving the
+                // bounded candidate window ahead of next_receive/next_change.
+                // A match is exactly the kind of address the device would
+                // have marked `used` had it ever revealed or spent it, so
+                // it's adopted: `next_recv`/`next_chg` advance past it and it
+                // is queued in `newly_used` for `mark_used` below. Returns
+                // `(address, true)` only the FIRST time an address resolves
+                // via derivation this import — callers use that to log
+                // exactly once per genuine adoption, never on repeat lookups
+                // (e.g. a second coin at the same already-adopted address).
+                let mut resolve_owner = |a: &str| -> Option<(spending::SpendingAddress, bool)> {
+                    let already_known = section
+                        .as_ref()
+                        .and_then(|s| s.used.iter().find(|x| x.address == a).cloned())
+                        .or_else(|| newly_used.iter().find(|x| x.address == a).cloned());
+                    if let Some(addr) = already_known {
+                        return Some((addr, false));
+                    }
+                    // `app_seed.as_ref()` can resolve to either `Option<&[u8;
+                    // 32]>` (the inherent `Option::as_ref`) or `&Option<[u8;
+                    // 32]>` (`AsRef` on whatever smart pointer wraps it,
+                    // found first in method resolution) depending on
+                    // `app_seed`'s exact captured type — match ergonomics
+                    // make `let Some(x) = ‹either shape›` work uniformly,
+                    // unlike `?` which needs a concrete `Try` type.
+                    let Some(seed) = app_seed.as_ref() else { return None };
+                    let mut found_addr: Option<spending::SpendingAddress> = None;
+                    'gap: for chain in [0u32, 1u32] {
+                        let base = if chain == 0 { next_recv } else { next_chg };
+                        for index in base..base.saturating_add(SPENDING_ADOPT_GAP) {
+                            if let Ok(key) = notes_core::seeds::derive_spending_key(
+                                seed, ctx.0, net_v, ctx.1, chain, index,
+                            ) {
+                                if key.address == a {
+                                    found_addr = Some(spending::SpendingAddress {
+                                        chain,
+                                        index,
+                                        address: key.address.clone(),
+                                        spk_hex: hex::encode(&key.script_pubkey),
+                                    });
+                                    break 'gap;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(addr) = &found_addr {
+                        if addr.chain == 0 {
+                            next_recv = next_recv.max(addr.index + 1);
+                        } else {
+                            next_chg = next_chg.max(addr.index + 1);
+                        }
+                        newly_used.push(addr.clone());
+                    }
+                    found_addr.map(|addr| (addr, true))
+                };
+
+                // 1) Used-only markers FIRST — every watch-window address the
+                // companion found ANY history for, coin or not. This must run
+                // BEFORE the coin loop below so a coin at a later index
+                // benefits from the advanced next_recv/next_chg window in the
+                // SAME import: a restore whose early addresses are used-but-
+                // spent-empty must still converge past them to reach a later
+                // real coin, not get stuck re-deriving from index 0 forever.
+                for a in &bundle.owner_used {
+                    if a == &notebook_addr {
+                        continue; // the notebook identity is a separate address space
+                    }
+                    if let Some((addr, is_new)) = resolve_owner(a) {
+                        if is_new {
+                            log::info!(
+                                "cb: spending-adopt chain={} index={} used-only",
+                                addr.chain, addr.index
+                            );
+                        }
+                    }
+                    // else: still unknown beyond the gap — nothing to advance.
+                }
+
+                // 2) Coins — log line shape UNCHANGED from before this
+                // companion gap-discovery extension (today's e2e greps it).
                 for u in &bundle.utxos {
                     match &u.owner_address {
                         None => {
@@ -3583,56 +3715,13 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             nb_utxos.push(UtxoRec { txid: u.txid.clone(), vout: u.vout, value: u.value })
                         }
                         Some(a) => {
-                            // `section` is a pre-loop clone, so an address
-                            // adopted earlier in THIS import must be found
-                            // via `newly_used` — otherwise a second coin at
-                            // the same fresh address would miss the (now
-                            // advanced) gap window and be dropped.
-                            let already_known = section
-                                .as_ref()
-                                .and_then(|s| s.used.iter().find(|x| &x.address == a).cloned())
-                                .or_else(|| {
-                                    newly_used.iter().find(|x| &x.address == a).cloned()
-                                });
-                            let resolved = if let Some(addr) = already_known {
-                                Some(addr)
-                            } else if let Some(seed) = app_seed.as_ref() {
-                                let mut found_addr: Option<spending::SpendingAddress> = None;
-                                'gap: for chain in [0u32, 1u32] {
-                                    let base = if chain == 0 { next_recv } else { next_chg };
-                                    for index in base..base.saturating_add(SPENDING_ADOPT_GAP) {
-                                        if let Ok(key) = notes_core::seeds::derive_spending_key(
-                                            seed, ctx.0, net_v, ctx.1, chain, index,
-                                        ) {
-                                            if &key.address == a {
-                                                found_addr = Some(spending::SpendingAddress {
-                                                    chain,
-                                                    index,
-                                                    address: key.address.clone(),
-                                                    spk_hex: hex::encode(&key.script_pubkey),
-                                                });
-                                                break 'gap;
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Some(addr) = &found_addr {
+                            if let Some((addr, is_new)) = resolve_owner(a) {
+                                if is_new {
                                     log::info!(
                                         "cb: spending-adopt chain={} index={}",
                                         addr.chain, addr.index
                                     );
-                                    if addr.chain == 0 {
-                                        next_recv = next_recv.max(addr.index + 1);
-                                    } else {
-                                        next_chg = next_chg.max(addr.index + 1);
-                                    }
-                                    newly_used.push(addr.clone());
                                 }
-                                found_addr
-                            } else {
-                                None
-                            };
-                            if let Some(addr) = resolved {
                                 sp_utxos.push(spending::SpendingUtxo {
                                     txid: u.txid.clone(),
                                     vout: u.vout,
