@@ -20,7 +20,7 @@ Keep as many **notebooks** as you like — each is its own address, derived from
 - **A backup you can read** — your notebooks derive from a 24-word recovery phrase the device shows on demand, as words or a SeedQR. Write it down once and your funds restore in *any* bitcoin wallet and your notes in this app — no Passport required. Keep separate **accounts** for separate lives, and if a phrase is ever exposed, switch to a fresh one.
 - **Every key, when you need it** — a Settings *Dangerous area* reveals your keys grouped by risk: **public** (account xpub + a `tr()` descriptor — watch-only, safe to share) and **private** (recovery words, and any notebook's hex/WIF), each scannable as a QR to import elsewhere. The device deliberately never shows a whole-account private key — the 24 words already restore everything.
 - **Public or private** — private notes are sealed with modern authenticated encryption before they ever leave the device; public notes are plain text for the world to read.
-- **Notes to other people** — composing starts at a **contacts picker**: yourself, recent addresses (nameable), a QR scan, or manual entry. Directed notes reach any taproot address like unstoppable, uncensorable mail; private directed notes can be read by exactly two devices — yours and theirs — and both can recover them from bare chain data after a wipe.
+- **Notes to other people** — composing starts at a **contacts picker**: yourself, recent addresses (nameable), a QR scan, or manual entry. Directed notes reach any taproot address like unstoppable, uncensorable mail — send one note to **several recipients at once**, and **reply** or **reply-all** to keep a thread going. Private directed notes can be read only by their recipients, and everyone can recover them from bare chain data after a wipe.
 - **A gift inside** — directed notes can carry a chosen amount of sats to the recipient, from the minimum dust up to whatever you like.
 - **Live cost while you type** — the compose screen re-prices on every keystroke with economy/normal/fast fee tiers or a custom rate, and the estimate is byte-exact against the transaction that actually gets signed.
 - **Sync without a cable** — bundles come in by animated QR straight to the device camera; signed transactions go out as a QR the companion scans with your webcam. Files and the Airlock volume cover the big transfers.
@@ -28,11 +28,13 @@ Keep as many **notebooks** as you like — each is its own address, derived from
 - **Every network** — mainnet, testnet4, signet, and regtest as one wallet-wide setting; each notebook keeps a separate ledger per chain, and the relay policy is verified live on testnet4.
 
 <p align="center">
-  <img src="screenshots/contacts.png" alt="Send to — contacts picker with recents and QR scan" width="270">
+  <img src="screenshots/contacts.png" alt="Send to — contacts picker with recents and QR scan" width="205">
   &nbsp;
-  <img src="screenshots/note.png" alt="A private note, decrypted on-device" width="270">
+  <img src="screenshots/compose-multi.png" alt="Compose to several recipients at once, each with an optional gift of sats" width="205">
   &nbsp;
-  <img src="screenshots/recovery.png" alt="Private keys — recovery words shown as text or a SeedQR, revealed on demand" width="270">
+  <img src="screenshots/note.png" alt="A private note, decrypted on-device" width="205">
+  &nbsp;
+  <img src="screenshots/recovery.png" alt="Private keys — recovery words shown as text or a SeedQR, revealed on demand" width="205">
 </p>
 
 ## The companion
