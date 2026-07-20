@@ -676,3 +676,76 @@ fn reply_set_unit() {
     };
     assert!(reply_set(&self_note, &a.address(NET)).is_empty());
 }
+
+/// `sealed_note_payloads_multi` (the PSBT/mixed-path payload primitive)
+/// emits byte-identical payloads to the canonical self-contained composer
+/// for the same inputs — public compared byte-for-byte (deterministic);
+/// private proven by both recipients decrypting the payload bodies via the
+/// scanner. One unique address must delegate to `sealed_note_payloads`
+/// byte-identically (public), and dedupe collapses duplicates.
+#[test]
+fn sealed_payloads_multi_matches_composer_and_delegates() {
+    use notes_core::bundle::{sealed_note_payloads, sealed_note_payloads_multi};
+    let a = identity(7);
+    let b = identity(9);
+    let c = identity(11);
+    let rb = Recipient::parse(NET, &b.address(NET)).unwrap();
+    let rc = Recipient::parse(NET, &c.address(NET)).unwrap();
+    let note_id = [5, 5, 5, 5];
+    let key = [0x42u8; 32];
+
+    // Public 2-recipient: byte-identical to the composer's OP_RETURNs.
+    let (payloads, spks) = sealed_note_payloads_multi(
+        &a, "psbt-path multi", false,
+        &[Recipient::parse(NET, &b.address(NET)).unwrap(), Recipient::parse(NET, &c.address(NET)).unwrap()],
+        note_id, key, 100_000,
+    ).unwrap();
+    assert_eq!(spks, vec![rb.spk.clone(), rc.spk.clone()]);
+    let utxos = vec![notes_core::tx::Utxo { txid: [3u8; 32], vout: 0, value: 1_000_000 }];
+    let recipients = vec![
+        (Recipient::parse(NET, &b.address(NET)).unwrap(), notes_core::DUST_LIMIT),
+        (Recipient::parse(NET, &c.address(NET)).unwrap(), notes_core::DUST_LIMIT),
+    ];
+    let note = compose_directed_note_multi_with_change(
+        &a, &utxos, "psbt-path multi", false, note_id, &recipients, key, None, 100_000, 1.0,
+        || Ok([0u8; 32]),
+    ).unwrap();
+    let composer_payloads: Vec<Vec<u8>> = note
+        .tx.outputs.iter()
+        .filter_map(|o| notes_core::tx::op_return_payload(&o.script_pubkey))
+        .map(<[u8]>::to_vec)
+        .collect();
+    assert_eq!(payloads, composer_payloads, "PSBT-path payloads must match the composer byte-for-byte");
+
+    // Private 2-recipient: FLAG_MULTI|PRIVATE framing, both recipients decrypt.
+    let (ppayloads, pspks) = sealed_note_payloads_multi(
+        &a, "sealed for both", true,
+        &[Recipient::parse(NET, &b.address(NET)).unwrap(), Recipient::parse(NET, &c.address(NET)).unwrap()],
+        note_id, key, 100_000,
+    ).unwrap();
+    assert_eq!(pspks.len(), 2);
+    let chunk = envelope::decode(&ppayloads[0]).unwrap();
+    assert_eq!(chunk.flags, FLAG_DIRECTED | FLAG_MULTI | FLAG_PRIVATE);
+    let body = envelope::reassemble(&ppayloads.iter().filter_map(|p| envelope::decode(p)).collect::<Vec<_>>()).unwrap();
+    let count = body[0] as usize;
+    assert_eq!(count, 2);
+    let wraps: Vec<Vec<u8>> = body[1..1 + 2 * notes_core::dm::WRAP_LEN]
+        .chunks(notes_core::dm::WRAP_LEN).map(<[u8]>::to_vec).collect();
+    let sealed = &body[1 + 2 * notes_core::dm::WRAP_LEN..];
+    for (i, reader) in [(0usize, &b), (1usize, &c)] {
+        let pt = notes_core::dm::open_received_multi(
+            &reader.tweaked_seckey, &reader.output_x, &a.output_x, &note_id, &wraps, sealed, Some(i),
+        ).unwrap();
+        assert_eq!(pt, b"sealed for both");
+    }
+
+    // One unique address (incl. via dupes) delegates byte-identically (public).
+    let (single, sspks) = sealed_note_payloads_multi(
+        &a, "solo", false,
+        &[Recipient::parse(NET, &b.address(NET)).unwrap(), Recipient::parse(NET, &b.address(NET)).unwrap()],
+        note_id, key, 100_000,
+    ).unwrap();
+    let (legacy, lspk) = sealed_note_payloads(&a, "solo", false, Some(&rb), note_id, 100_000).unwrap();
+    assert_eq!(single, legacy);
+    assert_eq!(sspks, vec![lspk.unwrap()]);
+}

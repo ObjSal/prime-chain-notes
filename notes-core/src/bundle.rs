@@ -860,6 +860,48 @@ pub fn sealed_note_payloads(
     Ok((payloads, recipient.map(|r| r.spk.clone())))
 }
 
+/// Multi-recipient analog of [`sealed_note_payloads`] — the payload-side
+/// primitive for externally-assembled (PSBT / mixed-source) multi-recipient
+/// notes, exposing the SAME FROZEN `FLAG_MULTI` body framing the
+/// self-contained `compose_directed_note_multi_*` builders emit (count(u8)
+/// || utf8 text, or count || wraps || sealed body — see envelope.rs/dm.rs).
+///
+/// `recipients` are deduped by address (first occurrence wins, order
+/// preserved); exactly ONE unique address delegates to
+/// [`sealed_note_payloads`] and is byte-identical to it (`content_key`
+/// unused there, same convention as the compose delegation). Private
+/// requires every recipient taproot. Returns the enveloped payloads plus
+/// each recipient's scriptPubKey in output order — the caller MUST place
+/// the recipient outputs in exactly that order (wrap order = output order).
+pub fn sealed_note_payloads_multi(
+    identity: &Identity,
+    text: &str,
+    private: bool,
+    recipients: &[Recipient],
+    note_id: [u8; 4],
+    content_key: [u8; 32],
+    max_op_return_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), Error> {
+    let mut deduped: Vec<&Recipient> = Vec::new();
+    for r in recipients {
+        if !deduped.iter().any(|existing| existing.address == r.address) {
+            deduped.push(r);
+        }
+    }
+    if deduped.is_empty() || deduped.len() > 255 {
+        return Err(Error::Envelope("recipients: 1..=255"));
+    }
+    if deduped.len() == 1 {
+        let (payloads, spk) =
+            sealed_note_payloads(identity, text, private, Some(deduped[0]), note_id, max_op_return_bytes)?;
+        return Ok((payloads, vec![spk.expect("recipient was given")]));
+    }
+    let body = multi_body(identity, text, private, note_id, &deduped, content_key)?;
+    let flags = FLAG_DIRECTED | FLAG_MULTI | if private { FLAG_PRIVATE } else { 0 };
+    let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
+    Ok((payloads, deduped.iter().map(|r| r.spk.clone()).collect()))
+}
+
 /// Shared tail of both compose paths: body → enveloped payloads → signed tx.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
@@ -1148,13 +1190,13 @@ fn multi_body(
     text: &str,
     private: bool,
     note_id: [u8; 4],
-    deduped: &[&(Recipient, u64)],
+    deduped: &[&Recipient],
     content_key: [u8; 32],
 ) -> Result<Vec<u8>, Error> {
     if private {
         let recipients_x: Vec<[u8; 32]> = deduped
             .iter()
-            .map(|(r, _)| r.p2tr_x.ok_or(Error::RecipientNotTaproot))
+            .map(|r| r.p2tr_x.ok_or(Error::RecipientNotTaproot))
             .collect::<Result<_, _>>()?;
         let (wraps, sealed_body) = dm::seal_multi(
             &identity.tweaked_seckey,
@@ -1225,7 +1267,8 @@ pub fn compose_directed_note_multi_with_change(
             aux,
         );
     }
-    let body = multi_body(identity, text, private, note_id, &deduped, content_key)?;
+    let recips: Vec<&Recipient> = deduped.iter().map(|(r, _)| r).collect();
+    let body = multi_body(identity, text, private, note_id, &recips, content_key)?;
     let flags = FLAG_DIRECTED | FLAG_MULTI | if private { FLAG_PRIVATE } else { 0 };
     let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
     let recipient_pairs: Vec<(Vec<u8>, u64)> =
@@ -1277,7 +1320,8 @@ pub fn compose_directed_note_multi_exact(
             aux,
         );
     }
-    let body = multi_body(identity, text, private, note_id, &deduped, content_key)?;
+    let recips: Vec<&Recipient> = deduped.iter().map(|(r, _)| r).collect();
+    let body = multi_body(identity, text, private, note_id, &recips, content_key)?;
     let flags = FLAG_DIRECTED | FLAG_MULTI | if private { FLAG_PRIVATE } else { 0 };
     let payloads = envelope::encode_chunks(note_id, flags, &body, max_op_return_bytes)?;
     let recipient_pairs: Vec<(Vec<u8>, u64)> =
