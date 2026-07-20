@@ -8,7 +8,8 @@ use notes_core::address::{p2tr_script_pubkey, p2wpkh_script_pubkey};
 use notes_core::keys::hash160;
 use notes_core::tx::{
     build_note_tx_exact, build_note_tx_mixed_exact, build_note_tx_mixed_exact_anchored,
-    build_sweep_tx_mixed, estimate_vsize, estimate_vsize_mixed, InputKind, MixedInput, Utxo,
+    build_note_tx_mixed_exact_anchored_multi, build_sweep_tx_mixed, estimate_vsize,
+    estimate_vsize_mixed, InputKind, MixedInput, Utxo,
 };
 use notes_core::DUST_LIMIT;
 
@@ -724,4 +725,291 @@ fn old_and_new_mixed_builders_byte_identical_when_forced_dust() {
     assert_eq!(old.fee, new.fee);
     assert_eq!(old.change, new.change);
     assert_eq!(old.vsize, new.vsize);
+}
+
+// ---------------------------------------------------------------------
+// `build_note_tx_mixed_exact_anchored_multi` — the multi-recipient (2..=255)
+// analog of `build_note_tx_mixed_exact_anchored`, for the mixed/spending
+// funding path (the device app's `on_compose_continue` mixed branch, which
+// previously could only ever carry ONE directed recipient).
+// ---------------------------------------------------------------------
+
+/// 0 or 1 recipients delegates to `build_note_tx_mixed_exact_anchored` and
+/// is byte-identical to it — the existing mixed self-note and single-
+/// recipient directed-note shapes are completely unaffected by this
+/// function's existence.
+#[test]
+fn mixed_multi_zero_and_one_recipient_delegates_byte_identical() {
+    let sk = wpkh_seckey(41);
+    let spk = wpkh_spk(&sk);
+    let notebook_dust_spk = p2tr_script_pubkey(&NOTEBOOK_X);
+    let change_spk = wpkh_spk(&wpkh_seckey(42));
+    let payloads = vec![b"delegation check".to_vec()];
+    let inputs = vec![MixedInput {
+        utxo: Utxo { txid: [101u8; 32], vout: 0, value: 100_000 },
+        prevout_spk: spk,
+        kind: InputKind::P2wpkh,
+        seckey: sk,
+    }];
+
+    // Zero recipients (self-note shape).
+    let old_self = build_note_tx_mixed_exact_anchored(
+        &inputs, &payloads, None, 0, &notebook_dust_spk, &change_spk, 2.0, || Ok(AUX),
+    )
+    .unwrap();
+    let new_self = build_note_tx_mixed_exact_anchored_multi(
+        &inputs, &payloads, &[], &notebook_dust_spk, &change_spk, 2.0, || Ok(AUX),
+    )
+    .unwrap();
+    assert_eq!(old_self.raw_hex, new_self.raw_hex);
+    assert_eq!(old_self.tx, new_self.tx);
+
+    // One recipient (single-recipient directed shape).
+    let recipient_spk = p2tr_script_pubkey(&[0x88; 32]);
+    let old_one = build_note_tx_mixed_exact_anchored(
+        &inputs,
+        &payloads,
+        Some(&recipient_spk),
+        5_000,
+        &notebook_dust_spk,
+        &change_spk,
+        2.0,
+        || Ok(AUX),
+    )
+    .unwrap();
+    let new_one = build_note_tx_mixed_exact_anchored_multi(
+        &inputs,
+        &payloads,
+        &[(recipient_spk, 5_000)],
+        &notebook_dust_spk,
+        &change_spk,
+        2.0,
+        || Ok(AUX),
+    )
+    .unwrap();
+    assert_eq!(old_one.raw_hex, new_one.raw_hex);
+    assert_eq!(old_one.tx, new_one.tx);
+}
+
+/// 3 recipients through the mixed/spending funding path, tx already
+/// anchored by a notebook input — NO dust-to-self output (the anchored
+/// skip rule), OP_RETURN then all 3 recipient outputs in order then
+/// change; cross-checked byte-for-byte against rust-bitcoin exactly like
+/// `anchored_mixed_build_skips_dust_when_notebook_input_present`. This is
+/// the exact shape a mixed-funded directed note to 3 recipients builds on
+/// the device.
+#[test]
+fn mixed_multi_three_recipients_anchored_output_order_and_cross_check() {
+    use bitcoin::consensus::encode::deserialize as btc_deser;
+    use bitcoin::hashes::Hash;
+    use bitcoin::secp256k1::ecdsa::Signature as SecpEcdsaSignature;
+    use bitcoin::secp256k1::{
+        schnorr::Signature as SecpSchnorrSignature, Message, PublicKey as SecpPublicKey, Secp256k1,
+        XOnlyPublicKey,
+    };
+    use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
+    use bitcoin::{Amount, ScriptBuf, TxOut as BtcTxOut};
+    use notes_core::bundle::Identity;
+
+    let notebook = Identity::from_app_seed(&[0x71; 32]).unwrap();
+    let notebook_dust_spk = p2tr_script_pubkey(&notebook.output_x);
+    let wpkh_sk = wpkh_seckey(43);
+    let wpkh_input_spk = wpkh_spk(&wpkh_sk);
+    let change_spk = wpkh_spk(&wpkh_seckey(44));
+    let payloads = vec![b"gift for everyone".to_vec()];
+
+    let r1 = p2tr_script_pubkey(&[0x01; 32]);
+    let r2 = p2tr_script_pubkey(&[0x02; 32]);
+    let r3 = p2tr_script_pubkey(&[0x03; 32]);
+    let recipients = vec![(r1.clone(), 1_000u64), (r2.clone(), 2_000u64), (r3.clone(), 3_000u64)];
+
+    let inputs = vec![
+        MixedInput {
+            utxo: Utxo { txid: [111u8; 32], vout: 0, value: 1_000 },
+            prevout_spk: notebook_dust_spk.clone(), // anchors the tx
+            kind: InputKind::Taproot,
+            seckey: notebook.tweaked_seckey,
+        },
+        MixedInput {
+            utxo: Utxo { txid: [112u8; 32], vout: 3, value: 200_000 },
+            prevout_spk: wpkh_input_spk.clone(),
+            kind: InputKind::P2wpkh,
+            seckey: wpkh_sk,
+        },
+    ];
+    let in_value: u64 = inputs.iter().map(|i| i.utxo.value).sum();
+
+    let note = build_note_tx_mixed_exact_anchored_multi(
+        &inputs,
+        &payloads,
+        &recipients,
+        &notebook_dust_spk,
+        &change_spk,
+        1.5,
+        || Ok(AUX),
+    )
+    .unwrap();
+
+    // Output order: OP_RETURN, r1, r2, r3, change — no dust (anchored).
+    assert_eq!(note.tx.outputs.len(), 5);
+    assert_eq!(note.tx.outputs[0].script_pubkey[0], 0x6a);
+    assert_eq!(note.tx.outputs[1].script_pubkey, r1);
+    assert_eq!(note.tx.outputs[1].value, 1_000);
+    assert_eq!(note.tx.outputs[2].script_pubkey, r2);
+    assert_eq!(note.tx.outputs[2].value, 2_000);
+    assert_eq!(note.tx.outputs[3].script_pubkey, r3);
+    assert_eq!(note.tx.outputs[3].value, 3_000);
+    assert_eq!(note.tx.outputs[4].script_pubkey, change_spk);
+    assert!(
+        note.tx.outputs.iter().all(|o| o.script_pubkey != notebook_dust_spk),
+        "no output should pay the notebook dust spk when anchored"
+    );
+    assert_eq!(note.sent, 6_000);
+    assert_eq!(in_value, note.fee + 6_000 + note.change);
+
+    // Estimator (fed the same extra-output shape: 3 recipients + change, no
+    // dust) stays byte-exact.
+    let predicted = estimate_vsize_mixed(
+        &[InputKind::Taproot, InputKind::P2wpkh],
+        &[payloads[0].len()],
+        &[r1.len(), r2.len(), r3.len(), change_spk.len()],
+    );
+    assert_eq!(predicted, note.vsize, "estimator must match the anchored 3-recipient shape");
+
+    // rust-bitcoin cross-check: both witness kinds verify under their own BIP.
+    let raw = hex::decode(&note.raw_hex).unwrap();
+    let btx: bitcoin::Transaction = btc_deser(&raw).unwrap();
+    assert_eq!(btx.compute_txid().to_string(), note.txid_hex);
+    assert_eq!(btx.vsize(), note.vsize);
+
+    let prevouts: Vec<BtcTxOut> = vec![
+        BtcTxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::from_bytes(notebook_dust_spk.clone()) },
+        BtcTxOut { value: Amount::from_sat(200_000), script_pubkey: ScriptBuf::from_bytes(wpkh_input_spk.clone()) },
+    ];
+    let secp = Secp256k1::verification_only();
+    let mut cache = SighashCache::new(&btx);
+
+    let output_key = XOnlyPublicKey::from_slice(&notebook.output_x).unwrap();
+    let tap_sighash = cache
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), TapSighashType::Default)
+        .unwrap();
+    secp.verify_schnorr(
+        &SecpSchnorrSignature::from_slice(&note.tx.witnesses[0][0]).unwrap(),
+        &Message::from_digest(tap_sighash.to_byte_array()),
+        &output_key,
+    )
+    .expect("taproot input must verify under BIP340/341");
+
+    let wpkh_script_spk = ScriptBuf::from_bytes(wpkh_input_spk);
+    let wpkh_sighash = cache
+        .p2wpkh_signature_hash(1, &wpkh_script_spk, Amount::from_sat(200_000), EcdsaSighashType::All)
+        .unwrap();
+    let witness1 = &note.tx.witnesses[1];
+    let sig_bytes = &witness1[0];
+    assert_eq!(*sig_bytes.last().unwrap(), 0x01, "SIGHASH_ALL byte");
+    let der = &sig_bytes[..sig_bytes.len() - 1];
+    let pubkey_bytes = &witness1[1];
+    let secp_sig = SecpEcdsaSignature::from_der(der).unwrap();
+    let secp_pubkey = SecpPublicKey::from_slice(pubkey_bytes).unwrap();
+    secp.verify_ecdsa(&Message::from_digest(wpkh_sighash.to_byte_array()), &secp_sig, &secp_pubkey)
+        .expect("P2WPKH input must verify under BIP143");
+}
+
+/// Unanchored multi-recipient build (no input spends the notebook spk):
+/// the dust-to-self output IS still present, ordered before change and
+/// after every recipient output.
+#[test]
+fn mixed_multi_unanchored_keeps_dust_after_recipients() {
+    let sk = wpkh_seckey(45);
+    let spk = wpkh_spk(&sk);
+    let notebook_dust_spk = p2tr_script_pubkey(&NOTEBOOK_X);
+    let change_spk = wpkh_spk(&wpkh_seckey(46));
+    let payloads = vec![b"unanchored multi".to_vec()];
+    let r1 = p2tr_script_pubkey(&[0x04; 32]);
+    let r2 = p2tr_script_pubkey(&[0x05; 32]);
+    let recipients = vec![(r1.clone(), 500u64), (r2.clone(), 700u64)];
+
+    let inputs = vec![MixedInput {
+        utxo: Utxo { txid: [121u8; 32], vout: 0, value: 300_000 },
+        prevout_spk: spk, // does NOT match notebook_dust_spk
+        kind: InputKind::P2wpkh,
+        seckey: sk,
+    }];
+
+    let note = build_note_tx_mixed_exact_anchored_multi(
+        &inputs,
+        &payloads,
+        &recipients,
+        &notebook_dust_spk,
+        &change_spk,
+        2.0,
+        || Ok(AUX),
+    )
+    .unwrap();
+
+    assert_eq!(note.tx.outputs.len(), 5); // OP_RETURN, r1, r2, dust, change
+    assert_eq!(note.tx.outputs[1].script_pubkey, r1);
+    assert_eq!(note.tx.outputs[2].script_pubkey, r2);
+    assert_eq!(note.tx.outputs[3].script_pubkey, notebook_dust_spk);
+    assert_eq!(note.tx.outputs[3].value, DUST_LIMIT);
+    assert_eq!(note.tx.outputs[4].script_pubkey, change_spk);
+    assert_eq!(300_000, note.fee + 1_200 + DUST_LIMIT + note.change);
+}
+
+/// Recipient count above 255 must error, mirroring
+/// `build_note_tx_multi_with_change`/`build_note_tx_multi_exact`'s bound.
+#[test]
+fn mixed_multi_recipient_count_upper_bound() {
+    let sk = wpkh_seckey(47);
+    let spk = wpkh_spk(&sk);
+    let notebook_dust_spk = p2tr_script_pubkey(&NOTEBOOK_X);
+    let change_spk = wpkh_spk(&wpkh_seckey(48));
+    let inputs = vec![MixedInput {
+        utxo: Utxo { txid: [131u8; 32], vout: 0, value: 1_000_000 },
+        prevout_spk: spk,
+        kind: InputKind::P2wpkh,
+        seckey: sk,
+    }];
+    let recipients: Vec<(Vec<u8>, u64)> =
+        (0..256u32).map(|i| (p2tr_script_pubkey(&[i as u8; 32]), DUST_LIMIT)).collect();
+    let err = build_note_tx_mixed_exact_anchored_multi(
+        &inputs,
+        &[b"x".to_vec()],
+        &recipients,
+        &notebook_dust_spk,
+        &change_spk,
+        1.0,
+        || Ok(AUX),
+    )
+    .unwrap_err();
+    assert!(matches!(err, notes_core::Error::Envelope(_)));
+}
+
+/// A recipient amount below `DUST_LIMIT` is rejected, mirroring the
+/// all-taproot multi builders' guard.
+#[test]
+fn mixed_multi_below_dust_amount_rejected() {
+    let sk = wpkh_seckey(49);
+    let spk = wpkh_spk(&sk);
+    let notebook_dust_spk = p2tr_script_pubkey(&NOTEBOOK_X);
+    let change_spk = wpkh_spk(&wpkh_seckey(50));
+    let inputs = vec![MixedInput {
+        utxo: Utxo { txid: [141u8; 32], vout: 0, value: 100_000 },
+        prevout_spk: spk,
+        kind: InputKind::P2wpkh,
+        seckey: sk,
+    }];
+    let recipients =
+        vec![(p2tr_script_pubkey(&[0x06; 32]), 1_000u64), (p2tr_script_pubkey(&[0x07; 32]), 10u64)];
+    let err = build_note_tx_mixed_exact_anchored_multi(
+        &inputs,
+        &[b"x".to_vec()],
+        &recipients,
+        &notebook_dust_spk,
+        &change_spk,
+        1.0,
+        || Ok(AUX),
+    )
+    .unwrap_err();
+    assert!(matches!(err, notes_core::Error::Envelope(_)));
 }

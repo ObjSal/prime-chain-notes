@@ -1,8 +1,8 @@
 import { Theme, UISize, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize } from "@ui/theme.slint";
-import { Callbacks, Ui, Home, Compose, Confirm, ConfirmSign, ConfirmRow, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick } from "callbacks.slint";
+import { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, ConfirmRow, Notes, NoteRow, View, Sync, SignPsbt, Settings, Contacts, ContactRow, Coins, CoinRow, Sweep, NotebooksUi, NotebookCb, NotebookRow, SenderRow, Recovery, ExportNbRow, Funding, FundingCoinRow, ChangePick } from "callbacks.slint";
 import { Button } from "@ui/button.slint";
 
-export { Callbacks, Ui, Home, Compose, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
+export { Callbacks, Ui, Home, Compose, ToRow, Confirm, ConfirmSign, Notes, View, Sync, SignPsbt, Settings, Contacts, Coins, Sweep, NotebooksUi, NotebookCb, Recovery, Funding, ChangePick, Theme, ButtonStyleProps, ButtonSizeProps, ButtonVariant, ButtonState, ButtonSize }
 
 component PrimaryAction inherits Button {
     background: Theme.palette-primary;
@@ -347,6 +347,41 @@ component ContactEntry inherits Rectangle {
     }
 }
 
+// One extra recipient row on the compose screen (multi-recipient directed
+// notes) — label + a "×" remove button, styled exactly like the notebook
+// list's archive-× control.
+component ToRowEntry inherits Rectangle {
+    in property <ToRow> entry;
+    callback remove();
+    height: 34px;
+    HorizontalLayout {
+        Text {
+            // `entry.label` is Rust-formatted via `to_label_for`, which
+            // already carries a "to: " prefix (matches the primary
+            // to-label Text above) — no double prefix here.
+            text: root.entry.label;
+            color: Theme.palette-muted;
+            font-family: "SourceCodePro";
+            font-size: 14px;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        Rectangle {
+            width: 40px;
+            TouchArea { clicked => { root.remove(); } }
+            Text {
+                text: "×";
+                color: Theme.palette-muted;
+                font-family: "Montserrat";
+                font-size: 22px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+    }
+}
+
 // One row on the universal Confirm & sign screen (4) — an input or output
 // decoded from the actual tx bytes (`notes_core::confirm::SummaryRow`).
 // Output rows with no address (the OP_RETURN note row) show the subtitle
@@ -686,6 +721,19 @@ export component AppWindow inherits Window {
                 font-size: 13px;
                 wrap: char-wrap;
             }
+
+            if View.reply-address != "" || View.reply-set.length > 1: HorizontalLayout {
+                vertical-stretch: 0;
+                spacing: 8px;
+                if View.reply-address != "": SecondaryAction {
+                    text: "Reply";
+                    clicked => { Callbacks.reply-to-note(); }
+                }
+                if View.reply-set.length > 1: SecondaryAction {
+                    text: "Reply all";
+                    clicked => { Callbacks.reply-all-to-note(); }
+                }
+            }
         }
 
         // ---------------------------------------------- screen 3: compose
@@ -717,6 +765,41 @@ export component AppWindow inherits Window {
                 font-family: "SourceCodePro";
                 font-size: 14px;
                 overflow: elide;
+            }
+
+            // Extra recipients (multi-recipient directed note): one row per
+            // Compose.to-extra entry, each removable.
+            for row in Compose.to-extra: ToRowEntry {
+                vertical-stretch: 0;
+                entry: row;
+                remove => { Callbacks.remove-recipient(row.address); }
+            }
+
+            // "+ Add recipient" — only for an in-progress directed draft,
+            // and only while under the 255-recipient cap.
+            if Compose.to-address != "" && 1 + Compose.to-extra.length < 255: Rectangle {
+                vertical-stretch: 0;
+                height: 30px;
+                TouchArea { clicked => { Callbacks.add-recipient-open(); } }
+                HorizontalLayout {
+                    Text {
+                        text: "+ Add recipient";
+                        color: Theme.palette-primary;
+                        font-family: "Montserrat";
+                        font-size: 13px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: "›";
+                        color: Theme.palette-muted;
+                        font-family: "Montserrat";
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+                }
             }
 
             // Pay-from (funding-unification): who funds this note —

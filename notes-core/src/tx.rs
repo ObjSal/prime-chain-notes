@@ -1006,6 +1006,164 @@ fn build_note_tx_mixed_exact_inner(
     Err(Error::InsufficientFunds)
 }
 
+/// Multi-recipient (0/1..=255) analog of [`build_note_tx_mixed_exact_anchored`]:
+/// many directed-note recipients (`recipients` as `(scriptPubKey, amount)`
+/// pairs in OUTPUT order) instead of at most one, each amount `>= DUST_LIMIT`.
+/// Same anchored-dust-skip rule as the singular function (no dust-to-self
+/// output when an input already spends `notebook_dust_spk`). A `recipients`
+/// slice of length 0 or 1 delegates to `build_note_tx_mixed_exact_anchored`
+/// and is therefore byte-identical to it — every mixed-funded self-note or
+/// single-recipient directed note this function's existence touches is
+/// unaffected. Output order: OP_RETURN chunk(s), recipient outputs in
+/// `recipients` order, optional notebook dust, change — matching
+/// [`build_note_tx_multi_with_change`]/[`build_note_tx_multi_exact`]'s
+/// recipient-then-other-outputs convention.
+#[allow(clippy::too_many_arguments)]
+pub fn build_note_tx_mixed_exact_anchored_multi(
+    inputs: &[MixedInput],
+    payloads: &[Vec<u8>],
+    recipients: &[(Vec<u8>, u64)],
+    notebook_dust_spk: &[u8],
+    change_spk: &[u8],
+    fee_rate: f64,
+    aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    if recipients.len() > 255 {
+        return Err(Error::Envelope("recipients: 1..=255"));
+    }
+    if recipients.len() <= 1 {
+        let (spk, amount) = match recipients.first() {
+            Some((spk, amount)) => (Some(spk.as_slice()), *amount),
+            None => (None, 0),
+        };
+        return build_note_tx_mixed_exact_anchored(
+            inputs,
+            payloads,
+            spk,
+            amount,
+            notebook_dust_spk,
+            change_spk,
+            fee_rate,
+            aux,
+        );
+    }
+    let anchored_by_input = inputs.iter().any(|i| i.prevout_spk == notebook_dust_spk);
+    build_note_tx_mixed_exact_inner_multi(
+        inputs,
+        payloads,
+        recipients,
+        notebook_dust_spk,
+        change_spk,
+        fee_rate,
+        !anchored_by_input,
+        aux,
+    )
+}
+
+/// Multi-recipient sibling of [`build_note_tx_mixed_exact_inner`] — same
+/// fee-search loop and signing, generalized from `Option<one recipient>` to
+/// a `recipients` slice. Kept as a SEPARATE function (not a refactor of the
+/// existing inner) so `build_note_tx_mixed_exact`/`build_note_tx_mixed_exact_anchored`
+/// are untouched by this addition; only reached via
+/// [`build_note_tx_mixed_exact_anchored_multi`] for `recipients.len() >= 2`.
+#[allow(clippy::too_many_arguments)]
+fn build_note_tx_mixed_exact_inner_multi(
+    inputs: &[MixedInput],
+    payloads: &[Vec<u8>],
+    recipients: &[(Vec<u8>, u64)],
+    notebook_dust_spk: &[u8],
+    change_spk: &[u8],
+    fee_rate: f64,
+    emit_dust: bool,
+    mut aux: impl FnMut() -> Result<[u8; 32], Error>,
+) -> Result<NoteTx, Error> {
+    if payloads.is_empty() {
+        return Err(Error::Envelope("no payloads"));
+    }
+    if inputs.is_empty() {
+        return Err(Error::InsufficientFunds);
+    }
+    if recipients.iter().any(|(_, amount)| *amount < DUST_LIMIT) {
+        return Err(Error::Envelope("gift amount below dust limit"));
+    }
+    let payload_lens: Vec<usize> = payloads.iter().map(Vec::len).collect();
+    let sent: u64 = recipients.iter().map(|(_, amount)| amount).sum();
+    let dust: u64 = if emit_dust { DUST_LIMIT } else { 0 };
+    let kinds: Vec<InputKind> = inputs.iter().map(|i| i.kind).collect();
+    let in_value: u64 = inputs.iter().map(|i| i.utxo.value).sum();
+
+    for change in [true, false] {
+        let mut extra_lens: Vec<usize> = Vec::with_capacity(recipients.len() + 2);
+        for (spk, _) in recipients {
+            extra_lens.push(spk.len());
+        }
+        if emit_dust {
+            extra_lens.push(notebook_dust_spk.len());
+        }
+        if change {
+            extra_lens.push(change_spk.len());
+        }
+        let vsize = estimate_vsize_mixed(&kinds, &payload_lens, &extra_lens);
+        let fee = (vsize as f64 * fee_rate).ceil() as u64;
+        if in_value < fee + sent + dust {
+            continue;
+        }
+        let change_value = in_value - fee - sent - dust;
+        if change && change_value < DUST_LIMIT {
+            continue;
+        }
+        if !change && change_value > DUST_LIMIT {
+            // Overshoot without change would burn > dust into fees; prefer
+            // the change-output branch (tried first in this loop).
+            continue;
+        }
+
+        let mut outputs: Vec<TxOut> = payloads
+            .iter()
+            .map(|p| TxOut { value: 0, script_pubkey: op_return_script(p) })
+            .collect();
+        for (spk, amount) in recipients {
+            outputs.push(TxOut { value: *amount, script_pubkey: spk.clone() });
+        }
+        if emit_dust {
+            outputs.push(TxOut { value: DUST_LIMIT, script_pubkey: notebook_dust_spk.to_vec() });
+        }
+        if change {
+            outputs.push(TxOut { value: change_value, script_pubkey: change_spk.to_vec() });
+        }
+
+        let mut tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            inputs: inputs.iter().map(|i| i.utxo.clone()).collect(),
+            outputs,
+            witnesses: Vec::new(),
+        };
+        let prevout_spks: Vec<Vec<u8>> = inputs.iter().map(|i| i.prevout_spk.clone()).collect();
+        let keys: Vec<crate::wpkh::InputKey> = inputs
+            .iter()
+            .map(|i| match i.kind {
+                InputKind::Taproot => crate::wpkh::InputKey::Taproot { tweaked_seckey: &i.seckey },
+                InputKind::P2wpkh => crate::wpkh::InputKey::P2wpkh { seckey: &i.seckey },
+            })
+            .collect();
+        crate::wpkh::sign_mixed_inputs(&mut tx, &prevout_spks, &keys, &mut aux)?;
+
+        let actual_fee = in_value - sent - dust - if change { change_value } else { 0 };
+        return Ok(NoteTx {
+            fee: actual_fee,
+            change: if change { change_value } else { 0 },
+            sent,
+            vsize: tx.vsize(),
+            txid_hex: tx.txid_hex(),
+            raw_hex: hex::encode(tx.serialize_segwit()),
+            spent_outpoints: tx.inputs.iter().map(|i| (i.txid, i.vout)).collect(),
+            tx,
+        });
+    }
+    Err(Error::InsufficientFunds)
+}
+
 /// Build a note tx spending EXACTLY the given inputs (coin control) —
 /// no automatic selection. Change (self or `change_out`) is the leftover
 /// after the note payloads, optional dust recipient, and fee. Fails if
