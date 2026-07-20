@@ -9,14 +9,14 @@ use std::time::Duration;
 
 use notes_core::address::Recipient;
 use notes_core::bundle::{
-    compose_directed_note_exact_amount, compose_directed_note_with_change_amount,
+    compose_directed_note_multi_exact, compose_directed_note_multi_with_change,
     compose_note_exact, decode_scanned, estimate_note_cost, extract_notes_multi_deduped,
-    sealed_note_payloads, Identity, SyncBundle,
+    sealed_note_payloads, sealed_note_payloads_multi, Identity, SyncBundle,
 };
 use notes_core::address::p2tr_script_pubkey;
 use notes_core::keys::{generate_aux_rand, generate_note_id, pick_unique_note_id};
 use notes_core::tx::{
-    build_note_tx_mixed_exact_anchored, build_sweep_tx_multi, estimate_sweep_vsize,
+    build_note_tx_mixed_exact_anchored_multi, build_sweep_tx_multi, estimate_sweep_vsize,
     estimate_vsize_mixed, InputKind, MixedInput, NoteTx, SweepSource, Utxo,
 };
 use notes_core::Network;
@@ -27,7 +27,9 @@ use slint_keyos_platform::fs::{self, Location, OpenFlags};
 use slint_keyos_platform::gui_server_api::navigation::qrscanner::{ScanQrOptions, ScanQrResult};
 use slint_keyos_platform::navigation::open_qr_scanner;
 use slint_keyos_platform::qrcode;
-use slint_keyos_platform::slint::{Color, ComponentHandle, Image, Timer, VecModel};
+use slint_keyos_platform::slint::{
+    Color, ComponentHandle, Image, Model, SharedString, Timer, VecModel,
+};
 
 security::use_api!();
 
@@ -114,6 +116,12 @@ struct NoteRec {
     /// Sender address of a note someone sent to us.
     #[serde(default)]
     from: Option<String>,
+    /// Every recipient of a multi-recipient directed note (own or received),
+    /// in output/wrap order. Empty for self-notes and pre-multi-recipient
+    /// state.json entries. `to` stays the primary (first) recipient for
+    /// back-compat single-recipient display/log parity.
+    #[serde(default)]
+    recipients: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -268,7 +276,10 @@ struct Plan {
     private: bool,
     note_id: [u8; 4],
     chunks: u64,
-    recipient: Option<String>,
+    /// Every recipient of this directed note, in output/wrap order (empty
+    /// for a self-note). `recipient` stays as the FIRST entry (or None) for
+    /// back-compat call sites that only need the primary address.
+    recipients: Vec<String>,
     /// Funding-unification: which spending-wallet coins this note spent
     /// (dropped from the ledger on sign) and, when change went to a fresh
     /// spending address, the address to mark used — both applied ONLY
@@ -646,6 +657,13 @@ fn resolve_rate(tier: i32, rate_text: &str, st: &State) -> Result<f64, String> {
     } else {
         Ok(st.fee_rate(tier))
     }
+}
+
+/// Fresh TRNG content key for a multi-recipient directed note — notes-core
+/// never generates this (dm.rs's module docs); caller-supplied, one-shot,
+/// NEVER persisted or logged. Independent draw from any signing aux.
+fn generate_content_key() -> Result<[u8; 32], String> {
+    generate_aux_rand().map_err(|e| e.to_string())
 }
 
 /// Sats the recipient (gift) output of a directed note carries. The gift
@@ -1753,6 +1771,56 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let contacts_g = ui.global::<Contacts>();
             let sweep_mode = contacts_g.get_pick_mode() == "sweep";
             let compose = ui.global::<Compose>();
+
+            // Appending an EXTRA recipient to an in-progress directed draft
+            // (Callbacks.add-recipient-open set this) — pushes onto
+            // Compose.to-extra instead of replacing the primary, and does
+            // NOT touch funding/change picks or navigate anywhere but back
+            // to compose (this is editing a draft, not starting a fresh
+            // one — unlike the replace path below, which intentionally
+            // resets those for a brand-new compose target).
+            if !sweep_mode && contacts_g.get_picking_extra() {
+                if addr.is_empty() {
+                    contacts_g
+                        .set_input_error("Can't add yourself as an extra recipient.".into());
+                    log::warn!("cb: pick-contact err=self extra=true");
+                    return;
+                }
+                let mut st = state.borrow_mut();
+                if Recipient::parse(st.network(), &addr).is_err() {
+                    contacts_g
+                        .set_input_error(format!("Not a valid {} address.", st.network).into());
+                    log::warn!("cb: pick-contact err=invalid address extra=true");
+                    return;
+                }
+                let primary = compose.get_to_address().to_string();
+                let current_extra: Vec<ToRow> = compose.get_to_extra().iter().collect();
+                if addr == primary || current_extra.iter().any(|r| r.address == addr) {
+                    contacts_g.set_input_error("Already a recipient of this note.".into());
+                    log::warn!("cb: pick-contact err=duplicate extra=true");
+                    return;
+                }
+                if 1 + current_extra.len() + 1 > 255 {
+                    contacts_g.set_input_error("Too many recipients (max 255).".into());
+                    log::warn!("cb: pick-contact err=too-many extra=true");
+                    return;
+                }
+                upsert_contact(&mut st, &addr);
+                save_state(&fs, &st);
+                let label = to_label_for(&st, &addr);
+                drop(st);
+                let mut new_extra = current_extra;
+                new_extra.push(ToRow { address: addr.as_str().into(), label: label.into() });
+                compose.set_to_extra(Rc::new(VecModel::from(new_extra)).into());
+                contacts_g.set_picking_extra(false);
+                contacts_g.set_input_text("".into());
+                contacts_g.set_input_error("".into());
+                contacts_g.set_naming_address("".into());
+                log::info!("cb: pick-contact to={addr} extra=true");
+                ui.global::<Ui>().set_screen(3);
+                return;
+            }
+
             if addr.is_empty() {
                 // Self: compose only — the sweep picker hides the Self card
                 // (sweep-to-self is the Coins screen's consolidate).
@@ -1761,6 +1829,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 }
                 compose.set_to_address("".into());
                 compose.set_to_label("to: self — my notebook".into());
+                compose.set_to_extra(Rc::new(VecModel::from(Vec::<ToRow>::new())).into());
                 log::info!("cb: pick-contact to=self");
             } else {
                 let mut st = state.borrow_mut();
@@ -1782,6 +1851,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 } else {
                     compose.set_to_address(addr.as_str().into());
                     compose.set_to_label(to_label_for(&st, &addr).into());
+                    compose.set_to_extra(Rc::new(VecModel::from(Vec::<ToRow>::new())).into());
                     log::info!("cb: pick-contact to={addr}");
                 }
             }
@@ -1814,6 +1884,33 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let pick_contact = pick_contact.clone();
         ui.global::<Callbacks>().on_pick_contact(move |addr| pick_contact(addr.as_str()));
+    }
+
+    // Compose's "+ Add recipient" row — opens the contacts picker in
+    // append mode (Contacts.picking-extra), modeled on how the home
+    // screen's "Compose note" button opens it in replace mode.
+    {
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_add_recipient_open(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            ui.global::<Contacts>().set_picking_extra(true);
+            ui.global::<Contacts>().set_pick_mode("compose".into());
+            ui.global::<Callbacks>().invoke_refresh_contacts();
+            ui.global::<Ui>().set_screen(7);
+        });
+    }
+
+    // Drop an address from Compose.to-extra — no navigation.
+    {
+        let ui_weak = ui_weak.clone();
+        ui.global::<Callbacks>().on_remove_recipient(move |addr| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let compose = ui.global::<Compose>();
+            let kept: Vec<ToRow> =
+                compose.get_to_extra().iter().filter(|r| r.address != addr).collect();
+            compose.set_to_extra(Rc::new(VecModel::from(kept)).into());
+            log::info!("cb: remove-recipient addr={addr}");
+        });
     }
 
     {
@@ -2063,6 +2160,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             expected_change: None,
                             recipient: if consolidate { None } else { Some(dest.clone()) },
                             recipient_name: None,
+                            recipients: Vec::new(),
                             note_preview: None,
                         };
                         let mut context_line = format!(
@@ -2302,6 +2400,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 None
             };
             let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
+            // Recipient count for THIS draft (primary + every "+ Add
+            // recipient" row); 0 for a self-note. Each recipient gets the
+            // SAME gift amount, so the real sats leaving to recipients is
+            // `gift * n_recipients`, not `gift` alone — the balance checks
+            // and cost-line suffix below both need the total, not the
+            // per-recipient amount.
+            let n_recipients: usize =
+                if directed { 1 + compose.get_to_extra().row_count() } else { 0 };
+            let total_gift: u64 = gift * n_recipients as u64;
             let private = compose.get_private_note();
             let effective = st.effective_chunk();
             let est = estimate_note_cost(text_len, private, effective, 1, recipient_spk_len);
@@ -2357,10 +2464,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 match est {
                     Ok((chunks, vsize)) => {
                         let fee = (vsize as f64 * rate).ceil() as u64;
-                        if fee + gift > st.balance() {
+                        if fee + total_gift > st.balance() {
                             compose.set_cost_line(
-                                format!("Needs ~{} sats — balance is {}.", fee + gift, st.balance())
-                                    .into(),
+                                format!(
+                                    "Needs ~{} sats — balance is {}.",
+                                    fee + total_gift,
+                                    st.balance()
+                                )
+                                .into(),
                             );
                             compose.set_can_continue(false);
                         } else {
@@ -2368,10 +2479,14 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 format!(
                                     "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}",
                                     sats_line(fee, st.btc_usd),
-                                    if directed {
+                                    if !directed {
+                                        String::new()
+                                    } else if n_recipients <= 1 {
                                         format!(" + {gift} sats to recipient")
                                     } else {
-                                        String::new()
+                                        format!(
+                                            " + {n_recipients} × {gift} = {total_gift} sats to {n_recipients} recipients"
+                                        )
                                     }
                                 )
                                 .into(),
@@ -2471,7 +2586,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             let vsize_no_change = estimate_vsize_mixed(&kinds, &payload_lens, &extra_no_change);
             let fee_no_change = (vsize_no_change as f64 * rate).ceil() as u64;
             let leftover_with_change =
-                in_value.checked_sub(fee_with_change + gift + dust_needed);
+                in_value.checked_sub(fee_with_change + total_gift + dust_needed);
 
             // took_no_change tracks which shape `(vsize, fee, ok)` below
             // actually reflects — needed because `ok2`'s success range
@@ -2486,7 +2601,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     (vsize_with_change, fee_with_change, true, false)
                 }
                 _ => {
-                    let ok2 = matches!(in_value.checked_sub(fee_no_change + gift + dust_needed), Some(v) if v <= notes_core::DUST_LIMIT);
+                    let ok2 = matches!(in_value.checked_sub(fee_no_change + total_gift + dust_needed), Some(v) if v <= notes_core::DUST_LIMIT);
                     (vsize_no_change, fee_no_change, ok2, true)
                 }
             };
@@ -2503,7 +2618,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
             // show the split honestly instead of a single number that
             // reads as an inflated fee.
             let fold = if ok && took_no_change {
-                notes_core::fold::predict_fold(in_value, gift + dust_needed, fee_with_change, fee_no_change, true)
+                notes_core::fold::predict_fold(in_value, total_gift + dust_needed, fee_with_change, fee_no_change, true)
             } else {
                 None
             };
@@ -2511,7 +2626,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 compose.set_cost_line(
                     format!(
                         "Needs ~{} sats — selected coins total {}.",
-                        fee + gift + dust_needed,
+                        fee + total_gift + dust_needed,
                         in_value
                     )
                     .into(),
@@ -2522,7 +2637,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                     format!(
                         "{text_len} bytes · {chunks} chunk(s) · ~{vsize} vB · ~{} @ {rate} sat/vB{}{}{}",
                         sats_line(fee, st.btc_usd),
-                        if directed { format!(" + {gift} sats to recipient") } else { String::new() },
+                        if !directed {
+                            String::new()
+                        } else if n_recipients <= 1 {
+                            format!(" + {gift} sats to recipient")
+                        } else {
+                            format!(
+                                " + {n_recipients} × {gift} = {total_gift} sats to {n_recipients} recipients"
+                            )
+                        },
                         if dust_applies {
                             format!(" + {} sats dust to notebook", notes_core::DUST_LIMIT)
                         } else {
@@ -2577,6 +2700,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 let private = compose.get_private_note();
                 let to_address = compose.get_to_address().trim().to_string();
                 let directed = !to_address.is_empty();
+                let extra_addrs: Vec<String> =
+                    compose.get_to_extra().iter().map(|r| r.address.to_string()).collect();
                 let tier = compose.get_tier();
                 let rate_text = compose.get_rate_text().to_string();
                 let gift = resolve_gift(directed, compose.get_gift_sats().as_str());
@@ -2612,11 +2737,39 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             st.notes.iter().any(|n| n.id == id_hex)
                         })
                         .map_err(|e| e.to_string())?;
-                        let recipient = if directed {
-                            Some(Recipient::parse(st.network(), &to_address).map_err(|e| e.to_string())?)
+                        // Full recipient list (primary + every "+ Add
+                        // recipient" row), each carrying the same gift
+                        // amount — order matches notes-core's own output
+                        // wrap order (OP_RETURN(s), then recipients in list
+                        // order), which the ledger vout math below depends
+                        // on matching exactly. Empty for a self-note; the
+                        // `_multi` notes-core functions error on an empty
+                        // slice, so callers below only invoke them when
+                        // `directed` is true (recipients_vec has >= 1
+                        // entry in that case, always).
+                        let recipients_vec: Vec<(Recipient, u64)> = if directed {
+                            let mut v = Vec::with_capacity(1 + extra_addrs.len());
+                            v.push((
+                                Recipient::parse(st.network(), &to_address)
+                                    .map_err(|e| e.to_string())?,
+                                gift,
+                            ));
+                            for a in &extra_addrs {
+                                v.push((
+                                    Recipient::parse(st.network(), a).map_err(|e| e.to_string())?,
+                                    gift,
+                                ));
+                            }
+                            v
                         } else {
-                            None
+                            Vec::new()
                         };
+                        // Fresh TRNG content key for a multi-recipient
+                        // private body — one-shot, never persisted/logged.
+                        // Drawn unconditionally (cheap) so every branch
+                        // below can pass it to the `_multi` calls without
+                        // re-deriving.
+                        let content_key = generate_content_key()?;
                         let sp_participates = !pick.spending.is_empty();
                         let mode_auto = !pick.touched && !sp_participates;
 
@@ -2636,15 +2789,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 0,
                             )?;
                             let change_is_notebook = change_choice.choice != "custom";
-                            let note = if let Some(r) = &recipient {
-                                compose_directed_note_with_change_amount(
+                            let note = if !recipients_vec.is_empty() {
+                                compose_directed_note_multi_with_change(
                                     id,
                                     &st.core_utxos(),
                                     &text,
                                     private,
                                     note_id,
-                                    r,
-                                    gift,
+                                    &recipients_vec,
+                                    content_key,
                                     Some(&change_spk),
                                     st.effective_chunk(),
                                     rate,
@@ -2694,15 +2847,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 0,
                             )?;
                             let change_is_notebook = change_choice.choice != "custom";
-                            let note = if let Some(r) = &recipient {
-                                compose_directed_note_exact_amount(
+                            let note = if !recipients_vec.is_empty() {
+                                compose_directed_note_multi_exact(
                                     id,
                                     &inputs,
                                     &text,
                                     private,
                                     note_id,
-                                    r,
-                                    gift,
+                                    &recipients_vec,
+                                    content_key,
                                     Some(&change_spk),
                                     st.effective_chunk(),
                                     rate,
@@ -2782,16 +2935,51 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             if mixed_inputs.is_empty() {
                                 return Err("Select at least one coin to pay from.".into());
                             }
-                            let (payloads, recipient_spk) = sealed_note_payloads(
-                                id,
-                                &text,
-                                private,
-                                recipient.as_ref(),
-                                note_id,
-                                st.effective_chunk(),
-                            )
-                            .map_err(|e| e.to_string())?;
-                            let recipient_amount = if recipient.is_some() { gift } else { 0 };
+                            // `sealed_note_payloads_multi` has no self-note
+                            // case (errors on an empty recipients slice —
+                            // notes-core bundle.rs:876), so a self-note
+                            // (recipients_vec empty) keeps calling the old
+                            // singular `sealed_note_payloads` with `None`;
+                            // only a directed note switches to the `_multi`
+                            // primitive.
+                            let (payloads, recipients_amounts): (Vec<Vec<u8>>, Vec<(Vec<u8>, u64)>) =
+                                if !recipients_vec.is_empty() {
+                                    // `Recipient` isn't `Clone`; re-parsing
+                                    // from the address string (already
+                                    // validated once above) is cheap and
+                                    // avoids touching notes-core for this.
+                                    let recips: Vec<Recipient> = recipients_vec
+                                        .iter()
+                                        .map(|(r, _)| {
+                                            Recipient::parse(st.network(), &r.address)
+                                                .map_err(|e| e.to_string())
+                                        })
+                                        .collect::<Result<_, _>>()?;
+                                    let (payloads, spks) = sealed_note_payloads_multi(
+                                        id,
+                                        &text,
+                                        private,
+                                        &recips,
+                                        note_id,
+                                        content_key,
+                                        st.effective_chunk(),
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                                    let amounts =
+                                        spks.into_iter().map(|spk| (spk, gift)).collect();
+                                    (payloads, amounts)
+                                } else {
+                                    let (payloads, _) = sealed_note_payloads(
+                                        id,
+                                        &text,
+                                        private,
+                                        None,
+                                        note_id,
+                                        st.effective_chunk(),
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                                    (payloads, Vec::new())
+                                };
                             let (change_spk, change_addr) = resolve_change(
                                 &change_choice.choice,
                                 &change_choice.custom_address,
@@ -2804,11 +2992,15 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 sec.next_change,
                             )?;
                             let change_is_notebook = change_choice.choice == "notebook";
-                            let note = build_note_tx_mixed_exact_anchored(
+                            // `build_note_tx_mixed_exact_anchored_multi` with
+                            // <=1 recipient entries delegates byte-identically
+                            // to `build_note_tx_mixed_exact_anchored` (tx.rs),
+                            // so this single call covers self/single/multi
+                            // recipient shapes without branching.
+                            let note = build_note_tx_mixed_exact_anchored_multi(
                                 &mixed_inputs,
                                 &payloads,
-                                recipient_spk.as_deref(),
-                                recipient_amount,
+                                &recipients_amounts,
                                 &notebook_dust_spk,
                                 &change_spk,
                                 rate,
@@ -2843,8 +3035,22 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             .filter(|o| o.script_pubkey.first() == Some(&0x6a))
                             .count() as u64;
                         let funded_by = pick.mode_label();
+                        // Full recipient list for THIS note (empty for a
+                        // self-note; primary + every "+ Add recipient" row
+                        // otherwise), in the same order as `recipients_vec`
+                        // fed the builder above — matches notes-core's own
+                        // output wrap order (OP_RETURN(s), recipients in
+                        // list order), which the ledger vout math further
+                        // below depends on matching exactly.
+                        let recipients_display: Vec<String> = if directed {
+                            let mut v = vec![to_address.clone()];
+                            v.extend(extra_addrs.iter().cloned());
+                            v
+                        } else {
+                            Vec::new()
+                        };
                         log::info!(
-                            "cb: compose len={} private={} to={} chunks={} fee={} vsize={} gift={} funded={funded_by} txid={} ok",
+                            "cb: compose len={} private={} to={} chunks={} fee={} vsize={} gift={} funded={funded_by} recipients={} txid={} ok",
                             text.len(),
                             private,
                             if directed { to_address.as_str() } else { "self" },
@@ -2852,6 +3058,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             note.fee,
                             note.vsize,
                             note.sent,
+                            recipients_display.len(),
                             note.txid_hex
                         );
                         let recipient = if directed { Some(to_address.clone()) } else { None };
@@ -2965,6 +3172,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             .then(|| change_choice.custom_address.trim().to_string()),
                             recipient: recipient.clone(),
                             recipient_name,
+                            recipients: recipients_display.clone(),
                             note_preview,
                         };
                         let context_line = format!(
@@ -3011,7 +3219,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                     private,
                                     note_id,
                                     chunks,
-                                    recipient,
+                                    recipients: recipients_display.clone(),
                                     spending_spent,
                                     spending_change_addr,
                                     change_is_notebook,
@@ -3253,14 +3461,20 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             .collect();
                         st.utxos.retain(|u| !spent.contains(&(u.txid.clone(), u.vout)));
 
-                        // Output order: OP_RETURN(s), [directed recipient], [notebook
-                        // dust — present unless a notebook coin already anchors the
-                        // tx, see `Plan.notebook_dust`'s doc], [change]. `p.chunks` +
-                        // the recipient flag place the dust slot; +1 more ONLY when
-                        // `p.notebook_dust` is true places change — when dust is
-                        // skipped, change lands in that same slot instead (computed
-                        // from the flag, never a hardcoded position).
-                        let dust_vout = p.chunks as u32 + u32::from(p.recipient.is_some());
+                        // Output order: OP_RETURN(s), EVERY directed recipient (in
+                        // list order — matches notes-core's own builders, and the
+                        // order `recipients_vec` was fed to them in
+                        // `on_compose_continue`), [notebook dust — present unless a
+                        // notebook coin already anchors the tx, see
+                        // `Plan.notebook_dust`'s doc], [change]. `p.chunks` +
+                        // `p.recipients.len()` (0, 1, or N recipient outputs) place
+                        // the dust slot; +1 more ONLY when `p.notebook_dust` is true
+                        // places change — when dust is skipped, change lands in that
+                        // same slot instead (computed from the flag, never a
+                        // hardcoded position). Getting `p.recipients.len()` right
+                        // here is safety-critical: a wrong offset would make the app
+                        // track the WRONG utxo as its own dust/change coin.
+                        let dust_vout = p.chunks as u32 + p.recipients.len() as u32;
                         if p.notebook_dust {
                             st.utxos.push(UtxoRec {
                                 txid: p.note.txid_hex.clone(),
@@ -3318,9 +3532,10 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             height: None,
                             blocktime: None,
                             status: "pending".into(),
-                            directed: p.recipient.is_some(),
-                            to: p.recipient.clone(),
+                            directed: !p.recipients.is_empty(),
+                            to: p.recipients.first().cloned(),
                             from: None,
+                            recipients: p.recipients.clone(),
                         };
 
                         // Export the signed tx for the companion to broadcast:
@@ -3348,9 +3563,9 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                             if airlock.is_ok() { "ok" } else { "err" },
                         );
 
-                        // Auto-save the recipient as a recent contact (usually a
+                        // Auto-save every recipient as a recent contact (usually a
                         // no-op re-front after the pick, but covers every path).
-                        if let Some(to) = &p.recipient {
+                        for to in &p.recipients {
                             upsert_contact(&mut st, to);
                         }
                         st.notes.push(rec.clone());
@@ -3376,6 +3591,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                         // A stale recipient must never silently direct the next note.
                         ui.global::<Compose>().set_to_address("".into());
                         ui.global::<Compose>().set_to_label("".into());
+                        ui.global::<Compose>()
+                            .set_to_extra(Rc::new(VecModel::from(Vec::<ToRow>::new())).into());
                         // Gift resets with the recipient so a large gift can't leak
                         // into the next note.
                         ui.global::<Compose>().set_gift_sats("330".into());
@@ -3431,6 +3648,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
     {
         let ui_weak = ui_weak.clone();
         let state = state.clone();
+        let identity = identity.clone();
         ui.global::<Callbacks>().on_open_note(move |id| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let st = state.borrow();
@@ -3443,14 +3661,63 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 Some(h) => format!("confirmed at block {h}"),
                 None => "pending — scan the tx QR with the companion to broadcast".to_string(),
             };
-            let who_line = match (&n.from, &n.to) {
-                (Some(from), _) => format!("\nfrom: {from}"),
-                (None, Some(to)) => format!("\nto: {to}"),
-                _ => String::new(),
+            let who_line = if n.recipients.len() > 1 {
+                let mut line = format!("\nto ({}): {}", n.recipients.len(), n.recipients[0]);
+                for addr in &n.recipients[1..] {
+                    line.push_str(&format!("\n    {addr}"));
+                }
+                line
+            } else {
+                match (&n.from, &n.to) {
+                    (Some(from), _) => format!("\nfrom: {from}"),
+                    (None, Some(to)) => format!("\nto: {to}"),
+                    _ => String::new(),
+                }
             };
             view.set_meta(format!("{where_line}{who_line}\ntxid: {}", n.txid).into());
             set_view_qr(&view, n);
             view.set_show_qr(false);
+
+            // Reply / Reply-all: a small local equivalent of notes-core's
+            // `bundle::reply_set` operating on the persisted `NoteRec`
+            // (plain display/UX logic, not a notes-core FROZEN invariant —
+            // deliberately not routed through notes-core, which only has
+            // the heavier `RecoveredNote` shape). `full_set` = {from} ∪
+            // recipients minus my own address, deduped, sender-first.
+            let my_address = identity.borrow().as_ref().map(|id| id.address(st.network()));
+            let mut full_set: Vec<String> = Vec::new();
+            let mut push_addr = |addr: &str, out: &mut Vec<String>| {
+                if Some(addr) != my_address.as_deref() && !out.iter().any(|a| a == addr) {
+                    out.push(addr.to_string());
+                }
+            };
+            if let Some(from) = &n.from {
+                push_addr(from, &mut full_set);
+            }
+            if !n.recipients.is_empty() {
+                for r in &n.recipients {
+                    push_addr(r, &mut full_set);
+                }
+            } else if let Some(to) = &n.to {
+                push_addr(to, &mut full_set);
+            }
+            // Received note: Reply is ALWAYS addressed to the sender,
+            // regardless of full_set's size. Own note: Reply is addressed
+            // to the sole other party only when there is exactly one — 2+
+            // hides Reply in favor of Reply-all (never both for an own
+            // note). A pure self-note (full_set empty) shows neither.
+            let reply_address = if let Some(from) = &n.from {
+                from.clone()
+            } else if full_set.len() == 1 {
+                full_set[0].clone()
+            } else {
+                String::new()
+            };
+            view.set_reply_address(reply_address.into());
+            let full_set_shared: Vec<SharedString> =
+                full_set.iter().map(SharedString::from).collect();
+            view.set_reply_set(Rc::new(VecModel::from(full_set_shared)).into());
+
             log::info!(
                 "cb: open-note id={} status={}{} qr={}",
                 n.id,
@@ -3459,6 +3726,49 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 view.get_has_qr()
             );
             ui.global::<Ui>().set_screen(2);
+        });
+    }
+
+    // Reply: fresh compose draft addressed to View.reply-address. Routed
+    // through the SAME `pick_contact` funnel a manual pick uses (contact
+    // name resolution, recency bump, funding/change reset, → screen 3) —
+    // it already clears Compose.to-extra on its replace path, so a stale
+    // extra-recipient list from a previous draft can't leak in.
+    {
+        let ui_weak = ui_weak.clone();
+        let pick_contact = pick_contact.clone();
+        ui.global::<Callbacks>().on_reply_to_note(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let addr = ui.global::<View>().get_reply_address().to_string();
+            if addr.is_empty() {
+                return;
+            }
+            pick_contact(&addr);
+        });
+    }
+
+    // Reply-all: primary = the first address in View.reply-set (via the
+    // same `pick_contact` funnel, which also resets to-extra), every
+    // remaining address pushed directly onto Compose.to-extra — NOT
+    // re-run through `pick_contact` (that would re-reset funding/change
+    // and re-navigate on every entry).
+    {
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        let pick_contact = pick_contact.clone();
+        ui.global::<Callbacks>().on_reply_all_to_note(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let set: Vec<String> =
+                ui.global::<View>().get_reply_set().iter().map(|s| s.to_string()).collect();
+            let Some((first, rest)) = set.split_first() else { return };
+            pick_contact(first);
+            let st = state.borrow();
+            let extra: Vec<ToRow> = rest
+                .iter()
+                .map(|a| ToRow { address: a.as_str().into(), label: to_label_for(&st, a).into() })
+                .collect();
+            drop(st);
+            ui.global::<Compose>().set_to_extra(Rc::new(VecModel::from(extra)).into());
         });
     }
 
@@ -3573,6 +3883,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                                 directed: r.directed,
                                 to: r.recipient.clone(),
                                 from: r.sender.clone(),
+                                recipients: r.recipients.clone(),
                             });
                         }
                     }
@@ -4107,6 +4418,7 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 expected_change: None,
                 recipient: None,
                 recipient_name: None,
+                recipients: Vec::new(),
                 note_preview,
             };
             let raw_hex = hex::encode(psbt.unsigned_tx.serialize_legacy());

@@ -44,6 +44,19 @@ pub struct ConfirmCtx {
     /// directed-note recipient address + optional contact name
     pub recipient: Option<String>,
     pub recipient_name: Option<String>,
+    /// Every recipient of a multi-recipient directed note (2..=255),
+    /// including the primary `recipient` above — additive, empty for a
+    /// classic single-recipient (or self) note, in which case only
+    /// `recipient`/`recipient_name` are consulted (unchanged behavior).
+    /// When non-empty, ANY output matching an address in this list
+    /// classifies as `"recipient"` kind instead of falling through to
+    /// `"other"` (which would otherwise show a scary "doesn't recognize
+    /// this address" warning for a perfectly normal 2nd+ recipient) — the
+    /// exact address that also equals `recipient` still gets
+    /// `recipient_name`'s subtitle; every other match gets the generic
+    /// "directed recipient" subtitle (this ctx has no per-address name
+    /// map for the extras).
+    pub recipients: Vec<String>,
     /// decoded note text to display (public notes) — display-only, pass-through
     pub note_preview: Option<String>,
 }
@@ -91,6 +104,16 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
     // (spk compare, never string compare, per the paranoid rule — a string
     // compare can be fooled by address-encoding quirks the spk can't be).
     let recipient_spk: Option<Vec<u8>> = ctx.recipient.as_deref().and_then(|a| resolve_spk(a, ctx.network));
+    // Multi-recipient (2..=255): every OTHER recipient beyond `recipient`
+    // resolved the same way — empty when `ctx.recipients` is empty (a
+    // classic single-recipient/self note), so this is a strict no-op
+    // addition for every existing caller.
+    let extra_recipient_spks: Vec<Vec<u8>> = ctx
+        .recipients
+        .iter()
+        .filter(|a| ctx.recipient.as_deref() != Some(a.as_str()))
+        .filter_map(|a| resolve_spk(a, ctx.network))
+        .collect();
     let expected_change_spk: Option<Vec<u8>> =
         ctx.expected_change.as_deref().and_then(|a| resolve_spk(a, ctx.network));
 
@@ -159,6 +182,8 @@ pub fn summarize_signed_tx(raw_hex: &str, ctx: &ConfirmCtx) -> Result<TxSummary,
 
         let (kind, subtitle) = if recipient_spk.as_deref() == Some(spk) {
             ("recipient", ctx.recipient_name.clone().unwrap_or_else(|| "directed recipient".to_string()))
+        } else if extra_recipient_spks.iter().any(|s| s.as_slice() == spk) {
+            ("recipient", "directed recipient".to_string())
         } else if ctx.self_spks.iter().any(|s| s.as_slice() == spk) {
             if ctx.spending_spks.iter().any(|s| s.as_slice() == spk) {
                 ("change", "change · Spending wallet".to_string())

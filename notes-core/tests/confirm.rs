@@ -81,6 +81,7 @@ fn base_ctx(self_spks: Vec<Vec<u8>>, spending_spks: Vec<Vec<u8>>) -> ConfirmCtx 
         expected_change: None,
         recipient: None,
         recipient_name: None,
+        recipients: Vec::new(),
         note_preview: None,
     }
 }

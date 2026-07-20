@@ -27,6 +27,13 @@ export global Home {
     in-out property <string> network: "mainnet";
 }
 
+// A multi-recipient compose's extra (non-primary) recipient row —
+// mirrors the peer app's ToRow.
+export struct ToRow {
+    address: string,
+    label: string,   // contact name if known, else short address
+}
+
 export global Compose {
     in-out property <string> text: "";
     in-out property <bool> private-note: true;   // DECIDED: private by default
@@ -37,6 +44,12 @@ export global Compose {
     // Human line shown at the top of compose ("to: self — my notebook" /
     // "to: <name> (<short addr>)"), set by Rust at pick/sign time.
     in-out property <string> to-label: "";
+    // Extra recipients beyond the primary `to-address`, for a
+    // multi-recipient directed note (2..=255 total). Appended via the
+    // contacts picker's "+ Add recipient" (Contacts.picking-extra), each
+    // gets the SAME gift amount as the primary. Empty for a classic
+    // single-recipient (or self) note.
+    in-out property <[ToRow]> to-extra;
     in-out property <int> tier: 1;               // 0 economy · 1 normal · 2 fast · 3 custom
     // sat/vB shown in the rate field. Rust refreshes it from the bundle's
     // tiers while tier < 3; a manual edit flips tier to 3 (custom) and the
@@ -145,6 +158,13 @@ export global Contacts {
     // sweep-to-self is the Coins screen's consolidate). Set by the screen
     // that opens the picker.
     in-out property <string> pick-mode: "compose";
+    // True while the picker is appending an EXTRA recipient to an
+    // in-progress directed draft (Callbacks.add-recipient-open) instead of
+    // replacing the primary — pick-contact branches on this to push onto
+    // Compose.to-extra instead of overwriting Compose.to-address, and does
+    // NOT reset the funding/change picks (it's editing a draft, not
+    // starting a fresh one).
+    in-out property <bool> picking-extra: false;
     // Recency order, front = most recently used (no clock on-device).
     in-out property <[ContactRow]> rows;
     // Manual address entry.
@@ -168,6 +188,12 @@ export global View {
     in-out property <image> qr;
     in-out property <bool> has-qr: false;
     in-out property <bool> show-qr: false;
+    // Reply / Reply-all (mirrors the chain-notes-app peer's semantics):
+    // non-"" shows a "Reply" button addressed to this address; a
+    // reply-set with 2+ entries shows "Reply all" addressed to all of
+    // them. Both computed by on-open-note from the note's from/recipients.
+    in-out property <string> reply-address: "";
+    in-out property <[string]> reply-set;
 }
 
 // A bundle file found in an inbox, for the import picker.
@@ -411,6 +437,11 @@ export global Callbacks {
     callback refresh-contacts();    // rebuild Contacts.rows from state
     callback pick-contact(string);  // "" = self; the single funnel: validate,
                                     // bump recency, set Compose.to-*, → screen 3
+                                    // (or, when Contacts.picking-extra, append
+                                    // onto Compose.to-extra instead)
+    callback add-recipient-open();  // compose's "+ Add recipient" row → picker
+                                     // in append mode (Contacts.picking-extra)
+    callback remove-recipient(string); // drop an address from Compose.to-extra
     callback scan-contact();        // system QR scanner → upsert (unnamed) + pick
     callback save-contact-name();   // reads Contacts.naming-address + input-text
     callback refresh-coins();       // rebuild Coins.rows from the UTXO ledger
@@ -435,4 +466,8 @@ export global Callbacks {
     callback change-pick(string);         // "auto" | "notebook" | "custom"
     callback change-address-changed();    // custom-address field edited
     callback change-done();               // Back from screen 26 → recompute + screen 3
+
+    // Reply / Reply-all (note view, screen 2).
+    callback reply-to-note();      // View.reply-address → fresh compose draft
+    callback reply-all-to-note();  // View.reply-set → fresh compose draft, all addressed
 }
