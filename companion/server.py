@@ -127,6 +127,14 @@ def ensure_address_watched(address):
 def mine(blocks=1):
     addr = wallet("getnewaddress", wallet_name="miner")
     wallet("generatetoaddress", str(blocks), addr, wallet_name="miner")
+    # Wallet block-processing is ASYNC in bitcoind (validation-interface
+    # callbacks drain on the scheduler thread AFTER generatetoaddress
+    # returns) — without this, a listunspent served right after a mine can
+    # answer from the PRE-block view: freshly-spent coins still listed,
+    # fresh outputs missing. The chain-notes-app UI suite's mixed-sweep leg
+    # raced exactly that (scanned its consolidate's spent inputs as
+    # spendable → missing-inputs on broadcast).
+    cli("syncwithvalidationinterfacequeue")
 
 
 def tip_height():
