@@ -284,6 +284,30 @@ pass "unknown txid -> HTTP 404 (dropped-tx detection sees a real 404, not a 400)
 STATUS="$(curl -s -o "$WORK/body_found.txt" -w '%{http_code}' "http://127.0.0.1:$PORT/regtest/api/tx/$T4")"
 [[ "$STATUS" == "200" ]] || fail "expected 200 for known txid $T4, got $STATUS: $(cat "$WORK/body_found.txt")"
 pass "known txid ($T4) -> HTTP 200, found-tx path unaffected"
+
+echo "== companion server.py: /address/{a} esplora-style stats =="
+STATUS="$(curl -s -o "$WORK/addr_stats.json" -w '%{http_code}' "http://127.0.0.1:$PORT/regtest/api/address/$ADDR")"
+[[ "$STATUS" == "200" ]] || fail "expected 200 for address stats, got $STATUS: $(cat "$WORK/addr_stats.json")"
+# $ADDR was funded once at setup (sendtoaddress 0.001 BTC = 100000 sats,
+# line ~51) but is then repeatedly self-spent with change returned to
+# itself by every note this script composes/sends from it, so its
+# lifetime funded_txo_sum by this point in the run is NOT just the
+# initial 100000 — cross-check against the watch wallet's own
+# confirmed-received total (an independent computation) instead of a
+# hardcoded figure that would go stale the moment an earlier step changes.
+EXPECT_FUNDED_SATS="$(python3 -c "print(round(float(\"$(WATCH getreceivedbyaddress "$ADDR" 1)\") * 1e8))")"
+jq -e --argjson v "$EXPECT_FUNDED_SATS" '.chain_stats.funded_txo_sum == $v' "$WORK/addr_stats.json" >/dev/null \
+    || fail "address stats funded_txo_sum mismatch: expected $EXPECT_FUNDED_SATS, got $(jq .chain_stats.funded_txo_sum "$WORK/addr_stats.json")"
+jq -e '.chain_stats.tx_count >= 1' "$WORK/addr_stats.json" >/dev/null \
+    || fail "address stats chain_stats.tx_count should be >= 1 for a funded, confirmed address"
+pass "address stats: chain_stats.funded_txo_sum == watch wallet's confirmed-received total ($EXPECT_FUNDED_SATS sats), tx_count=$(jq .chain_stats.tx_count "$WORK/addr_stats.json")"
+
+echo "== companion server.py: /address/{a} stats stable across identical calls (unchanged-notebook short-circuit) =="
+curl -s -o "$WORK/addr_stats2.json" "http://127.0.0.1:$PORT/regtest/api/address/$ADDR"
+diff "$WORK/addr_stats.json" "$WORK/addr_stats2.json" >/dev/null \
+    || fail "address stats not stable across identical calls (breaks the app's unchanged-notebook scan short-circuit)"
+pass "address stats byte-identical across two identical calls with no chain change in between"
+
 kill "$SRV_PID" >/dev/null 2>&1 || true
 
 echo

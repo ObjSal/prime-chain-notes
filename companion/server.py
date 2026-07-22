@@ -15,6 +15,7 @@ Usage:
 
 Stdlib only. GET  /api/health                    → {"status":"ok","regtest":bool}
              GET  /regtest/api/blocks/tip/height
+             GET  /regtest/api/address/A               → esplora-style chain_stats/mempool_stats
              GET  /regtest/api/address/A/txs[/chain][?after_txid=T]
              GET  /regtest/api/address/A/utxo
              GET  /regtest/api/v1/fees/recommended
@@ -214,6 +215,45 @@ def handle_api(handler, method, path, query, body):
         return {"time": int(time.time()), "USD": 100000}
 
     parts = path.split("/")
+    # /regtest/api/address/{addr} — esplora-style aggregate stats, no
+    # trailing sub-resource segment. Must be checked BEFORE the
+    # /txs|/utxo branch below (longer `parts`) so it isn't shadowed.
+    if len(parts) == 5 and parts[3] == "address" and parts[4]:
+        address = parts[4]
+        ensure_address_watched(address)
+        tip = tip_height()
+        stats = {
+            "chain_stats": {
+                "funded_txo_count": 0, "funded_txo_sum": 0,
+                "spent_txo_count": 0, "spent_txo_sum": 0, "tx_count": 0,
+            },
+            "mempool_stats": {
+                "funded_txo_count": 0, "funded_txo_sum": 0,
+                "spent_txo_count": 0, "spent_txo_sum": 0, "tx_count": 0,
+            },
+        }
+        # address_txids is already ordered deterministically (newest
+        # first); iterate that order so repeated calls with no chain/
+        # mempool change produce byte-identical output.
+        for txid in address_txids(address):
+            tx = esplora_tx(txid, tip)
+            bucket = stats["chain_stats"] if tx["status"]["confirmed"] else stats["mempool_stats"]
+            touches = False
+            for o in tx["vout"]:
+                if o.get("scriptpubkey_address") == address:
+                    bucket["funded_txo_count"] += 1
+                    bucket["funded_txo_sum"] += o["value"]
+                    touches = True
+            for i in tx["vin"]:
+                prevout = i.get("prevout") or {}
+                if prevout.get("scriptpubkey_address") == address:
+                    bucket["spent_txo_count"] += 1
+                    bucket["spent_txo_sum"] += prevout["value"]
+                    touches = True
+            if touches:
+                bucket["tx_count"] += 1
+        return stats
+
     # /regtest/api/address/{addr}/txs[/chain]
     if len(parts) >= 6 and parts[3] == "address" and parts[5] in ("txs", "utxo"):
         address = parts[4]
