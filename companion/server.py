@@ -133,8 +133,14 @@ def mine(blocks=1):
     # answer from the PRE-block view: freshly-spent coins still listed,
     # fresh outputs missing. The chain-notes-app UI suite's mixed-sweep leg
     # raced exactly that (scanned its consolidate's spent inputs as
-    # spendable → missing-inputs on broadcast).
-    cli("syncwithvalidationinterfacequeue")
+    # spendable → missing-inputs on broadcast). Best-effort: the drain is
+    # a consistency optimization — a hiccup in this hidden RPC must never
+    # turn a successful mine into a dropped connection for the POST /tx or
+    # faucet request that triggered it.
+    try:
+        cli("syncwithvalidationinterfacequeue")
+    except Exception:
+        pass
 
 
 def tip_height():
@@ -368,7 +374,17 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     print(f"companion on http://localhost:{port}  (regtest: {'on' if _datadir else 'off'})")
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    # request_queue_size: the default listen backlog (5) is too small for
+    # the chain-notes-app's scan workers — each opens its own connection,
+    # and a burst of queued scans can fill the backlog so a broadcast
+    # POST's connect gets REFUSED ("error sending request"). This server
+    # is single-threaded on purpose (deterministic ordering for tests);
+    # a deeper backlog just lets bursts queue instead of bounce. Must be
+    # a CLASS attribute — HTTPServer.__init__ calls listen() with it.
+    class DeepBacklogServer(HTTPServer):
+        request_queue_size = 64
+
+    DeepBacklogServer(("127.0.0.1", port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
